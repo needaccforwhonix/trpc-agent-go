@@ -11,25 +11,43 @@ package llmagent
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
+	"trpc.group/trpc-go/trpc-agent-go/internal/tracecapture"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/telemetry/semconv/metrics"
+	semconvtrace "trpc.group/trpc-go/trpc-agent-go/telemetry/semconv/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 // mockTool implements tool.CallableTool for testing.
-type mockTool struct{ name string }
+type mockTool struct {
+	name         string
+	description  string
+	inputSchema  *tool.Schema
+	outputSchema *tool.Schema
+}
 
-func (m *mockTool) Declaration() *tool.Declaration { return &tool.Declaration{Name: m.name} }
+func (m *mockTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{
+		Name:         m.name,
+		Description:  m.description,
+		InputSchema:  m.inputSchema,
+		OutputSchema: m.outputSchema,
+	}
+}
 func (m *mockTool) Call(ctx context.Context, jsonArgs []byte) (any, error) {
 	return "ok", nil
 }
@@ -61,7 +79,7 @@ func TestRegisterTools_AddsToolSet(t *testing.T) {
 
 	kb := &fakeKnowledge{}
 
-	all, userToolNames := registerTools(&Options{Tools: direct, ToolSets: []tool.ToolSet{ts}, Knowledge: kb})
+	all, userToolNames, _ := registerTools(&Options{Tools: direct, ToolSets: []tool.ToolSet{ts}, Knowledge: kb}, nil)
 
 	// Expect 1 direct + 1 from set + 1 knowledge search tool.
 	require.Equal(t, 3, len(all))
@@ -142,7 +160,15 @@ func TestLLMAgent_AfterCb(t *testing.T) {
 	inv := &agent.Invocation{InvocationID: "id", AgentName: "agent"}
 
 	llm := &LLMAgent{agentCallbacks: cb}
-	wrapped := llm.wrapEventChannelWithTelemetry(context.Background(), inv, orig, noop.Span{}, &itelemetry.InvokeAgentTracker{})
+	wrapped := llm.wrapEventChannelWithTelemetry(
+		context.Background(),
+		inv,
+		orig,
+		noop.Span{},
+		&itelemetry.InvokeAgentTracker{},
+		false,
+		tracecapture.StepLease{},
+	)
 
 	var objs []string
 	for e := range wrapped {
@@ -166,7 +192,15 @@ func TestLLMAgent_AfterCbNoResp(t *testing.T) {
 	inv := &agent.Invocation{InvocationID: "id2", AgentName: "agent2"}
 
 	llm := &LLMAgent{}
-	wrapped := llm.wrapEventChannelWithTelemetry(context.Background(), inv, orig, noop.Span{}, &itelemetry.InvokeAgentTracker{})
+	wrapped := llm.wrapEventChannelWithTelemetry(
+		context.Background(),
+		inv,
+		orig,
+		noop.Span{},
+		&itelemetry.InvokeAgentTracker{},
+		false,
+		tracecapture.StepLease{},
+	)
 
 	// Expect exactly one event propagated from original channel and no extras.
 	count := 0
@@ -178,6 +212,131 @@ func TestLLMAgent_AfterCbNoResp(t *testing.T) {
 	}
 }
 
+func TestLLMAgent_WrappedTelemetryAllowsEventWithoutResponse(t *testing.T) {
+	orig := make(chan *event.Event, 1)
+	orig <- &event.Event{
+		ID:         "state-only",
+		StateDelta: map[string][]byte{"state": []byte(`"updated"`)},
+	}
+	close(orig)
+
+	inv := &agent.Invocation{InvocationID: "id", AgentName: "agent"}
+	llm := &LLMAgent{}
+	wrapped := llm.wrapEventChannelWithTelemetry(
+		context.Background(),
+		inv,
+		orig,
+		noop.Span{},
+		&itelemetry.InvokeAgentTracker{},
+		false,
+		tracecapture.StepLease{},
+	)
+
+	evt, ok := <-wrapped
+	require.True(t, ok)
+	require.NotNil(t, evt)
+	require.Nil(t, evt.Response)
+	require.Equal(t, []byte(`"updated"`), evt.StateDelta["state"])
+	_, ok = <-wrapped
+	require.False(t, ok)
+}
+
+func TestLLMAgent_AfterCbErrorRecordsTelemetryErrorType(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	originalProvider := itelemetry.MeterProvider
+	originalMeter := itelemetry.InvokeAgentMeter
+	originalRequestCnt := itelemetry.InvokeAgentMetricGenAIRequestCnt
+	originalTokenUsage := itelemetry.InvokeAgentMetricGenAIClientTokenUsage
+	originalTimeToFirstToken := itelemetry.InvokeAgentMetricGenAIClientTimeToFirstToken
+	originalDuration := itelemetry.InvokeAgentMetricGenAIClientOperationDuration
+	t.Cleanup(func() {
+		itelemetry.MeterProvider = originalProvider
+		itelemetry.InvokeAgentMeter = originalMeter
+		itelemetry.InvokeAgentMetricGenAIRequestCnt = originalRequestCnt
+		itelemetry.InvokeAgentMetricGenAIClientTokenUsage = originalTokenUsage
+		itelemetry.InvokeAgentMetricGenAIClientTimeToFirstToken = originalTimeToFirstToken
+		itelemetry.InvokeAgentMetricGenAIClientOperationDuration = originalDuration
+	})
+
+	itelemetry.MeterProvider = provider
+	itelemetry.InvokeAgentMeter = provider.Meter(metrics.MeterNameInvokeAgent)
+	var err error
+	itelemetry.InvokeAgentMetricGenAIRequestCnt, err = itelemetry.InvokeAgentMeter.Int64Counter("gen_ai.client.request.cnt")
+	require.NoError(t, err)
+	itelemetry.InvokeAgentMetricGenAIClientTokenUsage = nil
+	itelemetry.InvokeAgentMetricGenAIClientTimeToFirstToken = nil
+	itelemetry.InvokeAgentMetricGenAIClientOperationDuration = nil
+
+	orig := make(chan *event.Event, 1)
+	orig <- event.New("id", "agent")
+	close(orig)
+
+	cb := agent.NewCallbacks()
+	cb.RegisterAfterAgent(func(ctx context.Context, inv *agent.Invocation, err error) (*model.Response, error) {
+		return nil, errors.New("after callback failed")
+	})
+
+	inv := &agent.Invocation{InvocationID: "id", AgentName: "agent"}
+	llm := &LLMAgent{agentCallbacks: cb}
+	var trackerErr error
+	tracker := itelemetry.NewInvokeAgentTracker(context.Background(), inv, false, &trackerErr)
+	wrapped := llm.wrapEventChannelWithTelemetry(
+		context.Background(),
+		inv,
+		orig,
+		noop.Span{},
+		tracker,
+		false,
+		tracecapture.StepLease{},
+	)
+
+	var events []*event.Event
+	for e := range wrapped {
+		events = append(events, e)
+	}
+	require.Len(t, events, 2)
+	require.NotNil(t, events[1].Response)
+	require.NotNil(t, events[1].Response.Error)
+	require.Equal(t, agent.ErrorTypeAgentCallbackError, events[1].Response.Error.Type)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	require.True(t, hasInvokeAgentMetricStringAttribute(
+		rm,
+		"gen_ai.client.request.cnt",
+		semconvtrace.KeyErrorType,
+		agent.ErrorTypeAgentCallbackError,
+	))
+}
+
+func hasInvokeAgentMetricStringAttribute(
+	rm metricdata.ResourceMetrics,
+	metricName string,
+	key string,
+	value string,
+) bool {
+	for _, scopeMetric := range rm.ScopeMetrics {
+		for _, metric := range scopeMetric.Metrics {
+			if metric.Name != metricName {
+				continue
+			}
+			sum, ok := metric.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			for _, point := range sum.DataPoints {
+				for _, attr := range point.Attributes.ToSlice() {
+					if string(attr.Key) == key && attr.Value.AsString() == value {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
 func TestLLMAgent_WithToolSet(t *testing.T) {
 	ct := &mockTool{name: "foo"}
 	ts := &mockToolSet{tools: []tool.Tool{ct}, name: "mock"}

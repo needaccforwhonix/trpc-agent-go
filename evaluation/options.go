@@ -10,16 +10,22 @@
 package evaluation
 
 import (
-	"runtime"
+	"errors"
+	"sync"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult"
 	evalresultinmemory "trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalset"
 	evalsetinmemory "trpc.group/trpc-go/trpc-agent-go/evaluation/evalset/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/registry"
+	tokenusage "trpc.group/trpc-go/trpc-agent-go/evaluation/internal/usage"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
 	metricinmemory "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/inmemory"
+	metricregistry "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/registry"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/service"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/usersimulation"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
 )
 
 // defaultNumRuns is the default number of runs.
@@ -31,26 +37,38 @@ type options struct {
 	evalResultManager                 evalresult.Manager
 	metricManager                     metric.Manager
 	registry                          registry.Registry
+	metricRegistry                    metricregistry.Registry
+	evalCaseResultAggregator          service.EvalCaseResultAggregator
 	evalService                       service.Service
+	expectedRunner                    runner.Runner
+	userSimulator                     usersimulation.Simulator
 	callbacks                         *service.Callbacks
+	judgeRunner                       runner.Runner
+	toolMockRunner                    runner.Runner
+	judgeRunnerNumSamples             *int
 	numRuns                           int
-	evalCaseParallelism               int
-	evalCaseParallelInferenceEnabled  bool
-	evalCaseParallelEvaluationEnabled bool
+	evalCaseIDs                       []string
+	numRunsParallelEnabled            *bool
+	evalCaseParallelism               *int
+	evalCaseParallelInferenceEnabled  *bool
+	evalCaseParallelEvaluationEnabled *bool
+	runDetailsEnabled                 bool
+	runDetailsCollector               *runDetailsCollector
+	runOptions                        []agent.RunOption
+	inferenceStats                    *evalresult.InferenceStats
+	inferenceStatsMu                  sync.Mutex
 }
 
 // newOptions creates a new options with the default values.
 func newOptions(opt ...Option) *options {
 	// Initialize options with default values.
 	opts := &options{
-		numRuns:                           defaultNumRuns,
-		evalSetManager:                    evalsetinmemory.New(),
-		evalResultManager:                 evalresultinmemory.New(),
-		metricManager:                     metricinmemory.New(),
-		registry:                          registry.New(),
-		evalCaseParallelism:               runtime.GOMAXPROCS(0),
-		evalCaseParallelInferenceEnabled:  false,
-		evalCaseParallelEvaluationEnabled: false,
+		numRuns:           defaultNumRuns,
+		evalSetManager:    evalsetinmemory.New(),
+		evalResultManager: evalresultinmemory.New(),
+		metricManager:     metricinmemory.New(),
+		registry:          registry.New(),
+		metricRegistry:    metricregistry.New(),
 	}
 	// Apply user options.
 	for _, o := range opt {
@@ -90,10 +108,31 @@ func WithRegistry(r registry.Registry) Option {
 	}
 }
 
+// WithMetricRegistry sets the metric runtime registry.
+func WithMetricRegistry(r metricregistry.Registry) Option {
+	return func(o *options) {
+		o.metricRegistry = r
+	}
+}
+
+// WithEvalCaseResultAggregator sets the eval case result aggregator for service evaluation.
+func WithEvalCaseResultAggregator(aggregator service.EvalCaseResultAggregator) Option {
+	return func(o *options) {
+		o.evalCaseResultAggregator = aggregator
+	}
+}
+
 // WithEvaluationService sets the evaluation service.
 func WithEvaluationService(s service.Service) Option {
 	return func(o *options) {
 		o.evalService = s
+	}
+}
+
+// WithUserSimulator sets the simulator used for conversation scenarios.
+func WithUserSimulator(sim usersimulation.Simulator) Option {
+	return func(o *options) {
+		o.userSimulator = sim
 	}
 }
 
@@ -104,6 +143,34 @@ func WithCallbacks(c *service.Callbacks) Option {
 	}
 }
 
+// WithJudgeRunner injects a judge runner for all LLM judge evaluators.
+func WithJudgeRunner(judge runner.Runner) Option {
+	return func(o *options) {
+		o.judgeRunner = judge
+	}
+}
+
+// WithJudgeRunnerNumSamples sets how many samples to collect from the judge runner.
+func WithJudgeRunnerNumSamples(numSamples int) Option {
+	return func(o *options) {
+		o.judgeRunnerNumSamples = &numSamples
+	}
+}
+
+// WithExpectedRunner sets the runner used to generate dynamic expected outputs.
+func WithExpectedRunner(r runner.Runner) Option {
+	return func(o *options) {
+		o.expectedRunner = r
+	}
+}
+
+// WithToolMockRunner sets the runner used to generate dynamic tool mock results.
+func WithToolMockRunner(r runner.Runner) Option {
+	return func(o *options) {
+		o.toolMockRunner = r
+	}
+}
+
 // WithNumRuns sets the number of runs.
 func WithNumRuns(numRuns int) Option {
 	return func(o *options) {
@@ -111,23 +178,115 @@ func WithNumRuns(numRuns int) Option {
 	}
 }
 
+// WithEvalCaseIDs limits evaluation to the specified eval case IDs.
+func WithEvalCaseIDs(evalCaseIDs ...string) Option {
+	return func(o *options) {
+		o.evalCaseIDs = append([]string(nil), evalCaseIDs...)
+	}
+}
+
+// WithNumRunsParallelEnabled enables or disables parallel execution across evaluation runs.
+func WithNumRunsParallelEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.numRunsParallelEnabled = &enabled
+	}
+}
+
 // WithEvalCaseParallelism sets the maximum number of eval cases processed in parallel.
 func WithEvalCaseParallelism(parallelism int) Option {
 	return func(o *options) {
-		o.evalCaseParallelism = parallelism
+		o.evalCaseParallelism = &parallelism
 	}
 }
 
 // WithEvalCaseParallelInferenceEnabled enables or disables parallel inference across eval cases.
 func WithEvalCaseParallelInferenceEnabled(enabled bool) Option {
 	return func(o *options) {
-		o.evalCaseParallelInferenceEnabled = enabled
+		o.evalCaseParallelInferenceEnabled = &enabled
 	}
 }
 
 // WithEvalCaseParallelEvaluationEnabled enables or disables parallel evaluation across eval cases.
 func WithEvalCaseParallelEvaluationEnabled(enabled bool) Option {
 	return func(o *options) {
-		o.evalCaseParallelEvaluationEnabled = enabled
+		o.evalCaseParallelEvaluationEnabled = &enabled
+	}
+}
+
+// WithRunDetailsEnabled enables or disables per-run inference details in evaluation results.
+func WithRunDetailsEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.runDetailsEnabled = enabled
+	}
+}
+
+// WithRunOptions appends agent.RunOption values that will be applied to every runner.Run call during inference.
+func WithRunOptions(opt ...agent.RunOption) Option {
+	return func(o *options) {
+		o.runOptions = append(o.runOptions, opt...)
+	}
+}
+
+func (o *options) validate(requireEvalService bool) error {
+	if o == nil {
+		return errors.New("options is nil")
+	}
+	if o.numRuns <= 0 {
+		return errors.New("num runs must be greater than 0")
+	}
+	if o.judgeRunnerNumSamples != nil && *o.judgeRunnerNumSamples <= 0 {
+		return errors.New("judge runner num samples must be greater than 0")
+	}
+	parallelInferenceEnabled := o.evalCaseParallelInferenceEnabled != nil && *o.evalCaseParallelInferenceEnabled
+	parallelEvaluationEnabled := o.evalCaseParallelEvaluationEnabled != nil && *o.evalCaseParallelEvaluationEnabled
+	if (parallelInferenceEnabled || parallelEvaluationEnabled) && o.evalCaseParallelism != nil && *o.evalCaseParallelism <= 0 {
+		return errors.New("eval case parallelism must be greater than 0")
+	}
+	if o.evalSetManager == nil {
+		return errors.New("eval set manager is nil")
+	}
+	if o.metricManager == nil {
+		return errors.New("metric manager is nil")
+	}
+	if o.evalResultManager == nil {
+		return errors.New("eval result manager is nil")
+	}
+	if o.registry == nil {
+		return errors.New("registry is nil")
+	}
+	if o.metricRegistry == nil {
+		return errors.New("metric registry is nil")
+	}
+	if requireEvalService && o.evalService == nil {
+		return errors.New("eval service is nil")
+	}
+	return nil
+}
+
+func (o *options) addInferenceStats(stats *evalresult.InferenceStats) {
+	if o == nil || stats == nil || (stats.Duration <= 0 && stats.TokenUsage == nil) {
+		return
+	}
+	o.inferenceStatsMu.Lock()
+	defer o.inferenceStatsMu.Unlock()
+	if o.inferenceStats == nil {
+		o.inferenceStats = &evalresult.InferenceStats{}
+	}
+	o.inferenceStats.Duration += stats.Duration
+	o.inferenceStats.TokenUsage = tokenusage.Add(o.inferenceStats.TokenUsage, stats.TokenUsage)
+}
+
+func (o *options) inferenceStatsValue() *evalresult.InferenceStats {
+	if o == nil {
+		return nil
+	}
+	o.inferenceStatsMu.Lock()
+	defer o.inferenceStatsMu.Unlock()
+	if o.inferenceStats == nil {
+		return nil
+	}
+	return &evalresult.InferenceStats{
+		Duration:   o.inferenceStats.Duration,
+		TokenUsage: tokenusage.Clone(o.inferenceStats.TokenUsage),
 	}
 }

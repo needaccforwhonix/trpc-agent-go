@@ -10,7 +10,7 @@ replace (
 require (
 	github.com/stretchr/testify v1.11.1
 	trpc.group/trpc-go/trpc-agent-go v0.8.0
-	trpc.group/trpc-go/trpc-agent-go/storage/s3 v1.1.2-0.20260108033914-7a20241f1ad5
+	trpc.group/trpc-go/trpc-agent-go/storage/s3 v1.8.0
 )
 
 require (
@@ -37,5 +37,5 @@ require (
 	go.uber.org/multierr v1.10.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	trpc.group/trpc-go/trpc-a2a-go v0.2.5 // indirect
+	trpc.group/trpc-go/trpc-a2a-go v0.2.6-0.20260721084546-18c8244d0acb // indirect
 )

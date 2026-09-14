@@ -12,6 +12,7 @@ package huggingface
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,12 +23,97 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 const ApiKey = "*****"
+
+type overflowTailoringStrategy struct {
+	tailored []model.Message
+}
+
+func (s overflowTailoringStrategy) TailorMessages(
+	ctx context.Context,
+	messages []model.Message,
+	maxTokens int,
+) ([]model.Message, error) {
+	return s.tailored, errors.New("minimal protected context exceeds token budget")
+}
+
+func TestWithContextWindow(t *testing.T) {
+	m, err := New("test-model", WithAPIKey("test-key"), WithContextWindow(204800))
+	require.NoError(t, err)
+	require.Equal(t, 204800, m.Info().ContextWindow)
+
+	m, err = New("test-model", WithAPIKey("test-key"), WithContextWindow(0))
+	require.NoError(t, err)
+	require.Zero(t, m.Info().ContextWindow)
+}
+
+func TestModel_CallbackPanicsAreRecovered(t *testing.T) {
+	t.Run("request callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatRequestCallback: func(ctx context.Context, req *ChatCompletionRequest) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatRequestCallback(context.Background(), &ChatCompletionRequest{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("response callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatResponseCallback: func(ctx context.Context, req *ChatCompletionRequest, resp *ChatCompletionResponse) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatResponseCallback(context.Background(), &ChatCompletionRequest{}, &ChatCompletionResponse{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("chunk callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatChunkCallback: func(ctx context.Context, req *ChatCompletionRequest, chunk *ChatCompletionChunk) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatChunkCallback(context.Background(), &ChatCompletionRequest{}, &ChatCompletionChunk{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("stream complete callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatStreamCompleteCallback: func(ctx context.Context, req *ChatCompletionRequest, err error) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatStreamCompleteCallback(context.Background(), &ChatCompletionRequest{}, nil)
+		})
+		assert.True(t, callbackCalled)
+	})
+}
 
 func TestNew(t *testing.T) {
 	tests := []struct {
@@ -482,13 +568,12 @@ func TestModel_TokenTailoring(t *testing.T) {
 				{Role: model.RoleUser, Content: "How are you?"},
 			},
 			expectTailoring: true,
-			expectMaxTokens: true,
+			expectMaxTokens: false,
 			validateRequest: func(t *testing.T, req *model.Request) {
 				// Messages should remain the same for small conversations.
 				assert.Len(t, req.Messages, 3)
-				// MaxTokens should be set automatically.
-				assert.NotNil(t, req.GenerationConfig.MaxTokens)
-				assert.Greater(t, *req.GenerationConfig.MaxTokens, 0)
+				// MaxTokens should stay unset unless user specifies it.
+				assert.Nil(t, req.GenerationConfig.MaxTokens)
 			},
 		},
 		{
@@ -503,12 +588,12 @@ func TestModel_TokenTailoring(t *testing.T) {
 				{Role: model.RoleUser, Content: "How are you?"},
 			},
 			expectTailoring: true,
-			expectMaxTokens: true,
+			expectMaxTokens: false,
 			validateRequest: func(t *testing.T, req *model.Request) {
 				// Messages should remain the same for small conversations.
 				assert.LessOrEqual(t, len(req.Messages), 3)
-				// MaxTokens should be set.
-				assert.NotNil(t, req.GenerationConfig.MaxTokens)
+				// MaxTokens should stay unset unless user specifies it.
+				assert.Nil(t, req.GenerationConfig.MaxTokens)
 			},
 		},
 		{
@@ -547,10 +632,10 @@ func TestModel_TokenTailoring(t *testing.T) {
 				{Role: model.RoleUser, Content: "Test message"},
 			},
 			expectTailoring: true,
-			expectMaxTokens: true,
+			expectMaxTokens: false,
 			validateRequest: func(t *testing.T, req *model.Request) {
 				assert.NotEmpty(t, req.Messages)
-				assert.NotNil(t, req.GenerationConfig.MaxTokens)
+				assert.Nil(t, req.GenerationConfig.MaxTokens)
 			},
 		},
 		{
@@ -635,6 +720,28 @@ func TestModel_TokenTailoring(t *testing.T) {
 	}
 }
 
+func TestWithTokenTailoring_UsesProtectedContextOnOverflow(t *testing.T) {
+	tailored := []model.Message{
+		model.NewSystemMessage("sys"),
+		model.NewUserMessage("q"),
+	}
+	m := &Model{
+		name:                 "test-model",
+		enableTokenTailoring: true,
+		maxInputTokens:       1,
+		tailoringStrategy:    overflowTailoringStrategy{tailored: tailored},
+	}
+	req := &model.Request{Messages: []model.Message{
+		model.NewSystemMessage("sys"),
+		model.NewUserMessage("old"),
+		model.NewUserMessage("q"),
+	}}
+
+	m.applyTokenTailoring(context.Background(), req)
+
+	require.Equal(t, tailored, req.Messages)
+}
+
 func TestModel_TokenTailoring_Integration(t *testing.T) {
 	// create mock HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -709,13 +816,11 @@ func TestModel_TokenTailoring_Integration(t *testing.T) {
 	}
 
 	log.Infof("request.Messages: %d", len(request.Messages))
-	log.Infof("request.GenerationConfig MaxTokens: %d", *request.GenerationConfig.MaxTokens)
 	// Verify that messages were tailored (reduced).
 	assert.Less(t, len(request.Messages), 200, "Messages should be tailored to fit token limit")
 	assert.Greater(t, len(request.Messages), 0, "Should have at least some messages")
-	// Verify that MaxTokens was set.
-	assert.NotNil(t, request.GenerationConfig.MaxTokens)
-	assert.Greater(t, *request.GenerationConfig.MaxTokens, 0)
+	// Verify that MaxTokens stays unset unless user specifies it.
+	assert.Nil(t, request.GenerationConfig.MaxTokens)
 
 	// Verify response was received.
 	require.NotEmpty(t, responses, "Should receive at least one response")
@@ -1243,10 +1348,16 @@ func TestModel_StreamingError(t *testing.T) {
 	}))
 	defer server.Close()
 
+	callbackCalled := make(chan struct{})
+	var callbackErr error
 	m, err := New(
 		"test-model",
 		WithAPIKey("invalid-key"),
 		WithBaseURL(server.URL),
+		WithChatStreamCompleteCallback(func(ctx context.Context, req *ChatCompletionRequest, err error) {
+			callbackErr = err
+			close(callbackCalled)
+		}),
 	)
 	require.NoError(t, err)
 
@@ -1266,11 +1377,20 @@ func TestModel_StreamingError(t *testing.T) {
 	var responses []*model.Response
 	for resp := range responseChan {
 		responses = append(responses, resp)
+		if resp.Error != nil {
+			select {
+			case <-callbackCalled:
+			default:
+				t.Fatal("stream-complete callback must run before error response is emitted")
+			}
+		}
 	}
 
 	require.NotEmpty(t, responses)
 	assert.NotNil(t, responses[0].Error)
 	assert.Contains(t, responses[0].Error.Message, "Unauthorized")
+	require.Error(t, callbackErr)
+	assert.Contains(t, callbackErr.Error(), "Unauthorized")
 }
 
 // TestModel_NonStreamingError tests non-streaming request error handling
@@ -1794,6 +1914,42 @@ func TestMarshalRequest(t *testing.T) {
 		json.Unmarshal(data, &result)
 		assert.Equal(t, "request_value", result["request_field"])
 	})
+}
+
+func TestMarshalRequest_ToolsDisabledFiltersExtraFields(t *testing.T) {
+	m := &Model{
+		extraFields: map[string]any{
+			"tool_choice":         "required",
+			"parallel_tool_calls": true,
+			"functions":           []any{},
+			"model_field":         "model-value",
+		},
+	}
+	hfRequest := &ChatCompletionRequest{
+		Model:      "test-model",
+		Messages:   []ChatMessage{{Role: "user", Content: "test"}},
+		Tools:      []Tool{{Type: "function"}},
+		ToolChoice: "required",
+		ExtraFields: map[string]any{
+			"tools":         []any{},
+			"function_call": "auto",
+			"request_field": "request-value",
+		},
+	}
+	ctx := imodelrequest.WithToolsDisabled(context.Background())
+
+	data, err := m.marshalRequestForContext(ctx, hfRequest)
+
+	require.NoError(t, err)
+	var captured map[string]any
+	require.NoError(t, json.Unmarshal(data, &captured))
+	require.NotContains(t, captured, "tool_choice")
+	require.NotContains(t, captured, "parallel_tool_calls")
+	require.NotContains(t, captured, "tools")
+	require.NotContains(t, captured, "function_call")
+	require.NotContains(t, captured, "functions")
+	require.Equal(t, "model-value", captured["model_field"])
+	require.Equal(t, "request-value", captured["request_field"])
 }
 
 // TestModel_MultimodalResponse tests handling of multimodal responses
@@ -2404,20 +2560,34 @@ func TestModel_NonStreamingWithError(t *testing.T) {
 
 // TestModel_StreamingReadError tests streaming with read error
 func TestModel_StreamingReadError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		// Send one valid chunk then close connection abruptly
-		fmt.Fprint(w, `data: {"id":"test","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"test"},"finish_reason":null}]}`+"\n\n")
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		// Connection will be closed by server shutdown
-	}))
-
+	streamErr := errors.New("stream read error")
+	callbackCalled := make(chan struct{})
+	var callbackErr error
+	customClient := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set("Content-Type", "text/event-stream")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     header,
+				Body: &errAfterReadCloser{
+					reader: strings.NewReader(
+						`data: {"id":"test","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"test"},"finish_reason":null}]}` + "\n\n",
+					),
+					err: streamErr,
+				},
+			}, nil
+		}),
+	}
 	m, err := New(
 		"test-model",
 		WithAPIKey("test-key"),
-		WithBaseURL(server.URL),
+		WithBaseURL("https://example.test"),
+		WithHTTPClient(customClient),
+		WithChatStreamCompleteCallback(func(ctx context.Context, req *ChatCompletionRequest, err error) {
+			callbackErr = err
+			close(callbackCalled)
+		}),
 	)
 	require.NoError(t, err)
 
@@ -2434,16 +2604,50 @@ func TestModel_StreamingReadError(t *testing.T) {
 	responseChan, err := m.GenerateContent(ctx, request)
 	require.NoError(t, err)
 
-	// Close server to simulate connection error
-	server.Close()
-
 	var responses []*model.Response
 	for resp := range responseChan {
 		responses = append(responses, resp)
+		if resp.Error != nil {
+			select {
+			case <-callbackCalled:
+			default:
+				t.Fatal("stream-complete callback must run before error response is emitted")
+			}
+		}
 	}
 
-	// Should receive at least one response (could be error or valid chunk)
-	require.NotEmpty(t, responses)
+	require.Len(t, responses, 2)
+	assert.Nil(t, responses[0].Error)
+	require.NotNil(t, responses[1].Error)
+	assert.Contains(t, responses[1].Error.Message, "stream read error")
+	require.ErrorIs(t, callbackErr, streamErr)
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type errAfterReadCloser struct {
+	reader *strings.Reader
+	err    error
+}
+
+func (r *errAfterReadCloser) Read(p []byte) (int, error) {
+	if r.reader.Len() > 0 {
+		return r.reader.Read(p)
+	}
+	if r.err != nil {
+		err := r.err
+		r.err = nil
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func (r *errAfterReadCloser) Close() error {
+	return nil
 }
 
 // TestModel_TokenTailoringWithCustomConfig tests token tailoring with custom config
@@ -2691,8 +2895,8 @@ func TestModel_TokenTailoringWithAutoCalculation(t *testing.T) {
 	assert.Nil(t, responses[0].Error)
 	// Messages should be tailored (or at least not increased)
 	assert.LessOrEqual(t, len(request.Messages), 100)
-	// MaxTokens should be set automatically
-	assert.NotNil(t, request.GenerationConfig.MaxTokens)
+	// MaxTokens should stay unset unless user specifies it
+	assert.Nil(t, request.GenerationConfig.MaxTokens)
 }
 
 // TestModel_RequestWithMaxTokensSet tests that user-specified MaxTokens is respected
@@ -3479,8 +3683,9 @@ func TestGenerateContent_WithExtraFields(t *testing.T) {
 		var req map[string]any
 		json.NewDecoder(r.Body).Decode(&req)
 
-		// Verify extra fields are present
-		assert.Equal(t, "custom_value", req["custom_field"])
+		// Verify extra fields are present and request-level fields take precedence.
+		assert.Equal(t, "request_value", req["custom_field"])
+		assert.Equal(t, "cache-1", req["prompt_cache_key"])
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(ChatCompletionResponse{
@@ -3515,6 +3720,10 @@ func TestGenerateContent_WithExtraFields(t *testing.T) {
 	request := &model.Request{
 		Messages: []model.Message{
 			{Role: "user", Content: "Hello"},
+		},
+		ExtraFields: map[string]any{
+			"custom_field":     "request_value",
+			"prompt_cache_key": "cache-1",
 		},
 	}
 
@@ -3820,9 +4029,7 @@ func TestGenerateContent_TokenTailoringAppliedToRequest(t *testing.T) {
 
 	t.Logf("原始消息数: %d, 实际发送消息数: %d", len(request.Messages), len(capturedRequest.Messages))
 
-	require.NotNil(t, capturedRequest.MaxTokens, "MaxTokens 应该被自动设置")
-	assert.Greater(t, *capturedRequest.MaxTokens, 0, "MaxTokens 应该大于 0")
-	t.Logf("自动设置的 MaxTokens: %d", *capturedRequest.MaxTokens)
+	require.Nil(t, capturedRequest.MaxTokens, "MaxTokens should stay unset")
 
 	if len(capturedRequest.Messages) < len(request.Messages) {
 		t.Logf("消息已被裁剪，从 %d 条减少到 %d 条", len(request.Messages), len(capturedRequest.Messages))
@@ -3891,4 +4098,105 @@ func TestGenerateContent_TokenTailoringWithUserMaxTokens(t *testing.T) {
 	require.NotNil(t, capturedRequest.MaxTokens, "MaxTokens 不应该为 nil")
 	assert.Equal(t, userMaxTokens, *capturedRequest.MaxTokens, "应该使用用户指定的 MaxTokens")
 	t.Logf("用户指定的 MaxTokens 被正确保留: %d", *capturedRequest.MaxTokens)
+}
+
+// TestChatRequestCallbackSynchronous verifies that
+// chatRequestCallback is invoked synchronously inside
+// GenerateContent, before the response goroutine starts.
+func TestChatRequestCallbackSynchronous(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming", stream: false},
+		{name: "streaming", stream: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					if !strings.HasSuffix(
+						r.URL.Path, "/chat/completions",
+					) {
+						http.Error(w, "not found",
+							http.StatusNotFound)
+						return
+					}
+					if tt.stream {
+						w.Header().Set("Content-Type",
+							"text/event-stream")
+						flusher, _ := w.(http.Flusher)
+						fmt.Fprint(w,
+							`data: {"id":"s","object":`+
+								`"chat.completion.chunk",`+
+								`"created":1,"model":"m",`+
+								`"choices":[{"index":0,`+
+								`"delta":{"role":"assistant",`+
+								`"content":"hi"},`+
+								`"finish_reason":"stop"}]}`+
+								"\n\n")
+						flusher.Flush()
+						fmt.Fprint(w,
+							"data: [DONE]\n\n")
+						flusher.Flush()
+						return
+					}
+					w.Header().Set("Content-Type",
+						"application/json")
+					fmt.Fprint(w,
+						`{"id":"n","object":`+
+							`"chat.completion",`+
+							`"created":1,"model":"m",`+
+							`"choices":[{"index":0,`+
+							`"message":{"role":"assistant",`+
+							`"content":"hi"},`+
+							`"finish_reason":"stop"}],`+
+							`"usage":{"prompt_tokens":1,`+
+							`"completion_tokens":1,`+
+							`"total_tokens":2}}`)
+				}))
+			defer server.Close()
+
+			var callCount int64
+			m, err := New("test-model",
+				WithAPIKey("key"),
+				WithBaseURL(server.URL),
+				WithChatRequestCallback(
+					func(_ context.Context,
+						_ *ChatCompletionRequest,
+					) {
+						callCount++
+					}),
+			)
+			require.NoError(t, err)
+
+			req := &model.Request{
+				Messages: []model.Message{
+					{Role: model.RoleUser,
+						Content: "hi"},
+				},
+				GenerationConfig: model.GenerationConfig{
+					Stream: tt.stream,
+				},
+			}
+
+			ch, err := m.GenerateContent(
+				context.Background(), req)
+			require.NoError(t, err)
+
+			// Callback must have fired synchronously
+			// before GenerateContent returned.
+			assert.Equal(t, int64(1), callCount,
+				"callback must execute exactly once "+
+					"before GenerateContent returns")
+
+			// Drain the channel to avoid goroutine leak.
+			for range ch {
+			}
+
+			// Confirm no extra invocations after drain.
+			assert.Equal(t, int64(1), callCount,
+				"callback must not be called more than once")
+		})
+	}
 }

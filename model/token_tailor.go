@@ -26,6 +26,9 @@ type simpleTokenCounterOptions struct {
 type SimpleTokenCounterOption func(*simpleTokenCounterOptions)
 
 // WithApproxRunesPerToken sets the approximate runes per token heuristic.
+// The value is a divisor: estimated tokens = counted UTF-8 runes / v.
+// For example, v=1.5 means roughly 1.5 runes per token, while v=2.0/3.0
+// means roughly 0.67 runes per token, or about 1.5 tokens per rune.
 // This is a heuristic and may vary across languages and models.
 //
 // Note:
@@ -51,6 +54,9 @@ type TokenTailoringConfig struct {
 	// InputTokensFloor is the minimum number of input tokens.
 	InputTokensFloor int
 	// OutputTokensFloor is the minimum number of output tokens.
+	//
+	// Deprecated: OutputTokensFloor is no longer used. Token tailoring no
+	// longer auto-calculates output MaxTokens.
 	OutputTokensFloor int
 	// SafetyMarginRatio is the safety margin ratio for token counting
 	// inaccuracies.
@@ -74,11 +80,26 @@ type TokenCounter interface {
 // TailoringStrategy tailors messages to fit within a token budget.
 type TailoringStrategy interface {
 	// TailorMessages reduces message list so total tokens are within maxTokens.
+	// If the smallest protected context cannot fit, it returns that best-effort
+	// context together with an error.
 	TailorMessages(ctx context.Context, messages []Message, maxTokens int) ([]Message, error)
 }
 
+type tokenTailoringOverflowError struct {
+	Tokens    int
+	MaxTokens int
+}
+
+func (e *tokenTailoringOverflowError) Error() string {
+	return fmt.Sprintf(
+		"token tailoring overflow: minimal protected context uses %d tokens, max input tokens is %d",
+		e.Tokens,
+		e.MaxTokens,
+	)
+}
+
 // SimpleTokenCounter provides a very rough token estimation based on rune length.
-// Heuristic: approximately one token per several UTF-8 runes for text fields.
+// Heuristic: approximately one token per configured number of UTF-8 runes.
 type SimpleTokenCounter struct {
 	approxRunesPerToken float64
 }
@@ -349,7 +370,11 @@ func countTokensForRounds(prefixSum []int, rounds []userAnchoredRound, keep []bo
 	return total
 }
 
-// ensureTailoredWithinBudget ensures the tailored result is within the budget.
+// ensureTailoredWithinBudget returns the smallest protected context when the
+// tailored result is still over budget. The protected context keeps the system
+// prefix and the latest valid round. If that minimal context is still too large,
+// the caller should surface the overflow instead of silently dropping system
+// instructions.
 func ensureTailoredWithinBudget(
 	ctx context.Context,
 	tokenCounter TokenCounter,
@@ -362,18 +387,21 @@ func ensureTailoredWithinBudget(
 	}
 
 	preservedHead := calculatePreservedHeadCount(messages)
-	withSystem, withoutSystem := buildMinimalSuffixCandidates(messages, preservedHead)
-	if fitsWithinBudget(ctx, tokenCounter, withSystem, maxTokens) {
-		return withSystem, nil
-	}
-
-	if len(withoutSystem) == 0 {
+	candidate := buildMinimalSuffixCandidate(messages, preservedHead)
+	if len(candidate) == 0 {
 		return nil, nil
 	}
-	if fitsWithinBudget(ctx, tokenCounter, withoutSystem, maxTokens) {
-		return withoutSystem, nil
+	if fitsWithinBudget(ctx, tokenCounter, candidate, maxTokens) {
+		return candidate, nil
 	}
-	return withoutSystem, nil
+	tokens, err := countCandidateTokens(ctx, tokenCounter, candidate)
+	if err != nil {
+		return candidate, err
+	}
+	return candidate, &tokenTailoringOverflowError{
+		Tokens:    tokens,
+		MaxTokens: maxTokens,
+	}
 }
 
 // shouldReturnOriginal checks if the messages should be returned as is.
@@ -386,8 +414,8 @@ func shouldReturnOriginal(
 	if len(messages) == 0 {
 		return true, messages
 	}
-	if maxTokens <= 0 {
-		return true, nil
+	if tokenCounter == nil {
+		tokenCounter = NewSimpleTokenCounter()
 	}
 	tokens, err := tokenCounter.CountTokensRange(ctx, messages, 0, len(messages))
 	if err != nil {
@@ -409,6 +437,9 @@ func fitsWithinBudget(
 	if len(messages) == 0 {
 		return false
 	}
+	if tokenCounter == nil {
+		tokenCounter = NewSimpleTokenCounter()
+	}
 	tokens, err := tokenCounter.CountTokensRange(ctx, messages, 0, len(messages))
 	if err != nil {
 		return false
@@ -416,21 +447,33 @@ func fitsWithinBudget(
 	return tokens <= maxTokens
 }
 
-// buildMinimalSuffixCandidates builds the minimal suffix candidates for the messages.
-func buildMinimalSuffixCandidates(messages []Message, preservedHead int) ([]Message, []Message) {
+func countCandidateTokens(
+	ctx context.Context,
+	tokenCounter TokenCounter,
+	messages []Message,
+) (int, error) {
+	if tokenCounter == nil {
+		tokenCounter = NewSimpleTokenCounter()
+	}
+	return tokenCounter.CountTokensRange(ctx, messages, 0, len(messages))
+}
+
+// buildMinimalSuffixCandidate builds the smallest protected context for the
+// messages: the system prefix plus the latest valid user-anchored round.
+func buildMinimalSuffixCandidate(messages []Message, preservedHead int) []Message {
 	last := lastNonSystemIndex(messages)
 	if last < 0 {
-		return nil, nil
+		return nil
 	}
 
 	last = trimTrailingAssistant(messages, last)
 	if last < 0 {
-		return nil, nil
+		return nil
 	}
 
 	start := startOfUserToolGroup(messages, last)
 	if start < 0 {
-		return nil, nil
+		return nil
 	}
 
 	end := last + 1
@@ -442,8 +485,7 @@ func buildMinimalSuffixCandidates(messages []Message, preservedHead int) ([]Mess
 	withSystem = append(withSystem, messages[start:end]...)
 	withSystem = validateAndFixMessageSequence(withSystem)
 
-	withoutSystem := validateAndFixMessageSequence(messages[start:end])
-	return withSystem, withoutSystem
+	return withSystem
 }
 
 // lastNonSystemIndex finds the last non-system message index.
@@ -504,16 +546,20 @@ func (s *MiddleOutStrategy) TailorMessages(ctx context.Context, messages []Messa
 		keep[i] = true
 	}
 
+	// Compute initial total once; subsequent updates are O(1) via prefix sums.
+	headTokens := prefixSum[preservedHead]
+	allRoundsTokens := countTokensForRounds(prefixSum, rounds, keep)
+	currentTotal := headTokens + allRoundsTokens
+
 	lastRoundIdx := len(rounds) - 1
+	// Pre-allocate once, reuse each iteration to avoid repeated allocations.
+	keptNonLast := make([]int, 0, lastRoundIdx)
 	for {
-		headTokens := prefixSum[preservedHead]
-		roundTokens := countTokensForRounds(prefixSum, rounds, keep)
-		total := headTokens + roundTokens
-		if total <= maxTokens {
+		if currentTotal <= maxTokens {
 			break
 		}
 
-		keptNonLast := make([]int, 0, len(rounds)-1)
+		keptNonLast = keptNonLast[:0]
 		for i := 0; i < lastRoundIdx; i++ {
 			if keep[i] {
 				keptNonLast = append(keptNonLast, i)
@@ -524,7 +570,11 @@ func (s *MiddleOutStrategy) TailorMessages(ctx context.Context, messages []Messa
 		}
 
 		midPos := len(keptNonLast) / 2
-		keep[keptNonLast[midPos]] = false
+		removeIdx := keptNonLast[midPos]
+		// O(1) incremental update: subtract the removed round's tokens.
+		removedTokens := countTokensWithPrefixSum(prefixSum, rounds[removeIdx].start, rounds[removeIdx].end)
+		currentTotal -= removedTokens
+		keep[removeIdx] = false
 	}
 
 	result := buildRoundTailoredResult(messages, preservedHead, rounds, keep)
@@ -571,18 +621,23 @@ func (s *HeadOutStrategy) TailorMessages(ctx context.Context, messages []Message
 		keep[i] = true
 	}
 
+	// Compute initial total once; subsequent updates are O(1) via prefix sums.
+	headTokens := prefixSum[preservedHead]
+	allRoundsTokens := countTokensForRounds(prefixSum, rounds, keep)
+	currentTotal := headTokens + allRoundsTokens
+
 	lastRoundIdx := len(rounds) - 1
 	dropIdx := 0
 	for {
-		headTokens := prefixSum[preservedHead]
-		roundTokens := countTokensForRounds(prefixSum, rounds, keep)
-		total := headTokens + roundTokens
-		if total <= maxTokens {
+		if currentTotal <= maxTokens {
 			break
 		}
 		if dropIdx >= lastRoundIdx {
 			break
 		}
+		// O(1) incremental update.
+		removedTokens := countTokensWithPrefixSum(prefixSum, rounds[dropIdx].start, rounds[dropIdx].end)
+		currentTotal -= removedTokens
 		keep[dropIdx] = false
 		dropIdx++
 	}
@@ -631,18 +686,23 @@ func (s *TailOutStrategy) TailorMessages(ctx context.Context, messages []Message
 		keep[i] = true
 	}
 
+	// Compute initial total once; subsequent updates are O(1) via prefix sums.
+	headTokens := prefixSum[preservedHead]
+	allRoundsTokens := countTokensForRounds(prefixSum, rounds, keep)
+	currentTotal := headTokens + allRoundsTokens
+
 	lastRoundIdx := len(rounds) - 1
 	dropIdx := lastRoundIdx - 1
 	for {
-		headTokens := prefixSum[preservedHead]
-		roundTokens := countTokensForRounds(prefixSum, rounds, keep)
-		total := headTokens + roundTokens
-		if total <= maxTokens {
+		if currentTotal <= maxTokens {
 			break
 		}
 		if dropIdx < 0 {
 			break
 		}
+		// O(1) incremental update.
+		removedTokens := countTokensWithPrefixSum(prefixSum, rounds[dropIdx].start, rounds[dropIdx].end)
+		currentTotal -= removedTokens
 		keep[dropIdx] = false
 		dropIdx--
 	}

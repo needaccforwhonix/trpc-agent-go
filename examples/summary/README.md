@@ -12,8 +12,43 @@ This example demonstrates LLM-driven session summarization integrated with the f
 - LLM-based summarization per session turn.
 - Simple trigger configuration using event-count threshold.
 - Prompt construction that injects the latest summary and recent events.
+- Context-aware routing can be found in `examples/summary/contextaware`.
+- FilterKey summary dispatch policy, including allowlists and full-session cascade control, can be found in `examples/summary/filterkey`.
+- Summary injection mode comparison can be found in `examples/summary/injection`.
 - Backend-specific persistence:
   - Summary text is stored in `sess.Summaries[filterKey]` for both backends.
+
+## Summary + Progressive Disclosure
+
+This example uses `inmemory`, so it demonstrates summary generation and summary
+injection only. It does **not** surface `session_search` / `session_load`.
+
+If you want the model to recover hidden details on demand after summary or
+context compaction, switch to a backend that supports both search and anchor
+window loading, such as `session/pgvector`, and enable the progressive-
+disclosure path:
+
+```go
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(llm),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithEnableContextCompaction(true),
+    llmagent.WithEnableOnDemandSession(true),
+)
+```
+
+Practical scope choices:
+
+- `current_hidden`: for details hidden behind the current summary boundary
+- `current_session`: for current-session details or tool results hidden by
+  request projection / context compaction
+- `other_sessions`: for recalling another session of the same user
+
+Current recall behavior:
+
+- searchable/loadable: user messages, assistant messages, tool results
+- not indexed: raw tool-call requests, partial events
 
 ## Prerequisites
 
@@ -41,7 +76,7 @@ go run main.go -events 0 -tokens 0 -time-sec 0
 
 Command-line flags:
 
-- `-model`: Model name to use for both chat and summarization. Default: `deepseek-chat`.
+- `-model`: Model name to use for both chat and summarization. Default: `deepseek-v4-flash`.
 - `-streaming`: Enable streaming mode for responses. Default: `true`.
 - `-events`: Event count threshold to trigger summarization. Default: `1`.
 - `-tokens`: Token-count threshold to trigger summarization (0=disabled). Default: `0`.
@@ -63,7 +98,7 @@ Example output:
 
 ```
 📝 Session Summarization Chat
-Model: deepseek-chat
+Model: deepseek-v4-flash
 Service: inmemory
 EventThreshold: 1
 TokenThreshold: 0
@@ -169,7 +204,10 @@ You can customize the summary prompt to control how conversations are summarized
 ### Available Placeholders
 
 - **`{conversation_text}`**: The conversation content to be summarized
-- **`{max_summary_words}`**: The maximum word count for the summary (only included when `WithMaxSummaryWords` is set). In the default prompt, this placeholder is replaced with a natural instruction like "Please keep the summary within 100 words." In custom prompts, it's replaced with just the number, allowing you to control the wording in your preferred language.
+- **`{previous_summary}`**: Optional previous rolling summary. When present in
+  `WithPrompt`, `{conversation_text}` contains only newly uncovered events;
+  otherwise the previous summary remains merged into the conversation text
+- **`{max_summary_words}`**: The maximum word count for the summary (only included when `WithMaxSummaryWords` is set). In the default prompt, this placeholder is replaced with a natural instruction like "Please keep the summary within 100 words." In custom prompts, it's replaced with just the number, allowing you to control the wording in your preferred language. When `WithMaxSummaryWords(...)` is set, include this placeholder in either `WithPrompt(...)` or `WithSystemPrompt(...)`.
 
 ### Example Usage
 
@@ -183,6 +221,9 @@ summary.WithPrompt("Extract technical insights from this conversation: {conversa
 // Custom prompt for concise summaries
 summary.WithPrompt("Provide a brief summary of this conversation: {conversation_text}")
 
+// Position the previous rolling summary separately from new events
+summary.WithPrompt("<previous_summary>\n{previous_summary}\n</previous_summary>\n<new_conversation>\n{conversation_text}\n</new_conversation>\nUpdated summary:")
+
 // Custom prompt with length limit (English)
 summary.WithPrompt("Summarize this conversation in no more than {max_summary_words} words: {conversation_text}")
 
@@ -191,6 +232,10 @@ summary.WithPrompt("请将以下对话总结为不超过{max_summary_words}个�
 
 // Custom prompt with length limit (mixed language)
 summary.WithPrompt("请总结以下对话，控制在{max_summary_words}字以内：{conversation_text}")
+
+// Put stable instructions in a dedicated system message
+summary.WithSystemPrompt("Focus on decisions and keep it within {max_summary_words} words.")
+summary.WithPrompt("<conversation>\n{conversation_text}\n</conversation>\n\nSummary:")
 ```
 
 ## Summary Options
@@ -201,17 +246,21 @@ The `SessionSummarizer` supports various configuration options to customize summ
 
 - **`WithMaxSummaryWords(maxWords int)`**: Sets the maximum word count for generated summaries. When set to 0 (default), no word limit is applied. The word limit is included in the prompt to guide the model's generation rather than truncating the output.
 
-- **`WithPrompt(prompt string)`**: Customizes the prompt template used for summary generation. The prompt must include the `{conversation_text}` placeholder. See the [Prompt Customization](#prompt-customization) section for details and examples.
+- **`WithPrompt(prompt string)`**: Customizes the prompt template used for summary generation. The prompt must include `{conversation_text}` and may include `{previous_summary}`. See the [Prompt Customization](#prompt-customization) section for details and examples.
+
+- **`WithSystemPrompt(prompt string)`**: Adds a dedicated system message for summarization instructions. It must not include `{conversation_text}` or `{previous_summary}`; keep the conversation content in the user prompt so the system message remains instruction-only.
 
 - **`WithSkipRecent(skipFunc SkipRecentFunc)`**: Sets a custom function that returns how many recent events to skip during summarization. Return 0 to skip none. Useful for avoiding summarizing very recent/incomplete turns, or applying time/content-based skipping strategies.
 
 ### Trigger Options
 
+- **`WithContextThreshold(opts ...ContextThresholdOption)`**: Zero-configuration trigger that dynamically resolves the model's context window at runtime. Calculates a token threshold as a fraction of the context window (default 50%), automatically adapting when the user switches models. Recommended for coding agents and long-running sessions. Options: `WithContextThresholdRatio(ratio)`, `WithContextThresholdFallbackWindow(tokens)`, `WithContextThresholdMinTokens(tokens)`.
+
 - **`WithEventThreshold(eventCount int)`**: Triggers summarization when the number of events exceeds the threshold.
 
 - **`WithTokenThreshold(tokenCount int)`**: Triggers summarization when the estimated token count exceeds the threshold (0=disabled).
 
-- **`WithTimeThreshold(interval time.Duration)`**: Triggers summarization when the time elapsed since the last event exceeds the interval (useful for periodic summarization in long-running sessions).
+- **`WithTimeThreshold(interval time.Duration)`**: In the Runner path, triggers when the idle gap before the current top-level request exceeds the interval. It is evaluated on a summary check, not by a background timer. Direct calls without a Runner request observation retain the last-event-age fallback.
 
 ### Composite Trigger Options
 
@@ -220,6 +269,14 @@ The `SessionSummarizer` supports various configuration options to customize summ
 - **`WithChecksAll(checks ...Checker)`**: Triggers summarization when ALL of the provided checks pass (AND logic).
 
 ### Example Usage
+
+```go
+// Zero-configuration: auto-detect context window and compact when needed
+sum := summary.NewSummarizer(model,
+    summary.WithContextThreshold(), // Recommended for coding agents
+    summary.WithMaxSummaryWords(200),
+)
+```
 
 ```go
 // Basic configuration

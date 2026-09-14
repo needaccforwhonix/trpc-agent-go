@@ -1,5 +1,7 @@
 # Knowledge 使用文档
 
+![Knowledge Chunking Viewer](../../assets/img/knowledge/chunk-viewer.png)
+
 ## 概述
 
 Knowledge 是 tRPC-Agent-Go 框架中的知识管理系统，为 Agent 提供检索增强生成（Retrieval-Augmented Generation, RAG）能力。通过集成向量数据、embedding 模型和文档处理组件，Knowledge 系统能够帮助 Agent 访问和检索相关的知识信息，从而提供更准确、更有依据的响应。
@@ -18,6 +20,7 @@ Knowledge 系统的使用遵循以下模式：
 
 - **智能检索**：基于向量相似度的语义搜索
 - **多源支持**：支持文件、目录、URL 等多种知识来源
+- **复杂文档提取**：支持在加载前先将 PDF、HTML 等复杂格式转换为 Markdown 或文本
 - **灵活存储**：支持内存、PostgreSQL、TcVector 等多种存储后端
 - **高性能处理**：并发处理和批量文档加载
 - **知识过滤**：通过元数据，支持知识的静态过滤和 Agent 智能过滤
@@ -169,12 +172,16 @@ knowledge/
 │   ├── transform.go     # Transformer 接口定义
 │   ├── charfilter.go    # 字符过滤器（移除指定字符）
 │   └── chardedup.go     # 字符去重器（合并连续重复字符）
+├── extractor/            # 内容提取器（将复杂格式先转换为 markdown/text）
+│   ├── extractor.go     # Extractor 接口定义
+│   └── docling/         # Docling 提取器实现
 ├── document/             # 文档处理
 │   ├── document.go      # Document 结构定义
 │   └── reader/          # 文档读取器（支持 txt/md/csv/json/docx/pdf 等格式）
 ├── query/                # 查询增强器
 │   ├── query.go         # QueryEnhancer 接口定义
-│   └── passthrough.go   # 默认透传增强器
+│   ├── passthrough.go   # 默认透传增强器
+│   └── llm.go           # LLM 查询改写增强器
 └── ocr/                  # OCR 文字识别
     ├── ocr.go           # Extractor 接口定义
     └── tesseract/       # Tesseract OCR 实现（独立 go.mod）
@@ -341,12 +348,82 @@ err := kb.Load(ctx,
 > - 请根据吞吐、成本与限流情况调节 `WithSourceConcurrency()`、`WithDocConcurrency()`
 > - 默认值在多数场景下较为均衡；需要更快速度可适当上调，遇到限流则下调
 
+### 批量 Embedding
+
+默认情况下每个文档单独发起一次 embedding 请求，加载一个包含 `N` 个文档的 source 就会产生 `N` 次请求。`WithEmbeddingBatchSize(B)` 会把多个文档合并为一次多输入请求，把该 source 的请求数降为 `ceil(N/B)`：
+
+```go
+err := kb.Load(ctx,
+    knowledge.WithDocConcurrency(4),       // 最多 4 个批次同时在途
+    knowledge.WithEmbeddingBatchSize(32),  // 每次请求最多 32 个文档
+)
+```
+
+批量默认关闭，且仅在所配置的 embedder 实现了 `embedder.BatchEmbedder` 时生效。内置的 OpenAI 兼容 embedder（`knowledge/embedder/openai`）已实现该接口，会以字符串数组的形式发送输入。当 embedder 不支持批量、未配置 embedder（由向量库远程生成 embedding），或通过 `WithEnableSourceSync(true)` 开启了 source sync 时，加载会继续走原有的逐文档路径，行为不变，并会打印日志说明所配置的批量大小被忽略，便于发现无效配置。
+
+两个选项可以组合使用：`WithDocConcurrency(n)` 限制并发批次数，因此在途文档数最多为 `n * B`。
+
+> **关于正确性与限制**：
+>
+> - 批次不会跨 source 合并，因为每个 source 是独立的处理单元。加载 `k` 个 source 时的总请求数是各 source `ceil(Ni/B)` 之和；把相同数量的文档拆成很多个小 source 会削弱收益，`k` 个各含 1 个文档的 source 仍然会发出 `k` 次请求
+> - 一个批次会被整体校验。若 provider 返回的向量数量不符、存在空向量、批内维度不一致或包含非有限值，整个批次失败，其中的文档一个都不会写入
+> - 失败的批次不会自动拆成多次单条请求，因此不会意外放大请求量。embedder 仍可能整批重试，这与它重试一次逐文档请求是同样的行为，因此 `N` 与 `ceil(N/B)` 统计的是加载发出的请求数，而不是最终到达 provider 的尝试次数
+> - 若批次写入向量库时中途失败，此前已成功写入的文档会保留，`Load` 返回错误，与现有的非事务语义一致
+> - 请在 provider 的单请求输入数、总 token 数和 payload 大小限制内选择 `B`，框架不会为满足这些限制而自动切分批次
+> - 每个输入仍然对应且只对应一个向量，并按响应索引还原到原输入。同一段文本单独 embedding 与放在批次中 embedding 是否得到完全相同的向量，取决于具体 provider，框架不做这个保证
+> - 批量的确定收益是减少 embedding 请求数。它不改变输入文本和模型，也不减少向量库的写入次数；端到端吞吐是否提升需要在自己的负载上实测
+
+[批量 Embedding 示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/features/batch-embedding)会对同一个文件分别在不带和带批量大小的情况下各加载一次，并打印两次加载各自发出的 embedding 请求数。
+
+### 加载进度回调
+
+通过 `WithLoadProgressCallback` 可以注册一个结构化的进度回调函数，用于驱动自定义 UI、指标采集或其他可观测性集成，无需解析日志输出：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/knowledge"
+
+err := kb.Load(ctx,
+    knowledge.WithLoadProgressCallback(func(ctx context.Context, evt knowledge.LoadProgressEvent) {
+        if evt.Done {
+            fmt.Printf("All sources loaded. total: %d docs, elapsed: %s\n",
+                evt.Total, evt.TotalElapsed)
+            return
+        }
+        if evt.Err != nil {
+            fmt.Printf("Source %s failed: %v\n", evt.SourceName, evt.Err)
+            return
+        }
+        fmt.Printf("Source %s: %d/%d docs, ETA: %s\n",
+            evt.SourceName, evt.SourceProcessed, evt.SourceTotal, evt.SourceETA)
+    }),
+)
+```
+
+`LoadProgressEvent` 包含以下字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `SourceNames` | `[]string` | 当前 Load 调用涉及的所有 source 名称列表 |
+| `SourceName` | `string` | 当前正在加载的 source 名称 |
+| `SourceProcessed` | `int` | 当前 source 已处理的文档数 |
+| `SourceTotal` | `int` | 当前 source 的文档总数 |
+| `SourceElapsed` | `time.Duration` | 当前 source 已耗时 |
+| `SourceETA` | `time.Duration` | 当前 source 的预估剩余时间 |
+| `Total` | `int` | 所有 source 累计已处理的文档数 |
+| `TotalElapsed` | `time.Duration` | 整个 Load 调用的总耗时 |
+| `Done` | `bool` | 是否所有 source 已加载完成 |
+| `Err` | `error` | source 加载出错时非 nil |
+
+> **注意**：当使用并发加载时（`WithSourceConcurrency > 1` 或 `WithDocConcurrency > 1`），回调可能从多个 goroutine 并发调用，调用方需自行同步回调内部访问的共享状态。
+
+完整示例参见 [examples/knowledge/basic](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/basic)，其中演示了基于进度回调实现的多行进度条 UI。
+
 ## 评测对比
 
 我们使用 [RAGAS](https://docs.ragas.io/) 框架对 tRPC-Agent-Go、LangChain、Agno 和 CrewAI 进行了全面的 RAG 质量评测。
 
 
-> **详细文档**: 完整的评测方案、参数配置和结果分析请参考 [examples/knowledge/evaluation/README_CN.md](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/evaluation/README_CN.md)
+> **详细文档**: 完整的评测方案、参数配置和结果分析请参考 [knowledge/README.zh_CN.md](https://github.com/trpc-group/trpc-agent-go-benchmark/blob/main/knowledge/README.zh_CN.md)
 
 
 ### 评测方案
@@ -369,13 +446,21 @@ err := kb.Load(ctx,
 | **Vector Store** | PGVector (CrewAI 使用 ChromaDB) |
 | **Agent 模型** | DeepSeek-V3.2 |
 
+### 面向特定语料的 Contextual Retrieval 试验
+
+[Contextual Retrieval 示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/contextual-retrieval)基于现有公开的 `source.Source` 和 `document.Document.EmbeddingText` 契约，对比原始索引文本与加入上下文后的索引文本，同时仍向 Agent 返回原始 chunk 内容。
+
+这是按语料选择启用的评估方案，不是 Knowledge 的默认行为，也不代表对所有任务均有收益。配对试验需保持模型、Embedder、分块方式、向量存储、检索设置、查询集和评测协议一致；在将父文档发送给配置的上下文模型前，请先阅读示例中的数据处理和成本说明。
+
 
 ## 更多内容
 
 - [向量存储](vectorstore/index.md) - 配置各种向量数据库后端
 - [Embedder](embedder.md) - 文本向量化模型配置
 - [Reranker](reranker.md) - 检索结果精排
+- [Query Enhancer](query-enhancer.md) - 多轮对话查询改写与增强
 - [文档源](source.md) - 文件、目录、URL 等知识来源配置
+- [Extractor 内容提取](extractor.md) - 复杂文档和网页转 Markdown / 文本
 - [OCR 图片文字识别](ocr.md) - 配置 Tesseract OCR 提取文本
 - [过滤器](filter.md) - 基础过滤器和智能过滤器
 - [知识库管理](management.md) - 动态源管理和状态监控

@@ -19,11 +19,11 @@ Agent Skills 把可复用的任务封装为“技能目录”，用 `SKILL.md`
 - 📥 `skill_load` 按需注入 `SKILL.md` 正文与选定文档
 - 📚 `skill_select_docs` 增/改/清除文档选择
 - 🧾 `skill_list_docs` 列出可用文档
-- 🏃 `skill_run` 在工作区执行命令，返回 stdout/stderr 与输出文件
+- 🧪 执行路径：`skill_load` 会在 `/skills/<name>/` 下物化出可写的
+  技能工作副本，脚本通过 `workspace_exec` 执行（只要配置了 code
+  executor 即可）
 - 🗂️ 按通配符收集输出文件并回传内容与 MIME 类型
 - 🧩 可选择本地或容器工作区执行器（默认本地）
-- 🧱 支持声明式 `inputs`/`outputs`：映射输入、
-  以清单方式收集/内联/保存输出
 
 ### 核心概念：三层信息模型
 
@@ -41,6 +41,48 @@ Agent Skills 把可复用的任务封装为“技能目录”，用 `SKILL.md`
      仅把文本内容物化到提示词；脚本不会被内联，而是在工作区中
      执行，并回传结果与输出文件。
 
+### 调用方声明必加载 Skill
+
+如果业务在收到请求时已经确定要使用哪个 Skill，可以直接声明必加载，
+无需再让模型判断或调用 `skill_load`：
+
+```go
+events, err := runner.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("审查这个改动"),
+    agent.WithSkillLoads(skill.LoadRequest{
+        Name: "code-review",
+        Docs: []string{"references/security.md"},
+    }),
+)
+```
+
+框架会基于本次 invocation 的有效 repository（包括上下文可见性过滤）
+对整批声明做原子校验，并在本次 invocation 的工具构建与请求处理过程中
+复用预检选中的 repository 以及声明 Skill 的已验证内容。`SKILL.md` 始终
+加载；`Docs` 选择额外的 Skill 相对路径文档，`IncludeAllDocs` 选择全部辅助
+文档，二者不能同时
+设置。非空 `Docs` 会替换当前文档选择；二者都未设置时，声明本身不会改写
+当前选择，与 `skill_load` 保持一致。在默认 `turn` 模式下，框架会将本轮
+重置与声明合并为同一个原子更新；重置会移除上一轮选择，因此不会继承该
+选择。不执行 `turn` 重置的模式（包括 `session`）会保留仍然存在的选择。
+同一 Skill 的等价声明会在规范化后合并，包括由多个 `WithSkillLoads` 追加的
+声明；等价要求规范化后的 `Docs` 集合与 `IncludeAllDocs` 值相同。同一
+Skill 的选择冲突则视为无效，`MaxLoadedSkills` 按合并后的 Skill 数量计算。
+任一声明失败都会阻止第一次模型请求，业务可通过
+`skill.ErrInvalidLoadRequest` 或 `skill.ErrSkillUnavailable` 识别直接返回的
+初始化错误。Candidate Selector、Ralph Loop 等异步执行 inner Agent 的
+Runner wrapper 仍沿用既有错误事件语义，但同样不会发起模型请求。
+
+声明式加载复用 `skill_load` 的状态、内容物化、load mode、workspace
+和工具激活语义，但不会伪造模型 tool call/tool result。声明只作用于
+Runner 选中的入口 invocation，不会被克隆出的子 Agent invocation 继承。
+如果选中的 Agent 未实现 `agent.InvocationSkillLoadSupport`（或返回
+false），Runner 返回 `agent.ErrSkillLoadingUnsupported`。自定义 Agent
+一旦声明支持，就必须在第一次模型请求前原子消费这些声明。
+
 ### Token 成本
 
 如果把一个技能仓库的全部内容（所有 `SKILL.md` 正文与 docs）
@@ -48,7 +90,7 @@ Agent Skills 把可复用的任务封装为“技能目录”，用 `SKILL.md`
 直接超过模型上下文窗口。
 
 想要**可复现、基于真实运行**的 token 对比（渐进披露 vs 全量注入），
-可参考 `benchmark/anthropic_skills/README.md`，并按其中说明运行
+可参考 [trpc-agent-go-benchmark/anthropic_skills/README.md](https://github.com/trpc-group/trpc-agent-go-benchmark/blob/main/anthropic_skills/README.md)，并按其中说明运行
 `token-report` 套件。
 
 ### Prompt Cache
@@ -69,12 +111,21 @@ Agent Skills 把可复用的任务封装为“技能目录”，用 `SKILL.md`
     命中更多前缀 token。
 
 回退机制：如果对应的 tool result 消息不在本次请求的 history 里
-（例如启用了 history suppression），框架会回退为插入一条专用的
+（例如启用了 history suppression），框架可以回退为插入一条专用的
 system message，确保模型仍能看到已加载内容。
 
-启用方式：`llmagent.WithSkillsLoadedContentInToolResults(true)`。
+Session summary 提醒：如果你启用了会话摘要注入
+（`WithAddSessionSummary(true)`），并且本次请求里确实插入了摘要，
+框架会尽量**跳过**这条回退 system message，避免把“已被 summary 掉的
+内容”又塞回提示词里。如果对应的 tool result 仍在提示词里，回退会继续
+保持关闭；如果 same-turn summary compaction 已经把这些 tool result
+裁掉，回退会重新开启，保证模型仍能看到完整正文/文档。
 
-要在真实工具链路中测量提升，参见 `benchmark/anthropic_skills` 的
+启用方式：`llmagent.WithSkillsLoadedContentInToolResults(true)`。
+如果你希望在 summary 场景恢复旧的回退行为：
+`llmagent.WithSkipSkillsFallbackOnSessionSummary(false)`。
+
+要在真实工具链路中测量提升，参见 [trpc-agent-go-benchmark/anthropic_skills](https://github.com/trpc-group/trpc-agent-go-benchmark/tree/main/anthropic_skills) 的
 `prompt-cache` 套件。
 
 与 `SkillLoadMode` 的关系（容易踩坑）：
@@ -83,7 +134,8 @@ system message，确保模型仍能看到已加载内容。
   里多次调用模型的场景（一次用户消息触发多个 tool call）。
 - 如果你希望跨**多轮对话**继续复用“已加载技能的正文/文档”，需要把
   `SkillLoadMode` 设为 `session`。默认 `turn` 会在下一轮开始前清空
-  `temp:skill:loaded:*` / `temp:skill:docs:*`，因此即使 history 里仍然
+  该 agent 的 skill state key（`temp:skill:loaded_by_agent:<agent>/<name>` /
+  `temp:skill:docs_by_agent:<agent>/<name>`），因此即使 history 里仍然
   有上一轮的 `skill_load` tool result（通常是 `loaded: <name>` 这种短
   stub），框架也不会再把正文/文档物化进去。
 
@@ -112,7 +164,9 @@ system message，确保模型仍能看到已加载内容。
   运行时配置拼出来。
 
 `skill_load` 只会把“已加载/已选文档”的**小状态**写入 Session（例如
-`temp:skill:loaded:*`、`temp:skill:docs:*`）。随后由请求处理器在
+`temp:skill:loaded_by_agent:<agent>/<name>`、
+`temp:skill:docs_by_agent:<agent>/<name>`；旧版 key 也仍被支持）。
+随后由请求处理器在
 **下一次模型请求**里，把对应的 `SKILL.md` 正文/已选 docs **物化**
 进去。
 
@@ -128,10 +182,13 @@ system message，确保模型仍能看到已加载内容。
 - 在同一次工具链路里，每次模型调用前都会按同一套规则重新物化，
   所以只要 skills 仓库内容和选择状态不变，模型看到的 skill 内容
   就是稳定的。
-- 如果本次请求 history 里没有对应的 tool result（例如 history
-  suppression 或截断），框架会回退为插入一条专用 system message
-  （`Loaded skill context:`）来保证正确性。但这会让 system 内容发生变化，
-  prompt cache 的收益可能会变小。
+- 如果本次请求的 history 里找不到对应的 `skill_load` /
+  `skill_select_docs` tool result（常见原因：history suppression、
+  会话摘要、或截断把这些 tool 消息移除），框架可以回退为插入一条专用
+  system message（`Loaded skill context:`），把缺失的 skill 正文/文档
+  补回来，确保模型仍能看到正确上下文。
+  - 但这会改变 system 内容，prompt cache 的收益可能变小；因此当本次请求
+    存在 session summary 时，该回退默认会被跳过（见上文）。
 
 ### 与业界实现对比
 
@@ -189,8 +246,7 @@ export SKILLS_ROOT=/path/to/skills
 
 ### 2) 启用 Skills
 
-在 `LLMAgent` 里提供技能仓库与执行器。未显式指定时，默认使用
-本地执行器（更易于本机开发）。
+在 `LLMAgent` 里提供技能仓库即可。
 
 ```go
 import (
@@ -206,8 +262,62 @@ agent := llmagent.New(
     "skills-assistant",
     llmagent.WithSkills(repo),
     llmagent.WithCodeExecutor(exec),
+    llmagent.WithEnableCodeExecutionResponseProcessor(false),
     // Optional: keep the system prompt stable for prompt caching.
     llmagent.WithSkillsLoadedContentInToolResults(true),
+)
+```
+
+`NewFSRepository` 也可以同时扫描多个根目录，常见做法是把通用
+skills 目录和用户私有 skills 目录一起传入：
+
+```go
+repo, _ := skill.NewFSRepository(
+    "./skills/common",
+    "./skills/users/alice",
+)
+```
+
+如果是一个常驻 Agent 服务复用同一个 skills 仓库来处理多种请求，
+可以再加一层按请求生效的可见性过滤。过滤函数可以从 `ctx` /
+运行时状态里读取任意业务信号（例如 `user_id`、`tenant_id`、角色、
+实验开关等），并把不匹配的 skill 从概览、工具声明和运行时校验里
+一起隐藏。下面用 `user_id` 只是举例：
+
+```go
+agt := llmagent.New(
+    "skills-assistant",
+    llmagent.WithSkills(repo),
+    llmagent.WithSkillFilter(func(ctx context.Context, s skill.Summary) bool {
+        userID, _ := agent.GetRuntimeStateValueFromContext[string](ctx, "user_id")
+        return allow(userID, s.Name)
+    }),
+)
+
+r := runner.NewRunner("skills-app", agt)
+
+ch, _ := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("..."),
+    agent.WithRuntimeState(map[string]any{"user_id": userID}),
+)
+```
+
+如果你的进程在启动后还会安装、删除或重命名 skill，请在文件系统
+变更完成后调用一次 `repo.Refresh()`，让下一轮请求看到最新技能
+集合。`Refresh()` 适用于仓库结构变化，不建议每次请求前都调用。
+
+细粒度白名单（只暴露知识注入类工具，适合只读型代理）：
+
+```go
+agent := llmagent.New(
+    "skills-assistant",
+    llmagent.WithSkills(repo),
+    llmagent.WithAllowedSkillTools(
+        llmagent.SkillToolLoad,
+    ),
 )
 ```
 
@@ -215,44 +325,70 @@ agent := llmagent.New(
 - 请求处理器注入概览与按需内容：
   [internal/flow/processor/skills.go]
   (https://github.com/trpc-group/trpc-agent-go/blob/main/internal/flow/processor/skills.go)
-- 工具自动注册：开启 `WithSkills` 后，`skill_load`、
-  `skill_select_docs`、`skill_list_docs` 与 `skill_run`
-  会自动出现在工具列表中，无需手动添加。
-- 注意：当你同时设置了 `WithCodeExecutor` 时，LLMAgent 默认会尝试执行
-  模型回复里的 Markdown 围栏代码块。如果你只是为了给 `skill_run` 提供运行时，
-  不希望自动执行代码块，可以加上
-  `llmagent.WithEnableCodeExecutionResponseProcessor(false)`。
-- 默认提示指引：框架会在系统消息里，在 `Available skills:` 列表后追加一段
-  `Tooling and workspace guidance:` 指引文本。
-  - 关闭该指引（减少提示词占用）：`llmagent.WithSkillsToolingGuidance("")`。
+- `WithSkills` 会自动注册内置 skill 工具（`skill_load`、
+  `skill_select_docs`、`skill_list_docs`），无需手动添加。它们都属于
+  “知识注入”类工具，不直接执行脚本。
+- `WithAllowedSkillTools(...)` 可以用显式白名单进一步收窄这套工具集，
+  例如只保留 `SkillToolLoad`。
+- **执行器自动 fallback**：当 `WithSkills(repo)` 开启但没有显式传
+  `WithCodeExecutor(...)` 时，框架会自动挂一个本地 code executor，
+  让 `workspace_exec` 开箱可用。模型随后通过 `workspace_exec` 在
+  `/skills/<name>/` 的可写工作副本里按 `SKILL.md` 描述的步骤执行脚本
+  并收集输出文件。以下三种情况会**跳过 fallback**：
+  （1）你已经传了 `WithCodeExecutor(...)`（用你自己的 executor）；
+  （2）你用了 `WithAllowedSkillTools(...)` 做精细控制（不做魔法）；
+  （3）你显式传了 `WithSkillToolProfile(SkillToolProfileKnowledgeOnly)`
+  （"我不要框架帮我起执行器"的 opt-out 信号）。生产环境建议显式
+  配置容器 executor，而不是依赖本地 fallback —— 本地 fallback 只是
+  开发期便利，不是上线目标形态。
+- **`CodeExecutor` 与围栏代码自动执行是两个独立开关**：
+  配置 `CodeExecutor` 只是让执行类**工具**（例如 `workspace_exec`）
+  可用，本身并不会让框架扫描模型回复里的 Markdown 围栏代码块并直接
+  运行。后者由独立的 `EnableCodeExecutionResponseProcessor` 控制
+  （默认：`true`）。两条推论：
+  - 当你**显式** `WithCodeExecutor(...)` 时，围栏代码自动执行保持框架
+    默认值，不会被 skills 逻辑偷偷改动。如果你只想让 executor 服务
+    `workspace_exec`，请显式传
+    `llmagent.WithEnableCodeExecutionResponseProcessor(false)`。
+  - 当 skills fallback 代你注入本地 executor 时（即上面的
+    `WithSkills(repo)` 场景），该隐式 executor 的用途被严格收敛为
+    "给 `workspace_exec` 供电"：如果你没有显式调用过
+    `WithEnableCodeExecutionResponseProcessor(...)`，fallback 路径
+    会自动把 `EnableCodeExecutionResponseProcessor` 置为 `false`，
+    避免 `WithSkills(repo)` 的升级路径偷偷打开你原本没配过的围栏
+    代码自动执行能力。
+- 默认提示指引：框架会在系统消息里，在 `Available skills:` 列表后
+  追加一段 `Tooling and workspace guidance:` 指引文本。
+  - 关闭该指引（减少提示词占用）：
+    `llmagent.WithSkillsToolingGuidance("")`。
   - 或用自定义文本替换：`llmagent.WithSkillsToolingGuidance("...")`。
-  - 如果你关闭它，请在自己的指令里说明何时使用 `skill_load`、
-    `skill_select_docs` 和 `skill_run`。
+  - 指引会跟随最终注册的 skill 工具集，包括
+    `WithAllowedSkillTools(...)`。
+  - 如果你关闭它，请在自己的指令里明确当前白名单下哪些 skill 工具
+    可用。
   - 加载器： [tool/skill/load.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/load.go)
-  - 运行器： [tool/skill/run.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/run.go)
 
 ### 3) 运行示例
 
-交互式技能对话示例：
-[examples/skillrun/main.go](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/main.go)
-
-```bash
-cd examples/skillrun
-export OPENAI_API_KEY="your-api-key"
-# 本地执行器
-go run . -executor local
-# 或容器执行器（需 Docker）
-go run . -executor container
-```
-
-GAIA 基准示例（技能 + 文件工具）：
+GAIA 基准示例（技能 + 文件工具 + `workspace_exec`）：
 [examples/skill/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skill/README.md)
 
 该示例包含数据集下载脚本，以及 `whisper`（音频）/`ocr`（图片）等
 技能的 Python 依赖准备说明。
 
+真实技能发现/安装示例（真实模型 + 真实公网/GitHub）：
+[examples/skillfind/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillfind/README.md)
+
+这个示例从内置的 `skill-find` skill 出发，先到公网搜索候选
+skills，再把 GitHub 上的公开 skill 安装到用户私有目录中，调用
+`repo.Refresh()` 让仓库立即重新发现，然后在同一个会话里继续使用
+新 skill。
+
 SkillLoadMode 演示（无需 API key）：
 [examples/skillloadmode/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillloadmode/README.md)
+
+子代理 skill 隔离演示（AgentTool + Skills）：
+[examples/skillisolation/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillisolation/README.md)
 
 快速开始（下载数据集 JSON 到 `examples/skill/data/`）：
 
@@ -267,14 +403,11 @@ python3 examples/skill/scripts/download_gaia_2023_level1_validation.py
 python3 examples/skill/scripts/download_gaia_2023_level1_validation.py --with-files
 ```
 
-示例技能（节选）：
-[examples/skillrun/skills/python_math/SKILL.md]
-(https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/skills/python_math/SKILL.md)
-
 自然语言交互建议：
 - 直接说明你要做什么；模型会根据概览判断是否需要某个技能。
-- 当需要时，模型会先调用 `skill_load` 注入正文/文档，再调用
-  `skill_run` 执行命令并回传输出文件。
+- 当需要时，模型会先调用 `skill_load` 注入正文/文档，然后按
+  `SKILL.md` 里描述的步骤通过 `workspace_exec` 在 `/skills/<name>/`
+  下执行脚本并收集输出文件。
 
 ## `SKILL.md` 结构与示例
 
@@ -322,19 +455,365 @@ https://github.com/anthropics/skills
 - `include_all_docs`（可选）：为 true 时包含所有文档
 
 行为：
-- 写入会话临时键（生命周期由 `SkillLoadMode` 控制）：
-  - `temp:skill:loaded:<name>` = "1"
-  - `temp:skill:docs:<name>` = "*" 或 JSON 字符串数组
+- 写入会话临时键（按 agent 隔离，生命周期由 `SkillLoadMode` 控制）：
+  - `temp:skill:loaded_by_agent:<agent>/<name>` = "1"
+  - `temp:skill:docs_by_agent:<agent>/<name>` = "*" 或 JSON 字符串数组
+  - `temp:skill:loaded_order_by_agent:<agent>` = JSON 字符串数组，
+    按“最早触达 -> 最新触达”的顺序保存 skill 名
+  - 旧版 key（`temp:skill:loaded:<name>`、`temp:skill:docs:<name>`）仍被支持，
+    并在读到时自动迁移。
+- 多代理提示：transfer 调用子代理时通常共享同一个 Session。key 按 agent
+  隔离后，子代理的 `skill_load` 不会自动把技能正文/文档“塞进”主代理的提示词。
+  如果主代理确实需要该技能正文/文档，请让主代理自己调用一次 `skill_load`。
 - 请求处理器读取这些键，把 `SKILL.md` 正文与文档物化到下一次模型请求中：
   - 默认：追加到系统消息（兼容旧行为）
   - 可选：追加到对应 tool result 消息
     (`llmagent.WithSkillsLoadedContentInToolResults(true)`)
 
+#### 在每次模型请求前获取“已加载技能列表”
+
+如果你希望在**每次模型请求前**拿到当前 `llmagent` 已加载的 skill 列表
+（包括一次 `Runner.Run` 内的 tool loop 里每一步），推荐使用
+`ModelCallbacks` 的 `BeforeModel`，并通过 `context` 取出当前
+`Invocation`。
+
+从最基本的机制出发理解：
+
+- `skill_load` 并不会把完整的 `SKILL.md` 正文写进 session 的事件记录里。
+- 它只会往 session state 写入一些很小的“标记键”（按 agent 隔离）：
+  - Loaded 标记：前缀为 `skill.LoadedPrefix(inv.AgentName)` 的 key
+  - Docs 选择：前缀为 `skill.DocsPrefix(inv.AgentName)` 的 key
+- Skills 的请求处理器会读取这些键，把正文/文档物化到**下一次**
+  outbound 模型请求里。
+
+因此，如果你只是想拿到“当前哪些 skills 已加载”，只需要读 session
+state 即可：
+
+下面的代码片段中，`m` 表示你的模型实例，`repo` 表示 skills 仓库。
+
+```go
+import (
+    "context"
+    "fmt"
+    "sort"
+    "strings"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/skill"
+)
+
+func loadedSkillNames(inv *agent.Invocation) []string {
+    if inv == nil || inv.Session == nil {
+        return nil
+    }
+    state := inv.Session.SnapshotState()
+    if len(state) == 0 {
+        return nil
+    }
+
+    prefix := skill.LoadedPrefix(inv.AgentName)
+
+    var out []string
+    for k, v := range state {
+        if !strings.HasPrefix(k, prefix) {
+            continue
+        }
+        if len(v) == 0 {
+            continue
+        }
+        name := strings.TrimPrefix(k, prefix)
+        if strings.TrimSpace(name) == "" {
+            continue
+        }
+        out = append(out, name)
+    }
+    sort.Strings(out)
+    return out
+}
+
+modelCallbacks := model.NewCallbacks().
+    RegisterBeforeModel(func(
+        ctx context.Context,
+        args *model.BeforeModelArgs,
+    ) (*model.BeforeModelResult, error) {
+        _ = args
+        inv, ok := agent.InvocationFromContext(ctx)
+        if !ok {
+            return nil, nil
+        }
+        fmt.Printf("loaded skills: %v\n", loadedSkillNames(inv))
+        return nil, nil
+    })
+
+agt := llmagent.New(
+    "skills-assistant",
+    llmagent.WithModel(m),
+    llmagent.WithSkills(repo),
+    llmagent.WithModelCallbacks(modelCallbacks),
+)
+_ = agt
+```
+
+注意：
+
+- 默认 `SkillLoadModeTurn` 会在**下一轮** `Runner.Run` 开始前清空这些
+  该 agent 的 `temp:skill:loaded_by_agent:*` /
+  `temp:skill:docs_by_agent:*` /
+  `temp:skill:loaded_order_by_agent:*` state key，所以“已加载列表”通常只在当前这轮
+  tool loop 里非空。
+- `SkillLoadModeSession` 会跨轮保留这些 key，所以“已加载列表”会一直
+  非空，直到你手动清空（或会话过期）。
+
+#### 内置选项：限制已加载技能数量（TopK）
+
+如果你的需求只是“最多保留最近 N 个已加载 skills”，可以直接使用内置
+option：
+
+- `llmagent.WithMaxLoadedSkills(N)`
+
+它会在**每次模型请求前**检查当前 loaded skills，并清空更老的
+`temp:skill:*` state key。最近 skill 的触达顺序会写入 session state，
+并由 `skill_load` / `skill_select_docs` 自动更新，因此不会依赖字母序兜底
+或 tool result history 是否还完整保留。
+
+示例：
+
+```go
+agt := llmagent.New(
+    "skills-assistant",
+    llmagent.WithModel(m),
+    llmagent.WithSkills(repo),
+    llmagent.WithMaxLoadedSkills(3),
+)
+_ = agt
+```
+
+#### 自定义策略：限制已加载技能数量（比如最多保留最近 3 个）
+
+`SkillLoadMode` 解决的是“驻留多久”（once/turn/session），不解决
+“最多加载多少个”。如果你需要在 `llmagent.WithMaxLoadedSkills` 之外
+做更细粒度的手动控制（比如自定义淘汰策略），推荐在 session service
+上加 `AppendEventHook`，去修改 `skill_load` 写入的 state delta。
+
+核心思路：
+
+1) 识别“加载 skill”的事件（state delta 里包含
+   该 agent 的 loaded key，即 key 前缀为 `skill.LoadedPrefix(ev.Author)`）。
+2) 计算“应用该 delta 后”会有哪些 skills 处于 loaded 状态。
+3) 如果数量超过阈值，在同一个 `StateDelta` 里把要淘汰的 skills 对应
+   key 置为 `nil`（清空）。
+
+示例（inmemory session service，最多保留最近 3 个 loaded skills）：
+
+```go
+import (
+    "encoding/json"
+    "sort"
+    "strings"
+
+    "trpc.group/trpc-go/trpc-agent-go/event"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/session"
+    "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+    "trpc.group/trpc-go/trpc-agent-go/skill"
+)
+
+const (
+    maxLoadedSkills = 3
+    toolSkillLoad   = "skill_load"
+)
+
+type skillLoadArgs struct {
+    Skill string `json:"skill"`
+}
+
+func loadedSkillsFromState(
+    state session.StateMap,
+    agentName string,
+) []string {
+    if len(state) == 0 {
+        return nil
+    }
+    prefix := skill.LoadedPrefix(agentName)
+    var out []string
+    for k, v := range state {
+        if !strings.HasPrefix(k, prefix) {
+            continue
+        }
+        if len(v) == 0 {
+            continue
+        }
+        name := strings.TrimPrefix(k, prefix)
+        if strings.TrimSpace(name) == "" {
+            continue
+        }
+        out = append(out, name)
+    }
+    sort.Strings(out)
+    return out
+}
+
+func capLoadedSkills(
+    sess *session.Session,
+    ev *event.Event,
+    max int,
+) {
+    if sess == nil || ev == nil || max <= 0 {
+        return
+    }
+    if len(ev.StateDelta) == 0 {
+        return
+    }
+
+    agentName := strings.TrimSpace(ev.Author)
+    if agentName == "" {
+        return
+    }
+    loadedPrefix := skill.LoadedPrefix(agentName)
+
+    // Only enforce when this event loads a skill.
+    var newlyLoaded []string
+    for k, v := range ev.StateDelta {
+        if !strings.HasPrefix(k, loadedPrefix) {
+            continue
+        }
+        if len(v) == 0 {
+            continue
+        }
+        name := strings.TrimPrefix(k, loadedPrefix)
+        if strings.TrimSpace(name) == "" {
+            continue
+        }
+        newlyLoaded = append(newlyLoaded, name)
+    }
+    if len(newlyLoaded) == 0 {
+        return
+    }
+
+    // Predict the "post-append" state by applying delta to a copy.
+    nextState := sess.SnapshotState()
+    for k, v := range ev.StateDelta {
+        nextState[k] = v
+    }
+
+    loaded := loadedSkillsFromState(nextState, agentName)
+    if len(loaded) <= max {
+        return
+    }
+
+    loadedSet := make(map[string]struct{}, len(loaded))
+    for _, name := range loaded {
+        loadedSet[name] = struct{}{}
+    }
+
+    // Keep the most recent loaded skills by scanning recent events.
+    keep := make([]string, 0, max)
+    keepSet := make(map[string]struct{}, max)
+
+    // 1) Always keep the skill(s) loaded by this delta.
+    sort.Strings(newlyLoaded)
+    for _, name := range newlyLoaded {
+        if _, ok := loadedSet[name]; !ok {
+            continue
+        }
+        if _, ok := keepSet[name]; ok {
+            continue
+        }
+        keep = append(keep, name)
+        keepSet[name] = struct{}{}
+        if len(keep) >= max {
+            break
+        }
+    }
+
+    // 2) Fill from newest skill_load calls in the transcript.
+    events := sess.GetEvents()
+    for i := len(events) - 1; i >= 0 && len(keep) < max; i-- {
+        if strings.TrimSpace(events[i].Author) != agentName {
+            continue
+        }
+        rsp := events[i].Response
+        if rsp == nil || len(rsp.Choices) == 0 {
+            continue
+        }
+        msg := rsp.Choices[0].Message
+        if msg.Role != model.RoleAssistant {
+            continue
+        }
+        for _, tc := range msg.ToolCalls {
+            if tc.Function.Name != toolSkillLoad {
+                continue
+            }
+            var in skillLoadArgs
+            if err := json.Unmarshal(
+                []byte(tc.Function.Arguments),
+                &in,
+            ); err != nil {
+                continue
+            }
+            name := strings.TrimSpace(in.Skill)
+            if name == "" {
+                continue
+            }
+            if _, ok := loadedSet[name]; !ok {
+                continue
+            }
+            if _, ok := keepSet[name]; ok {
+                continue
+            }
+            keep = append(keep, name)
+            keepSet[name] = struct{}{}
+            if len(keep) >= max {
+                break
+            }
+        }
+    }
+
+    // 3) Fallback: fill deterministically from the loaded list.
+    for _, name := range loaded {
+        if len(keep) >= max {
+            break
+        }
+        if _, ok := keepSet[name]; ok {
+            continue
+        }
+        keep = append(keep, name)
+        keepSet[name] = struct{}{}
+    }
+
+    // Evict everything else by clearing the same state keys.
+    for _, name := range loaded {
+        if _, ok := keepSet[name]; ok {
+            continue
+        }
+        ev.StateDelta[skill.LoadedKey(agentName, name)] = nil
+        ev.StateDelta[skill.DocsKey(agentName, name)] = nil
+    }
+}
+
+svc := inmemory.NewSessionService(
+    inmemory.WithAppendEventHook(func(
+        ctx *session.AppendEventContext,
+        next func() error,
+    ) error {
+        capLoadedSkills(ctx.Session, ctx.Event, maxLoadedSkills)
+        return next()
+    }),
+)
+_ = svc
+```
+
+`AppendEventHook` 的接口说明见 [Session 文档](session/index.md)，也可以参考
+可运行示例 `examples/session/hook`。
+
 说明：
 - 建议采用“渐进式披露”：默认只传 `skill` 加载正文；需要文档时先
   `skill_list_docs` 再 `skill_select_docs`，只选必要文档；除非确
   实需要全部（或用户明确要求），避免 `include_all_docs=true`。
-- 可多次调用以新增或替换文档。
+- 已知需要多份文档时应在一次调用中一起选择。后续调用若要保留当前
+  选择，请使用 `mode=add`；仅在传入完整替换集合时使用 `mode=replace`。
 - 工具会写入 session state，但**正文/文档在提示词里驻留多久**取决
   于 `SkillLoadMode`：
   - `turn`（默认）：在当前一次 `Runner.Run`（处理一条用户消息）
@@ -466,10 +945,23 @@ agent := llmagent.New(
 - `skill`（必填）
 - `docs`（可选数组）
 - `include_all_docs`（可选布尔）
-- `mode`（可选字符串）：`add` | `replace` | `clear`
+- `mode`（可选字符串）：`add` | `replace` | `clear`；默认
+  `replace`。schema 只允许这三个值；如果非枚举值仍到达运行时，
+  则出于向后兼容将其归一化为 `replace`。
 
 行为：
-- 更新 `temp:skill:docs:<name>`：`*` 表示全选；数组表示显式列表
+- 此工具更新的是当前激活的文档选择集合，并非只增不减的文件读取。
+- `add` 保留当前选择，并追加 `docs`（自动去重）。
+- `replace` 将 `docs` 设为完整选择；此前已选但本次未传入的文档会被移除。
+- `clear` 清空选择。
+- 已知需要多份文档时，应在一次 `replace` 调用中全部传入；后续发现
+  新文档时应使用 `add`，不要用多个单文档 `replace` 调用来回切换。
+- `include_all_docs=true` 生效后，如需收窄为显式列表，应先调用 `clear`。
+- 更新当前 agent 的 doc 选择 state key：
+  - `temp:skill:docs_by_agent:<agent>/<name>`：`*` 表示全选；数组表示显式列表
+  - 同时刷新 `temp:skill:loaded_order_by_agent:<agent>`，因此
+    `WithMaxLoadedSkills(N)` 会把文档选择也视作一次“最近触达”
+  - 旧版 key `temp:skill:docs:<name>` 仍被支持，并在读到时自动迁移
 
 ### `skill_list_docs`
 
@@ -484,201 +976,24 @@ agent := llmagent.New(
 提示：这些会话键由框架自动管理；用户通常无需直接操作，仅需用
 自然语言驱动对话即可。
 
-### `skill_run`
+### 技能工作区与运行时环境
 
-声明： [tool/skill/run.go](https://github.com/trpc-group/trpc-agent-go/blob/main/tool/skill/run.go)
+当模型通过 `workspace_exec` 执行 skill 脚本时，框架会为每个会话在
+工作区里物化一份可写的技能副本，并注入一组便于脚本使用的环境变量
+与符号链接：
 
-输入：
-- `skill`（必填）：技能名
-- `command`（必填）：Shell 命令（默认通过 `bash -c` 执行）
-- `cwd`（可选）：相对技能根目录的工作路径
-- `env`（可选）：环境变量映射
-- `output_files`（可选，传统收集方式）：通配符列表
-  （如 `out/*.txt`）。通配符以工作区根目录为准，也支持
-  `$OUTPUT_DIR/*.txt` 这类写法，会自动归一化为 `out/*.txt`。
-- `inputs`（可选，声明式输入）：把外部资源映射进工作区，
-  结构为对象数组，每项支持：
-  
-  - `from`：来源，支持四类方案（scheme）：
-    - `artifact://name[@version]` 从制品服务拉取文件
-    - `host:///abs/path` 从宿主机绝对路径复制/链接
-    - `workspace://rel/path` 从当前工作区相对路径复制/链接
-    - `skill://<name>/rel/path` 从已缓存的技能目录复制/链接
-  - `to`：目的路径（相对工作区）。未指定时默认写到
-    `WORK_DIR/inputs/<basename>`。
-  - `mode`：`copy`（默认）或 `link`（在可行时建立符号链接）。
-  - `pin`：当 `from=artifact://name` 未指定 `@version` 时，
-    尝试复用同一 `to` 路径第一次解析到的版本（best effort）。
-
-- `outputs`（可选，声明式输出）：使用清单（manifest）收集输出。
-  字段：
-  - `globs`：通配符数组（相对工作区，支持 `**`，也支持
-    `$OUTPUT_DIR/**` 这类写法并归一化为 `out/**`）。
-  - `inline`：是否把文件内容内联返回。
-  - `save`：是否保存为制品（与制品服务协作）。
-  - `name_template`：保存为制品时的文件名前缀（如 `pref/`）。
-  - `max_files`（默认 100）、`max_file_bytes`（默认 4 MiB/文件）、
-    `max_total_bytes`（默认 64 MiB）：上限控制。
-  - 说明：`outputs` 同时兼容 snake_case（推荐）与旧版 Go 风格字段名
-    （例如 `MaxFiles`）
-
-- `timeout`（可选）：超时秒数（执行器有默认值）
-- `save_as_artifacts`（可选，传统收集路径）：把通过
-  `output_files` 收集到的文件保存为制品，并在结果中返回
-  `artifact_files`。
-- `omit_inline_content`（可选）：为 true 时不返回
-  `output_files[*].content` 与 `primary_output.content`（只返回元信息）。
-  非文本输出的 `content` 也会始终为空。需要文本内容时，可用
-  `output_files[*].ref` 配合 `read_file` 按需读取。
-- `artifact_prefix`（可选）：与 `save_as_artifacts` 配合的前缀。
-  - 若未配置制品服务（Artifact service），`skill_run` 会继续
-    返回 `output_files`，并在 `warnings` 中给出提示。
-
-建议：
-- 建议 `skill_run` 尽量只用于执行 Skill 文档里描述的流程
-  （例如 `SKILL.md` 明确要求的命令）。
-- 不建议用 `skill_run` 做通用的 Shell 探索。
-- 优先使用 `skill_list_docs` / `skill_select_docs` 读取 Skill 文档，
-  再用文件工具按需查看选中的内容。
-
-可选的安全限制（白名单）：
-- 环境变量 `TRPC_AGENT_SKILL_RUN_ALLOWED_COMMANDS`：
-  - 逗号/空格分隔的命令名列表（如 `python3,ffmpeg`）
-  - 启用后 `skill_run` 会拒绝管道/重定向/分号等 Shell 语法，
-    并仅允许执行白名单中的“单条命令”
-  - 因为不再经过 Shell 解析，诸如 `> out/x.txt`、heredoc、
-    `$OUTPUT_DIR` 变量展开等写法将不可用；建议改为调用脚本，
-    或使用 `outputs` 收集输出文件
-- 代码侧也可通过 `llmagent.WithSkillRunAllowedCommands(...)` 配置。
-
-可选的安全限制（黑名单）：
-- 环境变量 `TRPC_AGENT_SKILL_RUN_DENIED_COMMANDS`：
-  - 逗号/空格分隔的命令名列表
-  - 启用后同样会拒绝 Shell 语法（仅允许“单条命令”），并拒绝
-    执行黑名单中的命令名
-- 代码侧也可通过 `llmagent.WithSkillRunDeniedCommands(...)` 配置。
-
-输出：
-- `stdout`、`stderr`、`exit_code`、`timed_out`、`duration_ms`
-- `primary_output`（可选）：包含 `name`、`ref`、`content`、`mime_type`、
-  `size_bytes`、`truncated`
-  - 便捷字段：指向“最合适的”小型文本输出文件（若存在）。当只有一个主要输出时
-    优先使用它。
-- `output_files`：文件列表（`name`、`ref`、`content`、`mime_type`、
-  `size_bytes`、`truncated`）
-  - `ref` 是稳定的 `workspace://<name>` 引用，可传给其它工具使用
-  - 非文本文件的 `content` 会被省略。
-  - 当 `omit_inline_content=true` 时，所有文件的 `content` 会被省略。可用
-    `ref` 配合 `read_file` 按需读取文本内容。
-  - `size_bytes` 表示磁盘上的文件大小；`truncated=true` 表示收集内容触发了
-    内部上限（例如 4 MiB/文件）。
-- `warnings`（可选）：非致命提示（例如制品保存被跳过）
-- `artifact_files`：制品引用（`name`、`version`）。两种途径：
-  - 传统路径：设置了 `save_as_artifacts` 时由工具保存并返回
-  - 清单路径：`outputs.save=true` 时由执行器保存并附加到结果
-
-典型流程：
-1) 模型先调用 `skill_load` 注入正文/文档
-2) 随后调用 `skill_run` 执行命令并收集输出文件：
-   - 传统：用 `output_files` 指定通配符
-   - 声明式：用 `outputs` 统一控制收集/内联/保存
-   - 如需把上游文件带入，可用 `inputs` 先行映射
-
-示例：
-
-映射外部输入文件，并收集一个小型文本输出：
-
-```json
-{
-  "skill": "demo",
-  "inputs": [
-    {
-      "from": "host:///tmp/notes.txt",
-      "to": "work/inputs/notes.txt",
-      "mode": "copy"
-    }
-  ],
-  "command": "mkdir -p out; wc -l work/inputs/notes.txt > out/lines.txt",
-  "outputs": {
-    "globs": ["$OUTPUT_DIR/lines.txt"],
-    "inline": true,
-    "save": false,
-    "max_files": 1
-  }
-}
-```
-
-元信息输出（避免把上下文塞满）：
-
-```json
-{
-  "skill": "demo",
-  "command": "mkdir -p out; echo hi > out/a.txt",
-  "output_files": ["out/*.txt"],
-  "omit_inline_content": true
-}
-```
-
-该调用会返回 `output_files[*].ref`（如 `workspace://out/a.txt`），
-并省略 `content`，同时包含 `size_bytes` 与 `truncated`。
-
-需要内容时再读取：
-
-```json
-{
-  "file_name": "workspace://out/a.txt",
-  "start_line": 1,
-  "num_lines": 20
-}
-```
-
-大文件建议保存为制品（不内联内容）：
-
-```json
-{
-  "skill": "demo",
-  "command": "mkdir -p out; echo report > out/report.txt",
-  "outputs": {
-    "globs": ["$OUTPUT_DIR/report.txt"],
-    "inline": false,
-    "save": true,
-    "max_files": 5
-  }
-}
-```
-
-保存成功后，`skill_run` 会返回 `artifact_files`（`name`、`version`），
-并可用 `artifact://<name>[@<version>]` 作为文件引用传给 `read_file` 等工具。
-
-传统保存路径（当你使用 `output_files` 时）：
-
-```json
-{
-  "skill": "demo",
-  "command": "mkdir -p out; echo report > out/report.txt",
-  "output_files": ["out/report.txt"],
-  "omit_inline_content": true,
-  "save_as_artifacts": true,
-  "artifact_prefix": "pref/"
-}
-```
-
-运行环境与工作目录：
-- 未提供 `cwd` 时，默认在技能根目录运行：`/skills/<name>`
-- 相对 `cwd` 会被解析为技能根目录下的子路径
-- `cwd` 也可以以 `$WORK_DIR`、`$OUTPUT_DIR`、`$SKILLS_DIR`、
-  `$WORKSPACE_DIR`、`$RUN_DIR`（或 `${...}`）开头，
-  工具会将其规范化为工作区内的相对目录
-- 运行时注入环境变量：
-  - `WORKSPACE_DIR`、`SKILLS_DIR`、`WORK_DIR`、`OUTPUT_DIR`、
-    `RUN_DIR`（由执行器注入）
-  - `SKILL_NAME`（由工具注入）
-- 便捷符号链接：在技能根目录下自动创建 `out/`、`work/`、
-  `inputs/` 链接到工作区对应目录，方便按文档中的相对路径使用。
+- 技能根目录 `/skills/<name>` 默认是**会话级的可写工作副本**：脚本
+  可以在源码旁创建缓存、`__pycache__`、`.venv/` 等文件。上游
+  技能仓库仍是事实来源；当源摘要发生变化时，下次 reconcile 会
+  替换工作区中的副本。
+- 便捷符号链接：在技能根目录下自动创建 `out/`、`work/`、`inputs/`
+  链接到工作区对应目录，方便按文档中的相对路径使用。
+- 注入环境变量：`WORKSPACE_DIR`、`SKILLS_DIR`、`WORK_DIR`、
+  `OUTPUT_DIR`、`RUN_DIR`（由执行器注入）。
 - `.venv/`：技能根目录下的可写目录，用于安装技能依赖
   （例如 `python -m venv .venv` + `pip install ...`）。
-- 文件工具在 base directory 下不存在真实 `inputs/` 目录时，会将
-  `inputs/<path>` 视为 `<path>` 的别名
+- 文件工具在 base directory 下不存在真实 `inputs/` 目录时，会把
+  `inputs/<path>` 视为 `<path>` 的别名。
 
 ## 执行器
 
@@ -697,7 +1012,8 @@ agent := llmagent.New(
 
 安全与资源：
 - 本地/容器均限制读取与写入在工作区内
-- 可通过超时、脚本权限（如只读挂载技能树）降低风险
+- `/skills/<name>` 工作副本默认可写；canonical 技能仓库仍是
+  唯一事实来源
 - `stdout`/`stderr` 可能会被截断（见 `warnings`）
 - 输出文件读取大小有限制，避免过大文件影响
 
@@ -724,29 +1040,293 @@ agent := llmagent.New(
 - 执行隔离：脚本以工作区为边界，输出文件由通配符精确收集，避免
   将脚本源码或非必要文件带入模型上下文。
 
+## 执行器环境变量注入
+
+当执行器运行在远端（容器、云函数等）时，宿主进程的环境变量不会
+自动传递。`codeexecutor.NewEnvInjectingCodeExecutor` 可以包装
+任意 `CodeExecutor`，在每次 `RunProgram` / `StartProgram`
+调用前，从 `context` 动态读取环境变量并合并到
+`RunProgramSpec.Env`。
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/codeexecutor"
+
+wrapped := codeexecutor.NewEnvInjectingCodeExecutor(exec,
+    func(ctx context.Context) map[string]string {
+        // 从 ctx 中读取调用方提供的环境变量。
+        // 来源由业务自行决定：RuntimeState、请求头、DB 查询等。
+        return map[string]string{"GITHUB_TOKEN": "..."}
+    },
+)
+
+agent := llmagent.New(
+    "skills-assistant",
+    llmagent.WithSkills(repo),
+    llmagent.WithCodeExecutor(wrapped),  // 用 wrapped 代替原始 exec
+)
+```
+
+行为：
+
+- 覆盖所有走 `Engine.Runner()` 的执行路径（例如 `workspace_exec`）。
+- provider 返回的 key **不覆盖** tool 显式传入的 `env`。
+- 每次 `RunProgram` 调用时求值，不在调用间共享状态。
+- provider 返回 `nil` 时零开销跳过。
+- 也可以只包装 Engine 层：
+  `codeexecutor.NewEnvInjectingEngine(eng, provider)`。
+
+典型场景：多用户 Agent 服务中，每个用户通过 AG-UI `state` 或
+HTTP header 传入自己的 token，provider 从请求上下文中读取后注入
+执行器，LLM 无需感知。
+
+## 请求级提示词片段覆盖
+
+如果少数请求需要压缩或改写系统消息，可以在 `runner.Run(...)` 里
+覆盖本次请求的 skill 概览或 `workspace_exec` 指引：
+
+- `agent.WithAvailableSkillsRenderer(...)` 自定义 `Available skills:`
+  概览。renderer 会收到当前请求可见的 `skill.Summary` 列表
+  （已应用 skill filter、上下文仓库等可见性规则），可以按业务需要
+  压缩描述、调整格式或补充本次请求的选择约束。返回内容没有以
+  `Available skills:` 开头时，框架会自动补上标题；返回空白字符串
+  表示本次请求不输出 `Available skills:` 段。
+- `agent.WithWorkspaceExecGuidance(...)` 自定义 `workspace_exec` 使用
+  指引。传入空字符串表示不覆盖，继续使用框架默认指引。
+
+```go
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Run the release checklist skill."),
+    agent.WithAvailableSkillsRenderer(func(
+        ctx context.Context,
+        req agent.AvailableSkillsRenderRequest,
+    ) string {
+        if len(req.Summaries) == 0 {
+            return ""
+        }
+        var b strings.Builder
+        b.WriteString("Only call skill_load when a listed skill is directly relevant.\n")
+        for _, s := range req.Summaries {
+            b.WriteString("- ")
+            b.WriteString(s.Name)
+            if desc := strings.TrimSpace(s.Description); desc != "" {
+                b.WriteString(": ")
+                b.WriteString(desc)
+            }
+            b.WriteString("\n")
+        }
+        return b.String()
+    }),
+    agent.WithWorkspaceExecGuidance(
+        "Use workspace_exec only when shell execution is required.",
+    ),
+)
+```
+
+`WithAvailableSkillsRenderer` 只改变概览文本，不改变实际可用的 skill
+工具，也不会替代 `skill_load` 对正文和文档的按需注入。
+`WithWorkspaceExecGuidance` 只改写提示词，不会禁用 `workspace_exec`。
+如果不希望暴露执行能力，请在创建 Agent 时关闭 workspace 执行
+surface，例如使用 `llmagent.WithWorkspaceExecSurfaceEnabled(false)`。
+
+## 基于 Skill 加载的工具激活
+
+`WithToolSets(...)` 注册的 ToolSet 会随 Agent 一起进入模型请求。工具激活提供另一种接入方式，先把 ToolSet 注册为候选集合，再由 `skill_load` 的结果决定是否进入后续模型请求。
+
+完整示例见 [examples/skilltoolactivation/README.md](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skilltoolactivation/README.md)。
+
+下面示例将 `example_file` 注册为候选 ToolSet，并声明加载 `example-skill` 后激活该 ToolSet。模型成功调用 `skill_load` 后，后续模型请求会包含 `example_file` 展开的工具。
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/skill"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
+	"trpc.group/trpc-go/trpc-agent-go/tool/file"
+)
+
+repo, _ := skill.NewFSRepository("./skills")
+exampleFiles, _ := file.NewToolSet(
+	file.WithName("example_file"),
+	file.WithBaseDir("./files"),
+)
+
+agent := llmagent.New(
+	"skills-assistant",
+	llmagent.WithSkills(repo),
+	llmagent.WithActivatableToolSets([]tool.ToolSet{exampleFiles}),
+	llmagent.WithToolActivationOnSkillLoad(
+		"example-skill",
+		[]string{"example_file"},
+		llmagent.WithToolActivationMode(llmagent.ToolActivationModeInclude),
+		llmagent.WithToolActivationLifetime(llmagent.ToolActivationLifetimeInvocation),
+	),
+)
+```
+
+`WithActivatableToolSets(...)` 注册候选 ToolSet。候选 ToolSet 使用 `ToolSet.Name()` 作为引用名，并沿用普通 `ToolSet` 的工具命名规则。候选集合中的工具只会在激活规则命中后进入模型请求。
+
+`WithToolActivationOnSkillLoad(...)` 建立 skill 与候选 ToolSet 的激活关系。模型成功调用 `skill_load` 加载对应 skill 后，激活结果从下一次模型请求开始生效。一次 `Runner.Run` 内若继续进入工具循环，后续模型请求会使用更新后的工具集合。多条规则同时命中时，框架先合并激活记录，完全相同的 `(mode, lifetime, toolSetName)` 记录只保留一条；随后展开 ToolSet，最终工具集合按工具名处理重复和同名冲突。
+
+`WithToolActivationOnSkillLoad(...)` 不能与 `WithOutputSchema(...)` 同时配置。
+
+用户工具包括通过 `WithTools(...)`、`WithToolSets(...)`、运行时 `agent.WithAdditionalTools(...)` 和 `agent.WithExternalTools(...)` 加入的工具。框架工具由 `LLMAgent` 根据已启用能力自动注册，例如 `skill_load`、`workspace_exec` 和 `transfer_to_agent`。
+
+### 激活模式
+
+`WithToolActivationMode(...)` 设置激活工具与已有用户工具的合成方式。
+
+#### Include 模式
+
+`ToolActivationModeInclude` 为默认模式，在已有用户工具基础上追加激活工具。
+
+下面示例为同一个 skill 配置两条 Include 规则。
+
+```go
+searchTool := function.NewFunctionTool(search, function.WithName("search"))
+calculatorTool := function.NewFunctionTool(calculator, function.WithName("calculator"))
+exampleSearch, _ := file.NewToolSet(
+	file.WithName("example_search"),
+	file.WithBaseDir("./search"),
+)
+
+agent := llmagent.New(
+	"skills-assistant",
+	llmagent.WithSkills(repo),
+	llmagent.WithTools([]tool.Tool{searchTool, calculatorTool}),
+	llmagent.WithActivatableToolSets([]tool.ToolSet{
+		exampleFiles,
+		exampleSearch,
+	}),
+	llmagent.WithToolActivationOnSkillLoad(
+		"example-skill",
+		[]string{"example_file"},
+		llmagent.WithToolActivationMode(llmagent.ToolActivationModeInclude),
+	),
+	llmagent.WithToolActivationOnSkillLoad(
+		"example-skill",
+		[]string{"example_search"},
+		llmagent.WithToolActivationMode(llmagent.ToolActivationModeInclude),
+	),
+)
+```
+
+加载 `example-skill` 后，后续模型请求包含原有的 `search`、`calculator`，并包含 `example_file` 和 `example_search` 展开的工具。
+
+#### Only 模式
+
+`ToolActivationModeOnly` 使用户工具集合等于激活工具集合，框架工具继续保留。
+
+下面示例为同一个 skill 配置两条 Only 规则。
+
+```go
+searchTool := function.NewFunctionTool(search, function.WithName("search"))
+calculatorTool := function.NewFunctionTool(calculator, function.WithName("calculator"))
+exampleSearch, _ := file.NewToolSet(
+	file.WithName("example_search"),
+	file.WithBaseDir("./search"),
+)
+
+agent := llmagent.New(
+	"skills-assistant",
+	llmagent.WithSkills(repo),
+	llmagent.WithTools([]tool.Tool{searchTool, calculatorTool}),
+	llmagent.WithActivatableToolSets([]tool.ToolSet{
+		exampleFiles,
+		exampleSearch,
+	}),
+	llmagent.WithToolActivationOnSkillLoad(
+		"example-skill",
+		[]string{"example_file"},
+		llmagent.WithToolActivationMode(llmagent.ToolActivationModeOnly),
+	),
+	llmagent.WithToolActivationOnSkillLoad(
+		"example-skill",
+		[]string{"example_search"},
+		llmagent.WithToolActivationMode(llmagent.ToolActivationModeOnly),
+	),
+)
+```
+
+加载 `example-skill` 后，后续模型请求中的用户工具来自 `example_file` 和 `example_search` 展开的工具，`search` 和 `calculator` 会被裁剪。框架工具继续保留。
+
+#### Include 与 Only 同时命中
+
+一次模型请求同时存在 Include 与 Only 激活结果时，按 Only 模式合成本次用户工具集合，也就是只保留所有 Only 规则展开后的用户工具，框架工具继续保留。
+
+```go
+searchTool := function.NewFunctionTool(search, function.WithName("search"))
+calculatorTool := function.NewFunctionTool(calculator, function.WithName("calculator"))
+exampleSearch, _ := file.NewToolSet(
+	file.WithName("example_search"),
+	file.WithBaseDir("./search"),
+)
+
+agent := llmagent.New(
+	"skills-assistant",
+	llmagent.WithSkills(repo),
+	llmagent.WithTools([]tool.Tool{searchTool, calculatorTool}),
+	llmagent.WithActivatableToolSets([]tool.ToolSet{
+		exampleFiles,
+		exampleSearch,
+	}),
+	llmagent.WithToolActivationOnSkillLoad(
+		"example-skill",
+		[]string{"example_file"},
+		llmagent.WithToolActivationMode(llmagent.ToolActivationModeInclude),
+	),
+	llmagent.WithToolActivationOnSkillLoad(
+		"example-skill",
+		[]string{"example_search"},
+		llmagent.WithToolActivationMode(llmagent.ToolActivationModeOnly),
+	),
+)
+```
+
+加载 `example-skill` 后，后续模型请求中的用户工具来自 `example_search` 展开的工具。`search`、`calculator` 和 Include 规则中的 `example_file` 不进入本次用户工具集合。
+
+#### 同名工具处理
+
+激活工具与已有用户工具同名时，最终使用激活工具。在 Include 模式下，同名用户工具会被替换；在 Only 模式下，最终用户工具集合来自 Only 规则展开后的激活工具。激活工具与框架工具同名时，框架工具保持可见，并记录告警。
+
+### 激活生命周期
+
+`WithToolActivationLifetime(...)` 设置激活结果的生效周期。
+
+- `ToolActivationLifetimeInvocation` 为默认生命周期，激活结果仅在当前 agent 调用过程内生效。本次调用如果继续产生后续模型请求，这些请求会继续携带激活工具。下一次调用同一 agent 时，需要再次由 `skill_load` 触发。
+- `ToolActivationLifetimeSession` 使激活结果在同一 session 内持续生效。同一 session 后续调用该 agent 时，会继续携带这些激活工具。
+
 ## 故障排查
 
 - “unknown skill”：确认技能名与仓库路径；调用 `skill_load` 前
   先检查“概览注入”是否包含该技能
-- “executor is not configured”：为 `LLMAgent` 配置
-  `WithCodeExecutor`，或使用默认本地执行器
-- 超时/非零退出码：检查命令、依赖与 `timeout` 参数；容器模式下
-  网络默认关闭，避免依赖网络的脚本
-- 输出文件未返回：检查 `output_files` 通配符是否指向正确位置
+- 没配 executor：默认情况下，`WithSkills(repo)` 会自动 fallback 到
+  一个本地 executor。如果你显式 opt out 了
+  （`WithSkillToolProfile(SkillToolProfileKnowledgeOnly)` 或
+  `WithAllowedSkillTools(...)`），又想要 `workspace_exec`，就显式传
+  `llmagent.WithCodeExecutor(...)`（本地或容器）。
+- 超时/非零退出码：检查命令、依赖与超时参数；容器模式下网络默认关闭，
+  避免依赖网络的脚本
+- 输出文件未收集到：确认 `workspace_exec` 使用的通配符是否指向工作区
+  内的实际路径
 
 ## 参考与示例
 
 - 背景：
   - 工程博客：
     https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
-  - 开源库： https://github.com/anthropics/skills
+  - 开源库：https://github.com/anthropics/skills
 - 业界实践：
   - OpenClaw：在 prompt 中要求模型用工具读取所选 skill 的 `SKILL.md`：
     https://github.com/openclaw/openclaw/blob/0cf93b8fa74566258131f9e8ca30f313aac89d26/src/agents/system-prompt.ts
   - OpenAI Codex：在项目文档里列出 skills，并要求按需打开 `SKILL.md`：
     https://github.com/openai/codex/blob/383b45279efda1ef611a4aa286621815fe656b8a/codex-rs/core/src/project_doc.rs
 - 本仓库：
-  - 交互示例： [examples/skillrun/main.go]
-    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/main.go)
-  - 示例技能： [examples/skillrun/skills/python_math/SKILL.md]
-    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillrun/skills/python_math/SKILL.md)
+  - GAIA 基准示例： [examples/skill/README.md]
+    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skill/README.md)
+  - 真实技能发现/安装示例： [examples/skillfind/README.md]
+    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillfind/README.md)
+  - 子代理 skill 隔离示例： [examples/skillisolation/README.md]
+    (https://github.com/trpc-group/trpc-agent-go/blob/main/examples/skillisolation/README.md)

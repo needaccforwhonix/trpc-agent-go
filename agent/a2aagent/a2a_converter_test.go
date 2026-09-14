@@ -10,11 +10,16 @@
 package a2aagent
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/graph"
 	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -119,6 +124,12 @@ func TestDefaultA2AEventConverter_ConvertToEvent(t *testing.T) {
 						{
 							ArtifactID: "artifact-1",
 							Parts:      []protocol.Part{&protocol.TextPart{Kind: protocol.KindText, Text: "Task content"}},
+							Metadata: map[string]any{
+								ia2a.MessageMetadataObjectTypeKey: "graph.node.start",
+								ia2a.MessageMetadataStateDeltaKey: ia2a.EncodeStateDeltaMetadata(map[string][]byte{
+									"_node_metadata": []byte(`{"nodeId":"planner","phase":"start"}`),
+								}),
+							},
 						},
 					},
 				},
@@ -146,6 +157,43 @@ func TestDefaultA2AEventConverter_ConvertToEvent(t *testing.T) {
 				}
 				if event.Response.ID != "artifact-1" {
 					t.Errorf("expected response ID 'artifact-1', got %s", event.Response.ID)
+				}
+				if event.Response.Object != "graph.node.start" {
+					t.Errorf("expected response object graph.node.start, got %s", event.Response.Object)
+				}
+				if event.StateDelta == nil {
+					t.Fatal("expected state delta restored from artifact metadata")
+				}
+				assertStateDeltaBytesEqual(t, map[string][]byte{
+					"_node_metadata": []byte(`{"nodeId":"planner","phase":"start"}`),
+				}, event.StateDelta)
+			},
+		},
+		{
+			name: "task result without artifact metadata keeps default object",
+			result: protocol.MessageResult{
+				Result: &protocol.Task{
+					ID:        "task-1",
+					ContextID: "ctx-1",
+					Artifacts: []protocol.Artifact{
+						{
+							ArtifactID: "artifact-1",
+							Parts:      []protocol.Part{&protocol.TextPart{Kind: protocol.KindText, Text: "Task content"}},
+						},
+					},
+				},
+			},
+			agentName: "test-agent",
+			invocation: &agent.Invocation{
+				InvocationID: "test-id",
+			},
+			setupFunc: func(tc *testCase) {},
+			validateFunc: func(t *testing.T, event *event.Event, err error) {
+				if err != nil {
+					t.Errorf("expected no error, got %v", err)
+				}
+				if event == nil {
+					t.Fatal("expected event, got nil")
 				}
 				if event.Response.Object != model.ObjectTypeChatCompletion {
 					t.Errorf("expected response object %s, got %s", model.ObjectTypeChatCompletion, event.Response.Object)
@@ -314,18 +362,8 @@ func TestDefaultA2AEventConverter_ConvertStreamingToEvents(t *testing.T) {
 				if err != nil {
 					t.Errorf("expected no error, got %v", err)
 				}
-				if len(events) == 0 {
-					t.Fatal("expected at least one event, got none")
-				}
-				evt := events[0]
-				if evt.Response == nil {
-					t.Fatal("expected response, got nil")
-				}
-				if evt.Response.ID != "status-1" {
-					t.Errorf("expected response ID 'status-1', got %s", evt.Response.ID)
-				}
-				if evt.Response.Object != model.ObjectTypeChatCompletionChunk {
-					t.Errorf("expected response object %s, got %s", model.ObjectTypeChatCompletionChunk, evt.Response.Object)
+				if len(events) != 0 {
+					t.Fatalf("expected no events (status updates are filtered), got %d", len(events))
 				}
 			},
 		},
@@ -375,6 +413,98 @@ func TestDefaultA2AEventConverter_ConvertStreamingToEvents(t *testing.T) {
 			events, err := converter.ConvertStreamingToEvents(tc.result, tc.agentName, tc.invocation)
 			tc.validateFunc(t, events, err)
 		})
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertToEvents_PreservesAssistantTextBeforeToolCall(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	invocation := &agent.Invocation{InvocationID: "test-id"}
+
+	dataPart := protocol.NewDataPart(map[string]any{
+		ia2a.ToolCallFieldID:   "call-1",
+		ia2a.ToolCallFieldType: "function",
+		ia2a.ToolCallFieldName: "lookup_policy",
+		ia2a.ToolCallFieldArgs: `{"city":"beijing"}`,
+	})
+	dataPart.Metadata = map[string]any{
+		ia2a.DataPartMetadataTypeKey: ia2a.DataPartMetadataTypeFunctionCall,
+	}
+
+	events, err := converter.ConvertToEvents(protocol.MessageResult{
+		Result: &protocol.Message{
+			MessageID: "msg-1",
+			Role:      protocol.MessageRoleAgent,
+			Parts: []protocol.Part{
+				&protocol.TextPart{Text: "I will help you call the tool."},
+				&dataPart,
+			},
+		},
+	}, "test-agent", invocation)
+	if err != nil {
+		t.Fatalf("ConvertToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	evt := events[0]
+	if evt.Response == nil || len(evt.Response.Choices) != 1 {
+		t.Fatalf("expected one response choice, got %#v", evt.Response)
+	}
+	msg := evt.Response.Choices[0].Message
+	if msg.Content != "I will help you call the tool." {
+		t.Fatalf("expected assistant content preserved, got %q", msg.Content)
+	}
+	if len(msg.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(msg.ToolCalls))
+	}
+	if msg.ToolCalls[0].Function.Name != "lookup_policy" {
+		t.Fatalf("expected tool name lookup_policy, got %q", msg.ToolCalls[0].Function.Name)
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertStreamingToEvents_PreservesAssistantTextBeforeToolCall(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	invocation := &agent.Invocation{InvocationID: "test-id"}
+
+	dataPart := protocol.NewDataPart(map[string]any{
+		ia2a.ToolCallFieldID:   "call-1",
+		ia2a.ToolCallFieldType: "function",
+		ia2a.ToolCallFieldName: "lookup_policy",
+		ia2a.ToolCallFieldArgs: `{"city":"beijing"}`,
+	})
+	dataPart.Metadata = map[string]any{
+		ia2a.DataPartMetadataTypeKey: ia2a.DataPartMetadataTypeFunctionCall,
+	}
+
+	events, err := converter.ConvertStreamingToEvents(protocol.StreamingMessageEvent{
+		Result: &protocol.TaskArtifactUpdateEvent{
+			TaskID:    "task-1",
+			ContextID: "ctx-1",
+			Artifact: protocol.Artifact{
+				ArtifactID: "artifact-1",
+				Parts: []protocol.Part{
+					&protocol.TextPart{Text: "I will help you call the tool."},
+					&dataPart,
+				},
+			},
+		},
+	}, "test-agent", invocation)
+	if err != nil {
+		t.Fatalf("ConvertStreamingToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	evt := events[0]
+	if evt.Response == nil || len(evt.Response.Choices) != 1 {
+		t.Fatalf("expected one response choice, got %#v", evt.Response)
+	}
+	msg := evt.Response.Choices[0].Message
+	if msg.Content != "I will help you call the tool." {
+		t.Fatalf("expected assistant content preserved, got %q", msg.Content)
+	}
+	if len(msg.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(msg.ToolCalls))
 	}
 }
 
@@ -476,8 +606,20 @@ func TestDefaultEventA2AConverter_ConvertToA2AMessage(t *testing.T) {
 				if len(msg.Parts) != 1 {
 					t.Errorf("expected 1 part, got %d", len(msg.Parts))
 				}
-				if _, ok := msg.Parts[0].(protocol.FilePart); !ok {
-					t.Error("expected FilePart")
+				filePart, ok := msg.Parts[0].(*protocol.FilePart)
+				if !ok {
+					t.Error("expected *FilePart")
+					return
+				}
+				if got := filePart.Metadata[ia2a.FilePartMetadataContentTypeKey]; got != ia2a.FilePartMetadataContentTypeImage {
+					t.Errorf("expected content_type %q, got %#v", ia2a.FilePartMetadataContentTypeImage, got)
+				}
+				fileBytes, ok := filePart.File.(*protocol.FileWithBytes)
+				if !ok {
+					t.Fatalf("expected *protocol.FileWithBytes, got %T", filePart.File)
+				}
+				if fileBytes.MimeType == nil || *fileBytes.MimeType != "png" {
+					t.Errorf("expected mime type png, got %#v", fileBytes.MimeType)
 				}
 			},
 		},
@@ -506,8 +648,20 @@ func TestDefaultEventA2AConverter_ConvertToA2AMessage(t *testing.T) {
 				if len(msg.Parts) != 1 {
 					t.Errorf("expected 1 part, got %d", len(msg.Parts))
 				}
-				if _, ok := msg.Parts[0].(protocol.FilePart); !ok {
-					t.Error("expected FilePart")
+				filePart, ok := msg.Parts[0].(*protocol.FilePart)
+				if !ok {
+					t.Error("expected *FilePart")
+					return
+				}
+				if got := filePart.Metadata[ia2a.FilePartMetadataContentTypeKey]; got != ia2a.FilePartMetadataContentTypeImage {
+					t.Errorf("expected content_type %q, got %#v", ia2a.FilePartMetadataContentTypeImage, got)
+				}
+				fileURI, ok := filePart.File.(*protocol.FileWithURI)
+				if !ok {
+					t.Fatalf("expected *protocol.FileWithURI, got %T", filePart.File)
+				}
+				if fileURI.URI != "https://example.com/image.jpg" {
+					t.Errorf("expected URI https://example.com/image.jpg, got %s", fileURI.URI)
 				}
 			},
 		},
@@ -536,8 +690,13 @@ func TestDefaultEventA2AConverter_ConvertToA2AMessage(t *testing.T) {
 				if len(msg.Parts) != 1 {
 					t.Errorf("expected 1 part, got %d", len(msg.Parts))
 				}
-				if _, ok := msg.Parts[0].(protocol.FilePart); !ok {
-					t.Error("expected FilePart")
+				filePart, ok := msg.Parts[0].(*protocol.FilePart)
+				if !ok {
+					t.Error("expected *FilePart")
+					return
+				}
+				if got := filePart.Metadata[ia2a.FilePartMetadataContentTypeKey]; got != ia2a.FilePartMetadataContentTypeAudio {
+					t.Errorf("expected content_type %q, got %#v", ia2a.FilePartMetadataContentTypeAudio, got)
 				}
 			},
 		},
@@ -567,8 +726,13 @@ func TestDefaultEventA2AConverter_ConvertToA2AMessage(t *testing.T) {
 				if len(msg.Parts) != 1 {
 					t.Errorf("expected 1 part, got %d", len(msg.Parts))
 				}
-				if _, ok := msg.Parts[0].(protocol.FilePart); !ok {
-					t.Error("expected FilePart")
+				filePart, ok := msg.Parts[0].(*protocol.FilePart)
+				if !ok {
+					t.Error("expected *FilePart")
+					return
+				}
+				if got := filePart.Metadata[ia2a.FilePartMetadataContentTypeKey]; got != ia2a.FilePartMetadataContentTypeFile {
+					t.Errorf("expected content_type %q, got %#v", ia2a.FilePartMetadataContentTypeFile, got)
 				}
 			},
 		},
@@ -784,6 +948,360 @@ func TestConvertTaskStatusToMessage(t *testing.T) {
 			tc.setupFunc(&tc)
 			msg := convertTaskStatusToMessage(tc.event)
 			tc.validateFunc(t, msg)
+		})
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertStreamingToEvents_FailedStatus(
+	t *testing.T,
+) {
+	converter := &defaultA2AEventConverter{}
+	code := "A2A_500"
+	metadata := ia2a.WithResponseErrorMetadata(nil, &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: "task failed",
+		Code:    &code,
+	})
+
+	events, err := converter.ConvertStreamingToEvents(
+		protocol.StreamingMessageEvent{
+			Result: &protocol.TaskStatusUpdateEvent{
+				TaskID:    "task-1",
+				ContextID: "ctx-1",
+				Metadata:  metadata,
+				Status: protocol.TaskStatus{
+					State: protocol.TaskStateFailed,
+				},
+			},
+		},
+		"test-agent",
+		&agent.Invocation{InvocationID: "inv"},
+	)
+	if err != nil {
+		t.Fatalf("ConvertStreamingToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Response == nil || events[0].Response.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if events[0].Response.Error.Code == nil ||
+		*events[0].Response.Error.Code != code {
+		t.Fatalf("code = %v, want %q", events[0].Response.Error.Code, code)
+	}
+	if !events[0].Response.Done {
+		t.Fatal("expected terminal error event")
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertStreamingToEvents_MessageStructuredError(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	code := "tool_not_found"
+	events, err := converter.ConvertStreamingToEvents(
+		protocol.StreamingMessageEvent{
+			Result: &protocol.Message{
+				Kind:      protocol.KindMessage,
+				MessageID: "msg-structured-error",
+				Role:      protocol.MessageRoleAgent,
+				Parts: []protocol.Part{
+					&protocol.TextPart{
+						Kind: protocol.KindText,
+						Text: "Tool 'upload_to_cos' not found",
+					},
+				},
+				Metadata: map[string]any{
+					ia2a.MessageMetadataErrorCodeKey: code,
+				},
+			},
+		},
+		"test-agent",
+		&agent.Invocation{InvocationID: "inv"},
+	)
+	if err != nil {
+		t.Fatalf("ConvertStreamingToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Response == nil || events[0].Response.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if events[0].Response.Error.Code == nil || *events[0].Response.Error.Code != code {
+		t.Fatalf("code = %v, want %q", events[0].Response.Error.Code, code)
+	}
+	if events[0].Response.Done {
+		t.Fatal("expected recoverable error event")
+	}
+	if events[0].Response.IsPartial {
+		t.Fatal("expected structured error message event to be non-partial")
+	}
+	if events[0].Response.Object != model.ObjectTypeChatCompletion {
+		t.Fatalf("object = %q, want %q", events[0].Response.Object, model.ObjectTypeChatCompletion)
+	}
+	if events[0].Response.Error.Message != "Tool 'upload_to_cos' not found" {
+		t.Fatalf(
+			"message = %q, want %q",
+			events[0].Response.Error.Message,
+			"Tool 'upload_to_cos' not found",
+		)
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertStreamingToEvents_CompletedStatusStructuredError(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	code := "A2A_500"
+	metadata := ia2a.WithResponseErrorMetadata(nil, &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: "runner failed",
+		Code:    &code,
+	})
+
+	events, err := converter.ConvertStreamingToEvents(
+		protocol.StreamingMessageEvent{
+			Result: &protocol.TaskStatusUpdateEvent{
+				TaskID:    "task-1",
+				ContextID: "ctx-1",
+				Final:     true,
+				Metadata:  metadata,
+				Status: protocol.TaskStatus{
+					State: protocol.TaskStateCompleted,
+				},
+			},
+		},
+		"test-agent",
+		&agent.Invocation{InvocationID: "inv"},
+	)
+	if err != nil {
+		t.Fatalf("ConvertStreamingToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Response == nil || events[0].Response.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if events[0].Response.Error.Code == nil || *events[0].Response.Error.Code != code {
+		t.Fatalf("code = %v, want %q", events[0].Response.Error.Code, code)
+	}
+	if !events[0].Response.Done {
+		t.Fatal("expected terminal error event")
+	}
+	if events[0].Response.Object != model.ObjectTypeError {
+		t.Fatalf("object = %q, want %q", events[0].Response.Object, model.ObjectTypeError)
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertStreamingToEvents_FinalArtifactStructuredError(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	code := "A2A_500"
+	lastChunk := true
+	metadata := ia2a.WithResponseErrorMetadata(nil, &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: "runner failed",
+		Code:    &code,
+	})
+
+	events, err := converter.ConvertStreamingToEvents(
+		protocol.StreamingMessageEvent{
+			Result: &protocol.TaskArtifactUpdateEvent{
+				TaskID:    "task-1",
+				ContextID: "ctx-1",
+				LastChunk: &lastChunk,
+				Metadata:  metadata,
+				Artifact: protocol.Artifact{
+					ArtifactID: "artifact-error",
+				},
+			},
+		},
+		"test-agent",
+		&agent.Invocation{InvocationID: "inv"},
+	)
+	if err != nil {
+		t.Fatalf("ConvertStreamingToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Response == nil || events[0].Response.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if events[0].Response.ID != "artifact-error" {
+		t.Fatalf("id = %q, want %q", events[0].Response.ID, "artifact-error")
+	}
+	if events[0].Response.Error.Code == nil || *events[0].Response.Error.Code != code {
+		t.Fatalf("code = %v, want %q", events[0].Response.Error.Code, code)
+	}
+	if !events[0].Response.Done {
+		t.Fatal("expected terminal error event")
+	}
+	if events[0].Response.Object != model.ObjectTypeError {
+		t.Fatalf("object = %q, want %q", events[0].Response.Object, model.ObjectTypeError)
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertToEvents_FailedTask(
+	t *testing.T,
+) {
+	converter := &defaultA2AEventConverter{}
+	metadata := ia2a.WithResponseErrorMetadata(nil, &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: "task failed",
+	})
+
+	events, err := converter.ConvertToEvents(
+		protocol.MessageResult{
+			Result: &protocol.Task{
+				ID:        "task-1",
+				ContextID: "ctx-1",
+				Metadata:  metadata,
+				Status: protocol.TaskStatus{
+					State: protocol.TaskStateFailed,
+				},
+			},
+		},
+		"test-agent",
+		&agent.Invocation{InvocationID: "inv"},
+	)
+	if err != nil {
+		t.Fatalf("ConvertToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Response == nil || events[0].Response.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if events[0].Response.Error.Message != "task failed" {
+		t.Fatalf(
+			"message = %q, want %q",
+			events[0].Response.Error.Message,
+			"task failed",
+		)
+	}
+}
+
+func TestDefaultA2AEventConverter_ConvertToEvents_MessageStructuredError(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	code := "tool_not_found"
+	events, err := converter.ConvertToEvents(
+		protocol.MessageResult{
+			Result: &protocol.Message{
+				Kind:      protocol.KindMessage,
+				MessageID: "msg-structured-error",
+				Role:      protocol.MessageRoleAgent,
+				Parts: []protocol.Part{
+					&protocol.TextPart{
+						Kind: protocol.KindText,
+						Text: "Tool 'upload_to_cos' not found",
+					},
+				},
+				Metadata: map[string]any{
+					ia2a.MessageMetadataErrorCodeKey: code,
+				},
+			},
+		},
+		"test-agent",
+		&agent.Invocation{InvocationID: "inv"},
+	)
+	if err != nil {
+		t.Fatalf("ConvertToEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Response == nil || events[0].Response.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if events[0].Response.Error.Code == nil || *events[0].Response.Error.Code != code {
+		t.Fatalf("code = %v, want %q", events[0].Response.Error.Code, code)
+	}
+	if !events[0].Response.Done {
+		t.Fatal("expected terminal error event")
+	}
+	if events[0].Response.Object != model.ObjectTypeError {
+		t.Fatalf("object = %q, want %q", events[0].Response.Object, model.ObjectTypeError)
+	}
+	if events[0].Response.Error.Message != "Tool 'upload_to_cos' not found" {
+		t.Fatalf(
+			"message = %q, want %q",
+			events[0].Response.Error.Message,
+			"Tool 'upload_to_cos' not found",
+		)
+	}
+}
+
+func TestTaskResponseError_EdgeCases(t *testing.T) {
+	if taskResponseError(nil) != nil {
+		t.Fatal("expected nil response error for nil result")
+	}
+
+	if taskResponseError(&parseResult{
+		taskState: protocol.TaskStateSubmitted,
+	}) != nil {
+		t.Fatal("expected nil response error for non-failure state")
+	}
+
+	passthrough := &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: "structured",
+	}
+	if got := taskResponseError(&parseResult{
+		taskState:     protocol.TaskStateFailed,
+		responseError: passthrough,
+		textContent:   "ignored",
+	}); got != passthrough {
+		t.Fatal("expected structured response error to be reused")
+	}
+	if got := taskResponseError(&parseResult{
+		responseError: passthrough,
+		textContent:   "ignored",
+	}); got != passthrough {
+		t.Fatal("expected structured message error to be reused without task failure state")
+	}
+}
+
+func TestTaskResponseError_FallbackMessages(t *testing.T) {
+	tests := []struct {
+		name  string
+		state protocol.TaskState
+		want  string
+	}{
+		{
+			name:  "failed",
+			state: protocol.TaskStateFailed,
+			want:  "remote task failed",
+		},
+		{
+			name:  "rejected",
+			state: protocol.TaskStateRejected,
+			want:  "remote task rejected",
+		},
+		{
+			name:  "canceled",
+			state: protocol.TaskStateCanceled,
+			want:  "remote task canceled",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			respErr := taskResponseError(&parseResult{
+				taskState: tt.state,
+			})
+			if respErr == nil {
+				t.Fatal("expected response error, got nil")
+			}
+			if respErr.Type != model.ErrorTypeFlowError {
+				t.Fatalf("unexpected error type: %s", respErr.Type)
+			}
+			if respErr.Message != tt.want {
+				t.Fatalf(
+					"message = %q, want %q",
+					respErr.Message,
+					tt.want,
+				)
+			}
 		})
 	}
 }
@@ -1036,6 +1554,12 @@ func TestProcessFunctionResponse(t *testing.T) {
 		validateFunc func(t *testing.T, content, id, name string)
 	}
 
+	unmarshalableResponse := struct {
+		Ch chan int
+	}{
+		Ch: make(chan int),
+	}
+
 	tests := []testCase{
 		{
 			name: "valid tool response",
@@ -1090,15 +1614,51 @@ func TestProcessFunctionResponse(t *testing.T) {
 			},
 		},
 		{
-			name: "non-string response",
+			name: "numeric response marshals to json",
 			dataPart: &protocol.DataPart{
 				Data: map[string]any{
 					"response": 12345,
 				},
 			},
 			validateFunc: func(t *testing.T, content, id, name string) {
+				if content != "12345" {
+					t.Errorf("expected JSON number content, got %s", content)
+				}
+			},
+		},
+		{
+			name: "object response marshals to json",
+			dataPart: &protocol.DataPart{
+				Data: map[string]any{
+					"response": map[string]any{
+						"city": "Beijing",
+						"temp": 26,
+					},
+				},
+			},
+			validateFunc: func(t *testing.T, content, id, name string) {
+				var got map[string]any
+				if err := json.Unmarshal([]byte(content), &got); err != nil {
+					t.Fatalf("expected valid JSON object content, got %q: %v", content, err)
+				}
+				if got["city"] != "Beijing" {
+					t.Errorf("expected city Beijing, got %#v", got["city"])
+				}
+				if got["temp"] != float64(26) {
+					t.Errorf("expected temp 26, got %#v", got["temp"])
+				}
+			},
+		},
+		{
+			name: "unmarshalable response is skipped",
+			dataPart: &protocol.DataPart{
+				Data: map[string]any{
+					"response": unmarshalableResponse,
+				},
+			},
+			validateFunc: func(t *testing.T, content, id, name string) {
 				if content != "" {
-					t.Errorf("expected empty content for non-string response, got %s", content)
+					t.Errorf("expected empty content for unmarshalable response, got %q", content)
 				}
 			},
 		},
@@ -1282,6 +1842,380 @@ func TestProcessDataPartInto_ADKMetadataKey(t *testing.T) {
 			processDataPart(tc.dataPart, result)
 			tc.validateFunc(t, result)
 		})
+	}
+}
+
+func TestProcessDataPartWithMappers_CustomMapperHandlesUnknownType(t *testing.T) {
+	result := &parseResult{}
+	part := &protocol.DataPart{
+		Data: map[string]any{
+			"business": "payload",
+		},
+		Metadata: map[string]any{
+			"type": "biz_custom",
+		},
+	}
+
+	processDataPartWithMappers(part, result, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			if ia2a.GetDataPartType(p.Metadata) != "biz_custom" {
+				return false, nil
+			}
+			out.SetTextContent("mapped-by-custom")
+			return true, nil
+		},
+	})
+
+	if result.textContent != "mapped-by-custom" {
+		t.Fatalf("expected mapper to set text content, got %q", result.textContent)
+	}
+}
+
+func TestProcessDataPartWithMappers_ValueTypedBuiltInDataPart(t *testing.T) {
+	result := &parseResult{}
+	part := protocol.NewDataPart(map[string]any{
+		ia2a.ToolCallFieldID:   "call-1",
+		ia2a.ToolCallFieldType: "function",
+		ia2a.ToolCallFieldName: "lookup",
+		ia2a.ToolCallFieldArgs: `{"query":"value-part"}`,
+	})
+	part.Metadata = map[string]any{
+		"type": ia2a.DataPartMetadataTypeFunctionCall,
+	}
+
+	processDataPartWithMappers(part, result, nil)
+
+	if len(result.toolCalls) != 1 {
+		t.Fatalf("expected built-in handling for value DataPart, got %d tool calls", len(result.toolCalls))
+	}
+	if result.toolCalls[0].Function.Name != "lookup" {
+		t.Fatalf("unexpected tool call name: %s", result.toolCalls[0].Function.Name)
+	}
+}
+
+func TestParseA2AMessagePartsWithMappers_CustomMapperPreservesMappedText(t *testing.T) {
+	msg := &protocol.Message{
+		Parts: []protocol.Part{
+			&protocol.DataPart{
+				Data: map[string]any{"business": "payload"},
+				Metadata: map[string]any{
+					"type": "biz_custom",
+				},
+			},
+		},
+	}
+
+	result := parseA2AMessagePartsWithMappers(msg, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			if ia2a.GetDataPartType(p.Metadata) != "biz_custom" {
+				return false, nil
+			}
+			out.SetTextContent("mapped-by-custom")
+			return true, nil
+		},
+	})
+
+	if result.textContent != "mapped-by-custom" {
+		t.Fatalf("expected mapper-mapped text content, got %q", result.textContent)
+	}
+}
+
+func TestParseA2AMessagePartsWithMappers_FlushesTextAroundValueTypedCustomDataPart(t *testing.T) {
+	customPart := protocol.NewDataPart(map[string]any{"business": "payload"})
+	customPart.Metadata = map[string]any{
+		"type": "biz_custom",
+	}
+
+	msg := &protocol.Message{
+		Parts: []protocol.Part{
+			protocol.NewTextPart("prefix "),
+			customPart,
+			protocol.NewTextPart("suffix"),
+		},
+	}
+
+	result := parseA2AMessagePartsWithMappers(msg, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			if got := out.GetTextContent(); got != "prefix " {
+				t.Fatalf("expected mapper to observe prior text, got %q", got)
+			}
+			out.SetTextContent(out.GetTextContent() + "mapped ")
+			return true, nil
+		},
+	})
+
+	if result.textContent != "prefix mapped suffix" {
+		t.Fatalf("expected text from before and after mapper to be preserved, got %q", result.textContent)
+	}
+}
+
+func TestProcessDataPartWithMappers_UnmatchedMapperDoesNotApplyChanges(t *testing.T) {
+	result := &parseResult{textContent: "existing"}
+	part := &protocol.DataPart{
+		Data: map[string]any{"business": "payload"},
+		Metadata: map[string]any{
+			"type": "biz_custom",
+		},
+	}
+
+	processDataPartWithMappers(part, result, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			out.SetTextContent("should-not-apply")
+			return false, nil
+		},
+	})
+
+	if result.textContent != "existing" {
+		t.Fatalf("expected unmatched mapper changes to be ignored, got %q", result.textContent)
+	}
+}
+
+func TestProcessDataPartWithMappers_CustomMapperSetsEventExtension(t *testing.T) {
+	result := &parseResult{}
+	part := &protocol.DataPart{
+		Data: map[string]any{
+			"business": "payload",
+		},
+		Metadata: map[string]any{
+			"type": "biz_custom",
+		},
+	}
+
+	processDataPartWithMappers(part, result, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			if ia2a.GetDataPartType(p.Metadata) != "biz_custom" {
+				return false, nil
+			}
+			if err := out.SetEventExtension("trpc.a2a.biz_payload", p.Data); err != nil {
+				return false, err
+			}
+			return true, nil
+		},
+	})
+
+	evt := &event.Event{Extensions: result.extensions}
+	payload, ok, err := event.GetExtension[map[string]any](evt, "trpc.a2a.biz_payload")
+	if err != nil {
+		t.Fatalf("expected extension decode to succeed, got error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected mapped event extension to be present")
+	}
+	if payload["business"] != "payload" {
+		t.Fatalf("expected payload business field to be preserved, got %+v", payload)
+	}
+}
+
+func TestNewDataPartMappingResult(t *testing.T) {
+	mapped := newDataPartMappingResult(nil)
+	if mapped == nil {
+		t.Fatal("expected non-nil mapping result for nil parseResult")
+	}
+
+	raw := json.RawMessage(`{"trace":"source"}`)
+	result := &parseResult{
+		textContent:         "text",
+		reasoningContent:    "reasoning",
+		codeExecution:       "print('ok')",
+		codeExecutionResult: "ok",
+		extensions: map[string]json.RawMessage{
+			"payload": raw,
+		},
+	}
+
+	mapped = newDataPartMappingResult(result)
+	if mapped.GetTextContent() != "text" {
+		t.Fatalf("unexpected text content: %q", mapped.GetTextContent())
+	}
+	if mapped.GetReasoningContent() != "reasoning" {
+		t.Fatalf("unexpected reasoning content: %q", mapped.GetReasoningContent())
+	}
+	if mapped.GetCodeExecution() != "print('ok')" {
+		t.Fatalf("unexpected code execution: %q", mapped.GetCodeExecution())
+	}
+	if mapped.GetCodeExecutionResult() != "ok" {
+		t.Fatalf("unexpected code execution result: %q", mapped.GetCodeExecutionResult())
+	}
+
+	raw[0] = '['
+	if string(mapped.eventExtensions["payload"]) != `{"trace":"source"}` {
+		t.Fatalf("extension clone should not change after source mutation, got %s", mapped.eventExtensions["payload"])
+	}
+}
+
+func TestApplyDataPartMappingResult(t *testing.T) {
+	dst := &parseResult{
+		textContent:         "old text",
+		reasoningContent:    "old reasoning",
+		codeExecution:       "old code",
+		codeExecutionResult: "old result",
+	}
+	mapped := &A2ADataPartMappingResult{}
+	mapped.SetTextContent("new text")
+	mapped.SetReasoningContent("new reasoning")
+	mapped.SetCodeExecution("new code")
+	mapped.SetCodeExecutionResult("new result")
+	mapped.AppendToolCall(model.ToolCall{
+		ID:   "call-1",
+		Type: "function",
+		Function: model.FunctionDefinitionParam{
+			Name: "lookup",
+		},
+	})
+	mapped.AppendToolResponse(A2ADataPartToolResponse{
+		ID:      "resp-1",
+		Name:    "lookup",
+		Content: "ok",
+	})
+	if err := mapped.SetEventExtension("payload", map[string]any{"trace": "mapped"}); err != nil {
+		t.Fatalf("SetEventExtension() returned error: %v", err)
+	}
+
+	applyDataPartMappingResult(dst, mapped)
+	if dst.textContent != "new text" {
+		t.Fatalf("unexpected text content: %q", dst.textContent)
+	}
+	if dst.reasoningContent != "new reasoning" {
+		t.Fatalf("unexpected reasoning content: %q", dst.reasoningContent)
+	}
+	if dst.codeExecution != "new code" {
+		t.Fatalf("unexpected code execution: %q", dst.codeExecution)
+	}
+	if dst.codeExecutionResult != "new result" {
+		t.Fatalf("unexpected code execution result: %q", dst.codeExecutionResult)
+	}
+	if len(dst.toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(dst.toolCalls))
+	}
+	if len(dst.toolResponses) != 1 {
+		t.Fatalf("expected one tool response, got %d", len(dst.toolResponses))
+	}
+	if string(dst.extensions["payload"]) != `{"trace":"mapped"}` {
+		t.Fatalf("unexpected extension payload: %s", dst.extensions["payload"])
+	}
+
+	mapped.eventExtensions["payload"][0] = '['
+	if string(dst.extensions["payload"]) != `{"trace":"mapped"}` {
+		t.Fatalf("destination extension should be cloned, got %s", dst.extensions["payload"])
+	}
+}
+
+func TestApplyDataPartMappingResult_NilInputs(t *testing.T) {
+	applyDataPartMappingResult(nil, &A2ADataPartMappingResult{})
+	applyDataPartMappingResult(&parseResult{}, nil)
+}
+
+func TestBuildEventResponse_WithMappedEventExtensions(t *testing.T) {
+	msg := &protocol.Message{
+		Parts: []protocol.Part{
+			&protocol.DataPart{
+				Data: map[string]any{
+					"trace_id": "trace-1",
+					"hint":     "mapped",
+				},
+				Metadata: map[string]any{
+					"type": "biz_custom",
+				},
+			},
+		},
+	}
+
+	result := parseA2AMessagePartsWithMappers(msg, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			if ia2a.GetDataPartType(p.Metadata) != "biz_custom" {
+				return false, nil
+			}
+			if err := out.SetEventExtension("trpc.a2a.biz_payload", p.Data); err != nil {
+				return false, err
+			}
+			return true, nil
+		},
+	})
+
+	evt := buildEventResponse(
+		false,
+		"msg-1",
+		result,
+		&agent.Invocation{InvocationID: "inv-1"},
+		"remote-agent",
+		protocol.MessageRoleAgent,
+	)
+
+	payload, ok, err := event.GetExtension[map[string]any](evt, "trpc.a2a.biz_payload")
+	if err != nil {
+		t.Fatalf("expected extension decode to succeed, got error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected mapped extension on converted event")
+	}
+	if payload["trace_id"] != "trace-1" || payload["hint"] != "mapped" {
+		t.Fatalf("unexpected extension payload: %+v", payload)
+	}
+	if evt.Response == nil || len(evt.Response.Choices) != 1 {
+		t.Fatalf("expected placeholder response to be preserved, got %+v", evt.Response)
+	}
+	if evt.Response.Choices[0].Message.Content != "" {
+		t.Fatalf("expected empty message content for extension-only event, got %q", evt.Response.Choices[0].Message.Content)
+	}
+}
+
+func TestProcessDataPartWithMappers_MapperErrorFallsThroughToNextMapper(t *testing.T) {
+	result := &parseResult{}
+	part := &protocol.DataPart{
+		Data: map[string]any{"business": "payload"},
+		Metadata: map[string]any{
+			"type": "biz_custom",
+		},
+	}
+
+	secondMapperCalled := false
+	processDataPartWithMappers(part, result, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			return false, errors.New("mapper failed")
+		},
+		nil,
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			secondMapperCalled = true
+			out.SetReasoningContent("mapped after error")
+			return true, nil
+		},
+	})
+
+	if !secondMapperCalled {
+		t.Fatal("expected second mapper to run after first mapper error")
+	}
+	if result.reasoningContent != "mapped after error" {
+		t.Fatalf("expected second mapper result to be applied, got %q", result.reasoningContent)
+	}
+}
+
+func TestProcessDataPartWithMappers_BuiltInTypeSkipsCustomMappers(t *testing.T) {
+	result := &parseResult{}
+	mapperCalled := false
+	part := &protocol.DataPart{
+		Data: map[string]any{
+			ia2a.ToolCallFieldID:   "call-1",
+			ia2a.ToolCallFieldType: "function",
+			ia2a.ToolCallFieldName: "lookup",
+			ia2a.ToolCallFieldArgs: `{"query":"test"}`,
+		},
+		Metadata: map[string]any{
+			"type": ia2a.DataPartMetadataTypeFunctionCall,
+		},
+	}
+
+	processDataPartWithMappers(part, result, []A2ADataPartMapper{
+		func(p *protocol.DataPart, out *A2ADataPartMappingResult) (bool, error) {
+			mapperCalled = true
+			return true, nil
+		},
+	})
+
+	if mapperCalled {
+		t.Fatal("expected built-in function call handling to bypass custom mappers")
+	}
+	if len(result.toolCalls) != 1 {
+		t.Fatalf("expected built-in tool call to be recorded, got %d", len(result.toolCalls))
 	}
 }
 
@@ -1731,6 +2665,29 @@ func TestParseA2AMessageParts_CodeExecution(t *testing.T) {
 	}
 }
 
+func TestParseA2AMessageParts_ResponseErrorFallsBackToText(t *testing.T) {
+	code := "A2A_500"
+	msg := &protocol.Message{
+		Parts: []protocol.Part{
+			&protocol.TextPart{Text: "task failed from content"},
+		},
+		Metadata: map[string]any{
+			ia2a.MessageMetadataErrorCodeKey: code,
+		},
+	}
+
+	result := parseA2AMessageParts(msg)
+	if result.responseError == nil {
+		t.Fatal("expected responseError, got nil")
+	}
+	if result.responseError.Message != "task failed from content" {
+		t.Fatalf(
+			"expected fallback message from text content, got %q",
+			result.responseError.Message,
+		)
+	}
+}
+
 // TestConvertToEvents_WithHistory tests conversion of Task with history containing code execution
 func TestConvertToEvents_WithHistory(t *testing.T) {
 	converter := &defaultA2AEventConverter{}
@@ -1926,6 +2883,163 @@ func TestParseA2AMessageParts_Tag(t *testing.T) {
 			result := parseA2AMessageParts(tt.msg)
 			tt.validateFunc(t, result)
 		})
+	}
+}
+
+func TestParseA2AMessageParts_StateDeltaMetadata(t *testing.T) {
+	originalStateDelta := map[string][]byte{
+		"_node_metadata": []byte(`{"nodeId":"planner","phase":"start"}`),
+		"json_string":    []byte(`"hello"`),
+		"plain_text":     []byte("raw-text"),
+		"empty_value":    []byte{},
+		"deleted":        nil,
+	}
+	msg := &protocol.Message{
+		Parts: nil,
+		Metadata: map[string]any{
+			"object_type":                     "graph.node.start",
+			ia2a.MessageMetadataStateDeltaKey: ia2a.EncodeStateDeltaMetadata(originalStateDelta),
+		},
+	}
+
+	result := parseA2AMessageParts(msg)
+	if result.objectType != "graph.node.start" {
+		t.Fatalf("expected objectType graph.node.start, got %s", result.objectType)
+	}
+	if result.stateDelta == nil {
+		t.Fatal("expected stateDelta to be restored from metadata")
+	}
+	assertStateDeltaBytesEqual(t, originalStateDelta, result.stateDelta)
+}
+
+func assertStateDeltaBytesEqual(t *testing.T, want, got map[string][]byte) {
+	t.Helper()
+
+	if len(got) != len(want) {
+		t.Fatalf("expected %d state_delta entries, got %d", len(want), len(got))
+	}
+	for key, wantValue := range want {
+		gotValue, ok := got[key]
+		if !ok {
+			t.Fatalf("missing state_delta key %q", key)
+		}
+		if wantValue == nil {
+			if gotValue != nil {
+				t.Fatalf("expected nil state_delta for key %q, got %v", key, gotValue)
+			}
+			continue
+		}
+		if gotValue == nil {
+			t.Fatalf("expected non-nil state_delta for key %q", key)
+		}
+		if !bytes.Equal(wantValue, gotValue) {
+			t.Fatalf("unexpected state_delta value for key %q: got %q want %q", key, gotValue, wantValue)
+		}
+	}
+}
+
+func TestConvertToEvents_StateDeltaMetadata(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	invocation := &agent.Invocation{InvocationID: "inv-state-delta"}
+	originalStateDelta := map[string][]byte{
+		"_node_metadata": []byte(`{"nodeId":"planner","phase":"start"}`),
+		"json_string":    []byte(`"hello"`),
+		"deleted":        nil,
+	}
+
+	events, err := converter.ConvertToEvents(protocol.MessageResult{
+		Result: &protocol.Message{
+			Kind:      protocol.KindMessage,
+			MessageID: "msg-state-delta",
+			Role:      protocol.MessageRoleAgent,
+			Metadata: map[string]any{
+				"object_type":                     "graph.node.start",
+				ia2a.MessageMetadataStateDeltaKey: ia2a.EncodeStateDeltaMetadata(originalStateDelta),
+			},
+		},
+	}, "test-agent", invocation)
+	if err != nil {
+		t.Fatalf("ConvertToEvents() error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Object != "graph.node.start" {
+		t.Fatalf("expected object graph.node.start, got %s", events[0].Object)
+	}
+	if events[0].StateDelta == nil {
+		t.Fatal("expected StateDelta on converted event")
+	}
+	assertStateDeltaBytesEqual(t, originalStateDelta, events[0].StateDelta)
+}
+
+func TestConvertToEvents_GraphExecutionMarksDone(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	invocation := &agent.Invocation{InvocationID: "inv-graph-exec"}
+
+	events, err := converter.ConvertToEvents(protocol.MessageResult{
+		Result: &protocol.Message{
+			Kind:      protocol.KindMessage,
+			MessageID: "msg-graph-exec",
+			Role:      protocol.MessageRoleAgent,
+			Metadata: map[string]any{
+				ia2a.MessageMetadataObjectTypeKey: graph.ObjectTypeGraphExecution,
+				ia2a.MessageMetadataStateDeltaKey: ia2a.EncodeStateDeltaMetadata(map[string][]byte{
+					"child_done": []byte("true"),
+				}),
+			},
+		},
+	}, "test-agent", invocation)
+	if err != nil {
+		t.Fatalf("ConvertToEvents() error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if !events[0].Done {
+		t.Fatal("expected graph.execution event to be marked done")
+	}
+	if events[0].IsPartial {
+		t.Fatal("expected graph.execution event to be non-partial")
+	}
+	if events[0].Object != graph.ObjectTypeGraphExecution {
+		t.Fatalf("expected object %q, got %q", graph.ObjectTypeGraphExecution, events[0].Object)
+	}
+}
+
+func TestConvertStreamingToEvents_GraphExecutionMarksDone(t *testing.T) {
+	converter := &defaultA2AEventConverter{}
+	invocation := &agent.Invocation{InvocationID: "inv-graph-exec-stream"}
+
+	events, err := converter.ConvertStreamingToEvents(protocol.StreamingMessageEvent{
+		Result: &protocol.TaskArtifactUpdateEvent{
+			TaskID:    "task-graph-exec",
+			ContextID: "ctx-graph-exec",
+			Artifact: protocol.Artifact{
+				ArtifactID: "artifact-graph-exec",
+			},
+			Metadata: map[string]any{
+				ia2a.MessageMetadataObjectTypeKey: graph.ObjectTypeGraphExecution,
+				ia2a.MessageMetadataStateDeltaKey: ia2a.EncodeStateDeltaMetadata(map[string][]byte{
+					"child_done": []byte("true"),
+				}),
+			},
+		},
+	}, "test-agent", invocation)
+	if err != nil {
+		t.Fatalf("ConvertStreamingToEvents() error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if !events[0].Done {
+		t.Fatal("expected streaming graph.execution event to be marked done")
+	}
+	if events[0].IsPartial {
+		t.Fatal("expected streaming graph.execution event to be non-partial")
+	}
+	if events[0].Object != graph.ObjectTypeGraphExecution {
+		t.Fatalf("expected object %q, got %q", graph.ObjectTypeGraphExecution, events[0].Object)
 	}
 }
 
@@ -2266,7 +3380,7 @@ func TestBuildStreamingResponse_ToolResponses(t *testing.T) {
 	if resp == nil {
 		t.Fatalf("expected response, got nil")
 	}
-	if resp.Object != model.ObjectTypeChatCompletion {
+	if resp.Object != model.ObjectTypeToolResponse {
 		t.Fatalf("unexpected object type: %s", resp.Object)
 	}
 	if len(resp.Choices) != 1 {
@@ -2428,6 +3542,68 @@ func TestBuildStreamingResponse_WithReasoningContent(t *testing.T) {
 	}
 }
 
+func TestBuildStreamingResponse_PassesThroughStructuredMessageError(t *testing.T) {
+	code := "tool_not_found"
+	resp := buildStreamingResponse("msg-123", &parseResult{
+		textContent: "Tool 'upload_to_cos' not found",
+		responseError: &model.ResponseError{
+			Type:    model.ErrorTypeFlowError,
+			Message: "Tool 'upload_to_cos' not found",
+			Code:    &code,
+		},
+		objectType: model.ObjectTypeError,
+	}, protocol.MessageRoleAgent)
+	if resp == nil {
+		t.Fatal("expected response, got nil")
+	}
+	if resp.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if resp.Error.Code == nil || *resp.Error.Code != code {
+		t.Fatalf("code = %v, want %q", resp.Error.Code, code)
+	}
+	if resp.Done {
+		t.Fatal("expected recoverable error response")
+	}
+	if resp.IsPartial {
+		t.Fatal("expected recoverable error response to be non-partial")
+	}
+	if resp.Object != model.ObjectTypeChatCompletion {
+		t.Fatalf("object = %q, want %q", resp.Object, model.ObjectTypeChatCompletion)
+	}
+	if resp.Error.Message != "Tool 'upload_to_cos' not found" {
+		t.Fatalf(
+			"message = %q, want %q",
+			resp.Error.Message,
+			"Tool 'upload_to_cos' not found",
+		)
+	}
+}
+
+func TestBuildStreamingResponse_UsesStructuredErrorMessageWhenTextMissing(t *testing.T) {
+	resp := buildStreamingResponse("msg-123", &parseResult{
+		responseError: &model.ResponseError{
+			Type:    model.ErrorTypeFlowError,
+			Message: "tool invocation failed",
+		},
+	}, protocol.MessageRoleAgent)
+	if resp == nil {
+		t.Fatal("expected response, got nil")
+	}
+	if resp.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if resp.Error.Message != "tool invocation failed" {
+		t.Fatalf("message = %q, want %q", resp.Error.Message, "tool invocation failed")
+	}
+	if resp.Done {
+		t.Fatal("expected recoverable error response")
+	}
+	if resp.IsPartial {
+		t.Fatal("expected recoverable error response to be non-partial")
+	}
+}
+
 func TestBuildNonStreamingResponse_WithReasoningContent(t *testing.T) {
 	resp := buildNonStreamingResponse("msg-123", &parseResult{
 		textContent:      "Answer",
@@ -2445,6 +3621,56 @@ func TestBuildNonStreamingResponse_WithReasoningContent(t *testing.T) {
 	}
 	if msg.ReasoningContent != "Thinking..." {
 		t.Errorf("expected reasoningContent %q, got %q", "Thinking...", msg.ReasoningContent)
+	}
+}
+
+func TestBuildNonStreamingResponse_PassesThroughStructuredMessageError(t *testing.T) {
+	code := "tool_not_found"
+	resp := buildNonStreamingResponse("msg-123", &parseResult{
+		textContent: "Tool 'upload_to_cos' not found",
+		responseError: &model.ResponseError{
+			Type:    model.ErrorTypeFlowError,
+			Message: "Tool 'upload_to_cos' not found",
+			Code:    &code,
+		},
+		objectType: model.ObjectTypeError,
+	}, protocol.MessageRoleAgent)
+	if resp == nil {
+		t.Fatal("expected response, got nil")
+	}
+	if resp.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if resp.Error.Code == nil || *resp.Error.Code != code {
+		t.Fatalf("code = %v, want %q", resp.Error.Code, code)
+	}
+	if resp.Object != model.ObjectTypeError {
+		t.Fatalf("object = %q, want %q", resp.Object, model.ObjectTypeError)
+	}
+	if resp.Error.Message != "Tool 'upload_to_cos' not found" {
+		t.Fatalf(
+			"message = %q, want %q",
+			resp.Error.Message,
+			"Tool 'upload_to_cos' not found",
+		)
+	}
+}
+
+func TestBuildNonStreamingResponse_UsesStructuredErrorMessageWhenTextMissing(t *testing.T) {
+	resp := buildNonStreamingResponse("msg-123", &parseResult{
+		responseError: &model.ResponseError{
+			Type:    model.ErrorTypeFlowError,
+			Message: "tool invocation failed",
+		},
+	}, protocol.MessageRoleAgent)
+	if resp == nil {
+		t.Fatal("expected response, got nil")
+	}
+	if resp.Error == nil {
+		t.Fatal("expected Response.Error to be populated")
+	}
+	if resp.Error.Message != "tool invocation failed" {
+		t.Fatalf("message = %q, want %q", resp.Error.Message, "tool invocation failed")
 	}
 }
 
@@ -2483,5 +3709,423 @@ func TestConvertA2ARoleToModelRole(t *testing.T) {
 				t.Errorf("convertA2ARoleToModelRole(%v) = %v, want %v", tt.role, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestAppendContentPart_UnknownType(t *testing.T) {
+	parts := appendContentPart(nil, model.ContentPart{Type: "unknown"})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for unknown content type, got %d", len(parts))
+	}
+}
+
+func TestAppendTextPart_NilText(t *testing.T) {
+	parts := appendTextPart(nil, model.ContentPart{Type: model.ContentTypeText, Text: nil})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for nil Text, got %d", len(parts))
+	}
+}
+
+func TestAppendImagePart_NilImage(t *testing.T) {
+	parts := appendImagePart(nil, model.ContentPart{Type: model.ContentTypeImage, Image: nil})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for nil Image, got %d", len(parts))
+	}
+}
+
+func TestAppendImagePart_NoDataNoURL(t *testing.T) {
+	parts := appendImagePart(nil, model.ContentPart{
+		Type:  model.ContentTypeImage,
+		Image: &model.Image{},
+	})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for Image with no data and no URL, got %d", len(parts))
+	}
+}
+
+func TestAppendImagePart_WithURL(t *testing.T) {
+	parts := appendImagePart(nil, model.ContentPart{
+		Type: model.ContentTypeImage,
+		Image: &model.Image{
+			URL:    "https://example.com/img.png",
+			Format: "image/png",
+		},
+	})
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].GetKind() != protocol.KindFile {
+		t.Fatalf("expected file kind, got %s", parts[0].GetKind())
+	}
+}
+
+func TestAppendAudioPart_NilAudio(t *testing.T) {
+	parts := appendAudioPart(nil, model.ContentPart{Type: model.ContentTypeAudio, Audio: nil})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for nil Audio, got %d", len(parts))
+	}
+}
+
+func TestAppendAudioPart_NilData(t *testing.T) {
+	parts := appendAudioPart(nil, model.ContentPart{
+		Type:  model.ContentTypeAudio,
+		Audio: &model.Audio{Data: nil, Format: "wav"},
+	})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for Audio with nil Data, got %d", len(parts))
+	}
+}
+
+func TestAppendAudioPart_WithData(t *testing.T) {
+	audioData := []byte("fake-audio-data")
+	parts := appendAudioPart(nil, model.ContentPart{
+		Type:  model.ContentTypeAudio,
+		Audio: &model.Audio{Data: audioData, Format: "wav"},
+	})
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].GetKind() != protocol.KindFile {
+		t.Fatalf("expected file kind, got %s", parts[0].GetKind())
+	}
+}
+
+func TestAppendFilePart_NilFile(t *testing.T) {
+	parts := appendFilePart(nil, model.ContentPart{Type: model.ContentTypeFile, File: nil})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for nil File, got %d", len(parts))
+	}
+}
+
+func TestAppendFilePart_EmptyData(t *testing.T) {
+	parts := appendFilePart(nil, model.ContentPart{
+		Type: model.ContentTypeFile,
+		File: &model.File{Name: "test.txt", Data: nil},
+	})
+	if len(parts) != 0 {
+		t.Fatalf("expected empty parts for File with empty Data, got %d", len(parts))
+	}
+}
+
+func TestAppendFilePart_WithFileIDAndDefaultName(t *testing.T) {
+	parts := appendFilePart(nil, model.ContentPart{
+		Type: model.ContentTypeFile,
+		File: &model.File{
+			FileID:   "file-id",
+			MimeType: "text/plain",
+		},
+	})
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+
+	filePart, ok := parts[0].(*protocol.FilePart)
+	if !ok {
+		t.Fatalf("expected *protocol.FilePart, got %T", parts[0])
+	}
+
+	fileWithURI, ok := filePart.File.(*protocol.FileWithURI)
+	if !ok {
+		t.Fatalf(
+			"expected *protocol.FileWithURI, got %T",
+			filePart.File,
+		)
+	}
+	if fileWithURI.Name == nil || *fileWithURI.Name != "file" {
+		t.Fatalf("unexpected file name: %+v", fileWithURI.Name)
+	}
+	if fileWithURI.URI != "file-id" {
+		t.Fatalf("unexpected file URI: %s", fileWithURI.URI)
+	}
+}
+
+func TestAppendFilePart_URLTakesPrecedenceOverFileID(t *testing.T) {
+	parts := appendFilePart(nil, model.ContentPart{
+		Type: model.ContentTypeFile,
+		File: &model.File{
+			URL:    "https://example.com/file",
+			FileID: "provider-file-id",
+		},
+	})
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	filePart, ok := parts[0].(*protocol.FilePart)
+	if !ok {
+		t.Fatalf("expected *protocol.FilePart, got %T", parts[0])
+	}
+	fileWithURI, ok := filePart.File.(*protocol.FileWithURI)
+	if !ok {
+		t.Fatalf("expected *protocol.FileWithURI, got %T", filePart.File)
+	}
+	if fileWithURI.URI != "https://example.com/file" {
+		t.Fatalf("unexpected file URI: %s", fileWithURI.URI)
+	}
+}
+
+func TestConvertResponseFilePart(t *testing.T) {
+	imageBytes := protocol.NewFilePartWithBytes(
+		"image.png",
+		"image/png",
+		base64.StdEncoding.EncodeToString([]byte("image")),
+	)
+	got := convertResponseFilePart(&imageBytes)
+	if got == nil || got.Type != model.ContentTypeImage ||
+		got.Image == nil || string(got.Image.Data) != "image" ||
+		got.Image.Format != "image/png" {
+		t.Fatalf("converted image = %#v", got)
+	}
+
+	fileURI := protocol.NewFilePartWithURI(
+		"report.pdf",
+		"application/pdf",
+		"https://example.com/report.pdf",
+	)
+	got = convertResponseFilePart(&fileURI)
+	if got == nil || got.Type != model.ContentTypeFile ||
+		got.File == nil || got.File.Name != "report.pdf" ||
+		got.File.URL != "https://example.com/report.pdf" ||
+		got.File.MimeType != "application/pdf" {
+		t.Fatalf("converted file = %#v", got)
+	}
+
+	invalidBytes := imageBytes
+	invalidBytes.File = &protocol.FileWithBytes{Bytes: "not-base64"}
+	got = convertResponseFilePart(&invalidBytes)
+	if got == nil || got.File == nil || string(got.File.Data) != "not-base64" {
+		t.Fatalf("invalid base64 fallback = %#v", got)
+	}
+
+	audioBytes := protocol.NewFilePartWithBytes(
+		"speech.mp3",
+		"audio/mpeg",
+		base64.StdEncoding.EncodeToString([]byte("audio")),
+	)
+	got = convertResponseFilePart(audioBytes)
+	if got == nil || got.Type != model.ContentTypeAudio ||
+		got.Audio == nil || string(got.Audio.Data) != "audio" ||
+		got.Audio.Format != "audio/mpeg" {
+		t.Fatalf("converted audio = %#v", got)
+	}
+
+	imageURI := protocol.NewFilePartWithURI(
+		"remote-image",
+		"application/octet-stream",
+		"https://example.com/image",
+	)
+	imageURI.Metadata = map[string]any{
+		ia2a.FilePartMetadataContentTypeKey: ia2a.FilePartMetadataContentTypeImage,
+	}
+	got = convertResponseFilePart(&imageURI)
+	if got == nil || got.Type != model.ContentTypeImage ||
+		got.Image == nil || got.Image.URL != "https://example.com/image" ||
+		got.Image.Format != "application/octet-stream" {
+		t.Fatalf("converted image URI = %#v", got)
+	}
+
+	var (
+		nilFilePart *protocol.FilePart
+		nilBytes    *protocol.FileWithBytes
+		nilURI      *protocol.FileWithURI
+	)
+	nilCases := []struct {
+		name string
+		part protocol.Part
+	}{
+		{name: "typed nil file part", part: nilFilePart},
+		{name: "typed nil bytes", part: &protocol.FilePart{File: nilBytes}},
+		{name: "typed nil URI", part: &protocol.FilePart{File: nilURI}},
+		{name: "nil file", part: &protocol.FilePart{}},
+		{name: "non-file part", part: &protocol.TextPart{Text: "text"}},
+	}
+	for _, tt := range nilCases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := convertResponseFilePart(tt.part); got != nil {
+				t.Fatalf("convertResponseFilePart() = %#v, want nil", got)
+			}
+		})
+	}
+}
+
+func TestLegacyA2AFileIdentity(t *testing.T) {
+	tests := []struct {
+		name        string
+		fileName    string
+		mimeType    string
+		metadata    map[string]any
+		wantContent string
+	}{
+		{
+			name:     "metadata takes precedence",
+			fileName: "image",
+			mimeType: "image/png",
+			metadata: map[string]any{
+				ia2a.FilePartMetadataContentTypeKey: ia2a.FilePartMetadataContentTypeAudio,
+			},
+			wantContent: ia2a.FilePartMetadataContentTypeAudio,
+		},
+		{
+			name:        "audio MIME type",
+			mimeType:    " AUDIO/MPEG ",
+			wantContent: ia2a.FilePartMetadataContentTypeAudio,
+		},
+		{
+			name:        "image format",
+			mimeType:    "png",
+			wantContent: ia2a.FilePartMetadataContentTypeImage,
+		},
+		{
+			name:        "audio format",
+			mimeType:    "mp3",
+			wantContent: ia2a.FilePartMetadataContentTypeAudio,
+		},
+		{
+			name:        "image name fallback",
+			fileName:    ia2a.FilePartMetadataContentTypeImage,
+			wantContent: ia2a.FilePartMetadataContentTypeImage,
+		},
+		{
+			name:        "audio name fallback",
+			fileName:    ia2a.FilePartMetadataContentTypeAudio,
+			wantContent: ia2a.FilePartMetadataContentTypeAudio,
+		},
+		{
+			name:        "generic file",
+			fileName:    "report.pdf",
+			mimeType:    "application/pdf",
+			wantContent: ia2a.FilePartMetadataContentTypeFile,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotMIMEType, gotContent := legacyA2AFileIdentity(
+				&protocol.FilePart{Metadata: tt.metadata},
+				&tt.fileName,
+				&tt.mimeType,
+			)
+			if gotName != tt.fileName {
+				t.Fatalf("name = %q, want %q", gotName, tt.fileName)
+			}
+			if gotMIMEType != tt.mimeType {
+				t.Fatalf("MIME type = %q, want %q", gotMIMEType, tt.mimeType)
+			}
+			if gotContent != tt.wantContent {
+				t.Fatalf("content type = %q, want %q", gotContent, tt.wantContent)
+			}
+		})
+	}
+}
+
+func TestDefaultA2AEventConverter_FileContentParts(t *testing.T) {
+	filePart := protocol.NewFilePartWithBytes(
+		"image.png",
+		"image/png",
+		base64.StdEncoding.EncodeToString([]byte("image")),
+	)
+	msg := &protocol.Message{
+		MessageID: "message-with-file",
+		Role:      protocol.MessageRoleAgent,
+		Parts: []protocol.Part{
+			&protocol.TextPart{Text: "before"},
+			&filePart,
+			&protocol.FilePart{},
+			&protocol.TextPart{Text: "after"},
+		},
+	}
+	converter := &defaultA2AEventConverter{}
+	invocation := &agent.Invocation{InvocationID: "invocation"}
+
+	tests := []struct {
+		name      string
+		streaming bool
+	}{
+		{name: "unary"},
+		{name: "streaming", streaming: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evt := converter.buildRespEvent(
+				tt.streaming,
+				msg,
+				"remote-agent",
+				invocation,
+			)
+			if evt == nil || evt.Response == nil || len(evt.Response.Choices) != 1 {
+				t.Fatalf("event response = %#v, want one choice", evt)
+			}
+			message := evt.Response.Choices[0].Message
+			if tt.streaming {
+				message = evt.Response.Choices[0].Delta
+			}
+			if message.Content != "beforeafter" {
+				t.Fatalf("content = %q, want %q", message.Content, "beforeafter")
+			}
+			if len(message.ContentParts) != 1 {
+				t.Fatalf("content parts = %d, want 1", len(message.ContentParts))
+			}
+			part := message.ContentParts[0]
+			if part.Type != model.ContentTypeImage || part.Image == nil ||
+				string(part.Image.Data) != "image" {
+				t.Fatalf("content part = %#v, want decoded image", part)
+			}
+		})
+	}
+}
+
+func TestProcessFunctionCall_NonMapData(t *testing.T) {
+	dataPart := protocol.NewDataPart("not-a-map")
+	result := processFunctionCall(&dataPart)
+	if result != nil {
+		t.Fatalf("expected nil for non-map data, got %+v", result)
+	}
+}
+
+func TestProcessFunctionCall_ArgsAsMap(t *testing.T) {
+	dataPart := protocol.NewDataPart(map[string]any{
+		ia2a.ToolCallFieldID:   "call-1",
+		ia2a.ToolCallFieldType: "function",
+		ia2a.ToolCallFieldName: "my_tool",
+		ia2a.ToolCallFieldArgs: map[string]any{"key": "value"},
+	})
+	result := processFunctionCall(&dataPart)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Function.Name != "my_tool" {
+		t.Errorf("unexpected function name: %s", result.Function.Name)
+	}
+	if string(result.Function.Arguments) != `{"key":"value"}` {
+		t.Errorf("unexpected arguments: %s", string(result.Function.Arguments))
+	}
+}
+
+func TestProcessFunctionCall_ArgsUnexpectedType(t *testing.T) {
+	dataPart := protocol.NewDataPart(map[string]any{
+		ia2a.ToolCallFieldName: "my_tool",
+		ia2a.ToolCallFieldArgs: 12345,
+	})
+	result := processFunctionCall(&dataPart)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if len(result.Function.Arguments) != 0 {
+		t.Errorf("expected empty arguments for unexpected type, got %s", string(result.Function.Arguments))
+	}
+}
+
+func TestBuildNonStreamingResponse_EmptyParseResult(t *testing.T) {
+	result := &parseResult{}
+	resp := buildNonStreamingResponse("msg-1", result, protocol.MessageRoleAgent)
+	if resp == nil {
+		t.Fatal("expected non-nil response")
+	}
+	if len(resp.Choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d", len(resp.Choices))
+	}
+	if resp.Choices[0].Message.Role != model.RoleAssistant {
+		t.Errorf("expected RoleAssistant, got %s", resp.Choices[0].Message.Role)
+	}
+	if resp.Choices[0].Message.Content != "" {
+		t.Errorf("expected empty content, got %q", resp.Choices[0].Message.Content)
 	}
 }

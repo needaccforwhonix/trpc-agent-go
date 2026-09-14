@@ -173,6 +173,61 @@ func TestModelCallbacks_Multi(t *testing.T) {
 	require.Equal(t, "first", result.CustomResponse.ID)
 }
 
+func TestModelCallbacks_Clone_PreservesOptionsAndDoesNotShareSlices(t *testing.T) {
+	callbacks := NewCallbacks(
+		WithContinueOnError(true),
+		WithContinueOnResponse(true),
+	)
+	expectedErr := errors.New("first")
+	var trail []string
+	callbacks.RegisterBeforeModel(func(_ context.Context, _ *BeforeModelArgs) (
+		*BeforeModelResult, error,
+	) {
+		trail = append(trail, "orig-error")
+		return nil, expectedErr
+	})
+	callbacks.RegisterBeforeModel(func(_ context.Context, _ *BeforeModelArgs) (
+		*BeforeModelResult, error,
+	) {
+		trail = append(trail, "orig-response")
+		return &BeforeModelResult{
+			CustomResponse: &Response{ID: "orig"},
+		}, nil
+	})
+
+	cloned := callbacks.Clone()
+	cloned.RegisterBeforeModel(func(_ context.Context, _ *BeforeModelArgs) (
+		*BeforeModelResult, error,
+	) {
+		trail = append(trail, "clone-response")
+		return &BeforeModelResult{
+			CustomResponse: &Response{ID: "clone"},
+		}, nil
+	})
+
+	result, err := cloned.RunBeforeModel(
+		context.Background(),
+		&BeforeModelArgs{Request: &Request{}},
+	)
+	require.ErrorIs(t, err, expectedErr)
+	require.Equal(t, "clone", result.CustomResponse.ID)
+	require.Equal(t,
+		[]string{"orig-error", "orig-response", "clone-response"},
+		trail,
+		"clone must preserve ContinueOnError/ContinueOnResponse options",
+	)
+
+	trail = nil
+	result, err = callbacks.RunBeforeModel(
+		context.Background(),
+		&BeforeModelArgs{Request: &Request{}},
+	)
+	require.ErrorIs(t, err, expectedErr)
+	require.Equal(t, "orig", result.CustomResponse.ID)
+	require.Equal(t, []string{"orig-error", "orig-response"}, trail,
+		"adding callbacks to the clone must not mutate the original")
+}
+
 func TestCallbacksChainRegistration(t *testing.T) {
 	// Test chain registration.
 	callbacks := NewCallbacks().
@@ -184,12 +239,8 @@ func TestCallbacksChainRegistration(t *testing.T) {
 		})
 
 	// Verify that both callbacks were registered.
-	if len(callbacks.BeforeModel) != 1 {
-		t.Errorf("Expected 1 before model callback, got %d", len(callbacks.BeforeModel))
-	}
-	if len(callbacks.AfterModel) != 1 {
-		t.Errorf("Expected 1 after model callback, got %d", len(callbacks.AfterModel))
-	}
+	require.Len(t, callbacks.BeforeModel, 1)
+	require.Len(t, callbacks.AfterModel, 1)
 }
 
 // TestCallbacks_BeforeModel_WithError tests error handling in before model callbacks.

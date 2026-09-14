@@ -30,9 +30,57 @@ import (
 const (
 	// defaultConnectionTimeout is the default timeout for Redis connection test.
 	defaultConnectionTimeout = 5 * time.Second
+
+	addMemoryResultSuccess = 0
+
+	updateMemoryResultNotFound = 0
+	updateMemoryResultSuccess  = 1
+	updateMemoryResultConflict = 2
 )
 
 var _ memory.Service = (*Service)(nil)
+
+// luaAddMemory atomically enforces the per-user limit for new memory IDs while
+// allowing an existing ID to be overwritten idempotently. A positive result is
+// the current memory count when the limit has been reached.
+var luaAddMemory = redis.NewScript(`
+local key = KEYS[1]
+local memoryID = ARGV[1]
+local entryJSON = ARGV[2]
+local memoryLimit = tonumber(ARGV[3])
+
+if redis.call('HEXISTS', key, memoryID) == 0 then
+    local count = redis.call('HLEN', key)
+    if count >= memoryLimit then
+        return count
+    end
+end
+
+redis.call('HSET', key, memoryID, entryJSON)
+return 0
+`)
+
+// luaUpdateMemory atomically updates a memory hash field and, when its
+// canonical ID changes, rejects an existing target before rotating the field.
+var luaUpdateMemory = redis.NewScript(`
+local key = KEYS[1]
+local sourceID = ARGV[1]
+local targetID = ARGV[2]
+local entryJSON = ARGV[3]
+
+if redis.call('HEXISTS', key, sourceID) == 0 then
+    return 0
+end
+if sourceID ~= targetID and redis.call('HEXISTS', key, targetID) == 1 then
+    return 2
+end
+
+redis.call('HSET', key, targetID, entryJSON)
+if sourceID ~= targetID then
+    redis.call('HDEL', key, sourceID)
+end
+return 1
+`)
 
 // Service is the redis memory service.
 // Storage structure:
@@ -97,6 +145,8 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 		opts.extractor,
 		opts.toolCreators,
 		opts.enabledTools,
+		opts.toolExposed,
+		opts.toolHidden,
 		svc.cachedTools,
 	)
 
@@ -106,11 +156,12 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 			opts.extractor, opts.enabledTools,
 		)
 		config := imemory.AutoMemoryConfig{
-			Extractor:        opts.extractor,
-			AsyncMemoryNum:   opts.asyncMemoryNum,
-			MemoryQueueSize:  opts.memoryQueueSize,
-			MemoryJobTimeout: opts.memoryJobTimeout,
-			EnabledTools:     opts.enabledTools,
+			Extractor:                opts.extractor,
+			AsyncMemoryNum:           opts.asyncMemoryNum,
+			MemoryQueueSize:          opts.memoryQueueSize,
+			MemoryJobTimeout:         opts.memoryJobTimeout,
+			DisableOnExternalContext: opts.disableAutoMemoryOnExternalContext,
+			EnabledTools:             opts.enabledTools,
 		}
 		svc.autoMemoryWorker = imemory.NewAutoMemoryWorker(config, svc)
 		svc.autoMemoryWorker.Start()
@@ -120,23 +171,12 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 }
 
 // AddMemory adds or updates a memory for a user (idempotent).
-func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryStr string, topics []string) error {
+func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryStr string,
+	topics []string, opts ...memory.AddOption) error {
 	if err := userKey.CheckUserKey(); err != nil {
 		return err
 	}
 	key := s.getUserMemKey(userKey)
-
-	// Enforce memory limit by HLen.
-	if s.opts.memoryLimit > 0 {
-		count, err := s.redisClient.HLen(ctx, key).Result()
-		if err != nil && err != redis.Nil {
-			return fmt.Errorf("redis memory service check memory count failed: %w", err)
-		}
-		if int(count) >= s.opts.memoryLimit {
-			return fmt.Errorf("memory limit exceeded for user %s, limit: %d, current: %d",
-				userKey.UserID, s.opts.memoryLimit, count)
-		}
-	}
 
 	now := time.Now()
 	mem := &memory.Memory{
@@ -144,6 +184,8 @@ func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryS
 		Topics:      topics,
 		LastUpdated: &now,
 	}
+	ep := memory.ResolveAddOptions(opts)
+	imemory.ApplyMetadata(mem, ep)
 	entry := &memory.Entry{
 		ID:        imemory.GenerateMemoryID(mem, userKey.AppName, userKey.UserID),
 		AppName:   userKey.AppName,
@@ -156,6 +198,28 @@ func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryS
 	if err != nil {
 		return fmt.Errorf("marshal memory entry failed: %w", err)
 	}
+	if s.opts.memoryLimit > 0 {
+		scriptResult, err := luaAddMemory.Run(
+			ctx,
+			s.redisClient,
+			[]string{key},
+			entry.ID,
+			string(bytes),
+			s.opts.memoryLimit,
+		).Int()
+		if err != nil {
+			return fmt.Errorf("store memory entry failed: %w", err)
+		}
+		switch {
+		case scriptResult == addMemoryResultSuccess:
+			return nil
+		case scriptResult > addMemoryResultSuccess:
+			return fmt.Errorf("memory limit exceeded for user %s, limit: %d, current: %d",
+				userKey.UserID, s.opts.memoryLimit, scriptResult)
+		default:
+			return fmt.Errorf("add memory entry returned unexpected result %d", scriptResult)
+		}
+	}
 	if err := s.redisClient.HSet(ctx, key, entry.ID, bytes).Err(); err != nil {
 		return fmt.Errorf("store memory entry failed: %w", err)
 	}
@@ -163,11 +227,15 @@ func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryS
 }
 
 // UpdateMemory updates an existing memory for a user.
-func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key, memoryStr string, topics []string) error {
+func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key, memoryStr string,
+	topics []string, opts ...memory.UpdateOption) error {
 	if err := memoryKey.CheckMemoryKey(); err != nil {
 		return err
 	}
-	key := s.getUserMemKey(memory.UserKey{AppName: memoryKey.AppName, UserID: memoryKey.UserID})
+	key := s.getUserMemKey(memory.UserKey{
+		AppName: memoryKey.AppName,
+		UserID:  memoryKey.UserID,
+	})
 
 	bytes, err := s.redisClient.HGet(ctx, key, memoryKey.MemoryID).Bytes()
 	if err != nil {
@@ -178,18 +246,46 @@ func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key, memory
 	if err := json.Unmarshal(bytes, entry); err != nil {
 		return fmt.Errorf("unmarshal memory entry failed: %w", err)
 	}
+	imemory.NormalizeEntry(entry)
 	now := time.Now()
-	entry.Memory.Memory = memoryStr
-	entry.Memory.Topics = topics
-	entry.Memory.LastUpdated = &now
-	entry.UpdatedAt = now
+	ep := memory.ResolveUpdateOptions(opts)
+	newID := imemory.ApplyMemoryUpdate(
+		entry,
+		memoryKey.AppName,
+		memoryKey.UserID,
+		memoryStr,
+		topics,
+		ep,
+		now,
+	)
 
 	updated, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("marshal updated memory entry failed: %w", err)
 	}
-	if err := s.redisClient.HSet(ctx, key, entry.ID, updated).Err(); err != nil {
+	scriptResult, err := luaUpdateMemory.Run(
+		ctx,
+		s.redisClient,
+		[]string{key},
+		memoryKey.MemoryID,
+		newID,
+		string(updated),
+	).Int()
+	if err != nil {
 		return fmt.Errorf("update memory entry failed: %w", err)
+	}
+	switch scriptResult {
+	case updateMemoryResultNotFound:
+		return fmt.Errorf("memory with id %s not found", memoryKey.MemoryID)
+	case updateMemoryResultSuccess:
+		// Continue and publish the effective ID below.
+	case updateMemoryResultConflict:
+		return fmt.Errorf("memory with id %s already exists", newID)
+	default:
+		return fmt.Errorf("update memory entry returned unexpected result %d", scriptResult)
+	}
+	if result := memory.ResolveUpdateResult(opts); result != nil {
+		result.MemoryID = newID
 	}
 	return nil
 }
@@ -238,6 +334,7 @@ func (s *Service) ReadMemories(ctx context.Context, userKey memory.UserKey, limi
 		if err := json.Unmarshal([]byte(v), e); err != nil {
 			return nil, fmt.Errorf("unmarshal memory entry failed: %w", err)
 		}
+		imemory.NormalizeEntry(e)
 		entries = append(entries, e)
 	}
 	// Sort by updated time (newest first), tie-breaker by created time.
@@ -254,7 +351,8 @@ func (s *Service) ReadMemories(ctx context.Context, userKey memory.UserKey, limi
 }
 
 // SearchMemories searches memories for a user.
-func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, query string) ([]*memory.Entry, error) {
+func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey,
+	query string, opts ...memory.SearchOption) ([]*memory.Entry, error) {
 	if err := userKey.CheckUserKey(); err != nil {
 		return nil, err
 	}
@@ -267,30 +365,28 @@ func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, qu
 		return nil, fmt.Errorf("search memories failed: %w", err)
 	}
 
-	results := make([]*memory.Entry, 0)
+	entries := make([]*memory.Entry, 0, len(all))
 	for _, v := range all {
 		e := &memory.Entry{}
 		if err := json.Unmarshal([]byte(v), e); err != nil {
 			return nil, fmt.Errorf("unmarshal memory entry failed: %w", err)
 		}
-		if imemory.MatchMemoryEntry(e, query) {
-			results = append(results, e)
-		}
+		imemory.NormalizeEntry(e)
+		entries = append(entries, e)
 	}
-	// Stable sort by updated time desc.
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].UpdatedAt.Equal(results[j].UpdatedAt) {
-			return results[i].CreatedAt.After(results[j].CreatedAt)
-		}
-		return results[i].UpdatedAt.After(results[j].UpdatedAt)
-	})
-	return results, nil
+	return imemory.SearchEntries(
+		entries,
+		memory.ResolveSearchOptions(query, opts),
+		s.opts.searchMinScore,
+		s.opts.maxSearchResults,
+	), nil
 }
 
 // Tools returns the list of available memory tools.
-// In auto memory mode (extractor is set), only front-end tools are returned.
-// By default, only Search is enabled; Load can be enabled explicitly.
-// In agentic mode, all enabled tools are returned.
+// In auto memory mode (extractor is set), memory_search is exposed by default,
+// memory_load is exposed once enabled, and other enabled tools remain hidden
+// unless explicitly exposed.
+// Without an extractor, enabled tools are exposed directly.
 // The tools list is pre-computed at service creation time.
 func (s *Service) Tools() []tool.Tool {
 	return slices.Clone(s.precomputedTools)

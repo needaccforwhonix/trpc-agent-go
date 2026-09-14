@@ -15,7 +15,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
+	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/skill"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -47,6 +50,32 @@ func TestWithRuntimeState(t *testing.T) {
 	require.Equal(t, "12345", ro.RuntimeState["user_id"])
 	require.Equal(t, 678, ro.RuntimeState["room_id"])
 	require.Equal(t, true, ro.RuntimeState["config"])
+}
+
+func TestMergeRuntimeState(t *testing.T) {
+	state := map[string]any{
+		"user_id": "12345",
+		"room_id": 678,
+	}
+
+	other := map[string]any{
+		"room_id":  999,
+		"config":   true,
+		"roomName": "demo",
+	}
+
+	var ro RunOptions
+	WithRuntimeState(state)(&ro)
+	MergeRuntimeState(other)(&ro)
+
+	require.NotNil(t, ro.RuntimeState)
+	require.Equal(t, "12345", ro.RuntimeState["user_id"])
+	require.Equal(t, 999, ro.RuntimeState["room_id"])
+	require.Equal(t, true, ro.RuntimeState["config"])
+	require.Equal(t, "demo", ro.RuntimeState["roomName"])
+	require.Equal(t, 999, other["room_id"])
+	require.Equal(t, true, other["config"])
+	require.Equal(t, "demo", other["roomName"])
 }
 
 func TestWithKnowledgeFilter(t *testing.T) {
@@ -107,6 +136,13 @@ func TestWithMaxRunDuration(t *testing.T) {
 	require.Equal(t, maxRun, ro.MaxRunDuration)
 }
 
+func TestWithCodeExecutor(t *testing.T) {
+	exec := &invocationTestCodeExecutor{}
+	var ro RunOptions
+	WithCodeExecutor(exec)(&ro)
+	require.Same(t, exec, ro.CodeExecutor)
+}
+
 func TestWithA2ARequestOptions(t *testing.T) {
 	tests := []struct {
 		name string
@@ -137,6 +173,19 @@ func TestWithA2ARequestOptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+type invocationTestCodeExecutor struct{}
+
+func (*invocationTestCodeExecutor) ExecuteCode(
+	context.Context,
+	codeexecutor.CodeExecutionInput,
+) (codeexecutor.CodeExecutionResult, error) {
+	return codeexecutor.CodeExecutionResult{}, nil
+}
+
+func (*invocationTestCodeExecutor) CodeBlockDelimiter() codeexecutor.CodeBlockDelimiter {
+	return codeexecutor.CodeBlockDelimiter{Start: "```", End: "```"}
 }
 
 func TestMultipleRunOptions(t *testing.T) {
@@ -171,6 +220,19 @@ func TestWithResume(t *testing.T) {
 	require.False(t, ro.Resume)
 }
 
+func TestWithPersistInterruptedAssistant(t *testing.T) {
+	var ro RunOptions
+	require.Nil(t, ro.PersistInterruptedAssistant)
+
+	WithPersistInterruptedAssistant(true)(&ro)
+	require.NotNil(t, ro.PersistInterruptedAssistant)
+	require.True(t, *ro.PersistInterruptedAssistant)
+
+	WithPersistInterruptedAssistant(false)(&ro)
+	require.NotNil(t, ro.PersistInterruptedAssistant)
+	require.False(t, *ro.PersistInterruptedAssistant)
+}
+
 func TestWithGraphEmitFinalModelResponses(t *testing.T) {
 	var ro RunOptions
 	WithGraphEmitFinalModelResponses(true)(&ro)
@@ -178,6 +240,15 @@ func TestWithGraphEmitFinalModelResponses(t *testing.T) {
 
 	WithGraphEmitFinalModelResponses(false)(&ro)
 	require.False(t, ro.GraphEmitFinalModelResponses)
+}
+
+func TestWithGraphTerminalMessagesOnly(t *testing.T) {
+	var ro RunOptions
+	WithGraphTerminalMessagesOnly(true)(&ro)
+	require.True(t, ro.GraphTerminalMessagesOnly)
+
+	WithGraphTerminalMessagesOnly(false)(&ro)
+	require.False(t, ro.GraphTerminalMessagesOnly)
 }
 
 func TestWithStreamMode(t *testing.T) {
@@ -215,6 +286,113 @@ func (s *stubTool) Declaration() *tool.Declaration {
 	return s.decl
 }
 
+type stubToolSet struct {
+	name  string
+	tools []tool.Tool
+}
+
+func (s stubToolSet) Tools(context.Context) []tool.Tool {
+	return s.tools
+}
+
+func (s stubToolSet) Close() error {
+	return nil
+}
+
+func (s stubToolSet) Name() string {
+	return s.name
+}
+
+func TestWithAdditionalTools(t *testing.T) {
+	const toolName = "runtime_tool"
+
+	runtimeTool := &stubTool{
+		decl: &tool.Declaration{Name: toolName},
+	}
+
+	var ro RunOptions
+	WithAdditionalTools([]tool.Tool{runtimeTool})(&ro)
+
+	require.Equal(t, []tool.Tool{runtimeTool}, ro.AdditionalTools)
+	require.Empty(t, ro.ExternalTools)
+	require.Empty(t, ro.ExternalToolNames)
+}
+
+func TestWithExternalTools(t *testing.T) {
+	const (
+		externalToolName = "external_tool"
+		internalToolName = "internal_tool"
+		deniedToolName   = "denied_tool"
+	)
+
+	externalTool := &stubTool{
+		decl: &tool.Declaration{Name: externalToolName},
+	}
+	internalTool := &stubTool{
+		decl: &tool.Declaration{Name: internalToolName},
+	}
+	deniedTool := &stubTool{
+		decl: &tool.Declaration{Name: deniedToolName},
+	}
+
+	ro := NewRunOptions(
+		WithExternalTools([]tool.Tool{externalTool}),
+		WithToolExecutionFilter(
+			tool.NewIncludeToolNamesFilter(internalToolName),
+		),
+	)
+
+	require.Equal(t, []tool.Tool{externalTool}, ro.ExternalTools)
+	require.Empty(t, ro.ExternalToolNames)
+
+	ctx := context.Background()
+	require.False(t, ro.ShouldExecuteTool(ctx, externalTool))
+	require.True(t, ro.ShouldExecuteTool(ctx, internalTool))
+	require.False(t, ro.ShouldExecuteTool(ctx, deniedTool))
+}
+
+func TestWithExternalTools_DoesNotShadowDifferentToolWithSameName(
+	t *testing.T,
+) {
+	const toolName = "client_tool"
+
+	externalTool := &stubTool{
+		decl: &tool.Declaration{Name: toolName},
+	}
+	registeredTool := &stubTool{
+		decl: &tool.Declaration{Name: toolName},
+	}
+
+	ro := NewRunOptions(
+		WithExternalTools([]tool.Tool{externalTool}),
+	)
+
+	ctx := context.Background()
+	require.False(t, ro.ShouldExecuteTool(ctx, externalTool))
+	require.True(t, ro.ShouldExecuteTool(ctx, registeredTool))
+
+	ro.ExternalToolNames = map[string]bool{toolName: true}
+	require.False(t, ro.ShouldExecuteTool(ctx, registeredTool))
+}
+
+func TestWithExternalTools_DoesNotUseDeclarationAsIdentity(
+	t *testing.T,
+) {
+	const toolName = "client_tool"
+
+	sharedDecl := &tool.Declaration{Name: toolName}
+	externalTool := &stubTool{decl: sharedDecl}
+	registeredTool := &stubTool{decl: sharedDecl}
+
+	ro := NewRunOptions(
+		WithExternalTools([]tool.Tool{externalTool}),
+	)
+
+	ctx := context.Background()
+	require.False(t, ro.ShouldExecuteTool(ctx, externalTool))
+	require.True(t, ro.ShouldExecuteTool(ctx, registeredTool))
+}
+
 func TestWithToolExecutionFilter(t *testing.T) {
 	const (
 		allowedToolName = "tool1"
@@ -239,6 +417,39 @@ func TestWithToolExecutionFilter(t *testing.T) {
 	require.False(t, ro.ToolExecutionFilter(ctx, denied))
 }
 
+func TestRunOptionsShouldExecuteToolPreservesNamedToolIdentity(t *testing.T) {
+	ctx := context.Background()
+	base := &stubTool{
+		decl: &tool.Declaration{Name: "browse"},
+	}
+	namedTools := itool.NewNamedToolSet(stubToolSet{
+		name:  "safe",
+		tools: []tool.Tool{base},
+	}).Tools(ctx)
+	require.Len(t, namedTools, 1)
+	ro := NewRunOptions(
+		WithToolExecutionFilter(tool.NewIncludeToolNamesFilter("safe_browse")),
+	)
+	require.True(t, ro.ShouldExecuteTool(ctx, namedTools[0]))
+	require.False(t, ro.ShouldExecuteTool(ctx, base))
+}
+
+func TestRunOptionsShouldExecuteToolUnwrapsDeclarationWrapper(t *testing.T) {
+	ctx := context.Background()
+	base := &stubTool{
+		decl: &tool.Declaration{Name: "lookup"},
+	}
+	patchedTools := itool.ApplyDeclarations([]tool.Tool{base}, []tool.Declaration{{
+		Name:        "lookup",
+		Description: "patched",
+	}})
+	require.Len(t, patchedTools, 1)
+	ro := NewRunOptions(WithToolExecutionFilter(func(_ context.Context, tl tool.Tool) bool {
+		return tl == base
+	}))
+	require.True(t, ro.ShouldExecuteTool(ctx, patchedTools[0]))
+}
+
 // TestWithToolCallArgumentsJSONRepairEnabled_SetsRunOptions verifies the option toggles the RunOptions flag.
 func TestWithToolCallArgumentsJSONRepairEnabled_SetsRunOptions(t *testing.T) {
 	var ro RunOptions
@@ -250,4 +461,42 @@ func TestWithToolCallArgumentsJSONRepairEnabled_SetsRunOptions(t *testing.T) {
 	WithToolCallArgumentsJSONRepairEnabled(false)(&ro)
 	require.NotNil(t, ro.ToolCallArgumentsJSONRepairEnabled)
 	require.False(t, *ro.ToolCallArgumentsJSONRepairEnabled)
+}
+
+func TestWithToolCallTextRepairEnabled_SetsRunOptions(t *testing.T) {
+	var ro RunOptions
+	require.Nil(t, ro.ToolCallTextRepairEnabled)
+	WithToolCallTextRepairEnabled(true)(&ro)
+	require.NotNil(t, ro.ToolCallTextRepairEnabled)
+	require.True(t, *ro.ToolCallTextRepairEnabled)
+
+	WithToolCallTextRepairEnabled(false)(&ro)
+	require.NotNil(t, ro.ToolCallTextRepairEnabled)
+	require.False(t, *ro.ToolCallTextRepairEnabled)
+}
+
+func TestWithPromptSectionOptions_SetsRunOptions(t *testing.T) {
+	renderer := func(
+		_ context.Context,
+		req AvailableSkillsRenderRequest,
+	) string {
+		require.Len(t, req.Summaries, 1)
+		return "- " + req.Summaries[0].Name + ": compact"
+	}
+	var ro RunOptions
+	WithWorkspaceExecGuidance("compact workspace guidance")(&ro)
+	WithAvailableSkillsRenderer(renderer)(&ro)
+	require.Equal(t, "compact workspace guidance", ro.WorkspaceExecGuidance)
+	require.NotNil(t, ro.AvailableSkillsRenderer)
+	got := ro.AvailableSkillsRenderer(
+		context.Background(),
+		AvailableSkillsRenderRequest{
+			Summaries: []skill.Summary{
+				{Name: "alpha", Description: "alpha skill"},
+			},
+		},
+	)
+	require.Equal(t, "- alpha: compact", got)
+	WithAvailableSkillsRenderer(nil)(&ro)
+	require.Nil(t, ro.AvailableSkillsRenderer)
 }

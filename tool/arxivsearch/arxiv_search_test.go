@@ -21,7 +21,9 @@ import (
 
 	"github.com/go-pdf/fpdf"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/tool/arxivsearch/internal/arxiv"
 )
 
@@ -169,12 +171,16 @@ func Test_arxivTool_search(t *testing.T) {
 	}
 
 	tests := []struct {
-		name         string
-		req          searchRequest
-		setupServer  func() *httptest.Server
-		wantErr      bool
-		wantArticles int
-		wantContent  []content
+		name          string
+		req           searchRequest
+		setupServer   func() *httptest.Server
+		wantErr       bool
+		wantErrText   string
+		wantArticles  int
+		wantContent   []content
+		wantRunes     int
+		wantReturned  int
+		wantTruncated bool
 	}{
 		{
 			name: "normal case with query",
@@ -216,6 +222,36 @@ func Test_arxivTool_search(t *testing.T) {
 			},
 		},
 		{
+			name: "read pdf content applies max content runes",
+			req: searchRequest{
+				Search: arxiv.Search{
+					Query: "pdf cap test",
+				},
+				ReadArxivPapers: true,
+				MaxContentRunes: 5,
+			},
+			setupServer: func() *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					entryXML := createEntryXML("PDF Cap Test Paper", "6789.0123v1", "cs.AI", pdfServer.URL+"/capped.pdf")
+					feedXML := createFeedXML([]string{entryXML})
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte(feedXML))
+				}))
+			},
+			wantArticles: 1,
+			wantContent: []content{
+				{
+					Page:      1,
+					Text:      "Hello",
+					Truncated: true,
+				},
+			},
+			wantRunes:     11,
+			wantReturned:  5,
+			wantTruncated: true,
+		},
+		{
 			name: "empty query and id list",
 			req:  searchRequest{},
 			setupServer: func() *httptest.Server {
@@ -226,7 +262,31 @@ func Test_arxivTool_search(t *testing.T) {
 					w.Write([]byte(feedXML))
 				}))
 			},
-			wantErr: true,
+			wantErr:     true,
+			wantErrText: errEmptySearch,
+		},
+		{
+			name: "date only query",
+			req: searchRequest{
+				Search: arxiv.Search{
+					SubmittedDateFrom: "2022-06-01",
+					SubmittedDateTo:   "2022-06-30",
+				},
+			},
+			setupServer: func() *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					query := r.URL.Query().Get("search_query")
+					assert.Equal(t,
+						"submittedDate:[202206010000 TO 202206302359]",
+						query)
+
+					feedXML := createFeedXML([]string{})
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte(feedXML))
+				}))
+			},
+			wantArticles: 0,
 		},
 		{
 			name: "search returns error",
@@ -351,6 +411,9 @@ func Test_arxivTool_search(t *testing.T) {
 
 			if tt.wantErr {
 				assert.Error(t, err, "Expected error")
+				if tt.wantErrText != "" {
+					assert.ErrorContains(t, err, tt.wantErrText)
+				}
 				return
 			}
 
@@ -365,10 +428,264 @@ func Test_arxivTool_search(t *testing.T) {
 			if tt.req.ReadArxivPapers {
 				for _, article := range got {
 					assert.Equal(t, article.Content, tt.wantContent)
+					if tt.wantRunes > 0 || tt.wantReturned > 0 ||
+						tt.wantTruncated {
+						assert.Equal(t, tt.wantRunes,
+							article.ContentRunes)
+						assert.Equal(t, tt.wantReturned,
+							article.ReturnedContentRunes)
+						assert.Equal(t, tt.wantTruncated,
+							article.ContentTruncated)
+					}
 				}
 			}
 		})
 	}
+}
+
+// applyOpts builds a ClientConfig and resolves the final *http.Client via
+// the same code path used by NewClient inside NewToolSet.
+func applyOpts(opts ...Option) (*arxiv.ClientConfig, *http.Client) {
+	cfg := &arxiv.ClientConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return cfg, arxiv.NewClient(*cfg).HTTPClient()
+}
+
+func TestWithHTTPClient_Set(t *testing.T) {
+	custom := &http.Client{Timeout: 7 * time.Second, Transport: http.DefaultTransport}
+	_, got := applyOpts(WithHTTPClient(custom))
+	assert.Same(t, custom, got, "WithHTTPClient should pass through caller's client (no clone) when no timeout override")
+}
+
+func TestWithHTTPClient_NilFallsBackToDefault(t *testing.T) {
+	_, got := applyOpts(WithHTTPClient(nil))
+	assert.NotNil(t, got)
+	assert.Equal(t, 30*time.Second, got.Timeout)
+}
+
+func TestWithHTTPClient_NilPlusTimeout(t *testing.T) {
+	_, got := applyOpts(WithHTTPClient(nil), WithTimeout(45*time.Second))
+	assert.NotNil(t, got)
+	assert.Equal(t, 45*time.Second, got.Timeout)
+}
+
+func TestWithTimeout_Standalone(t *testing.T) {
+	_, got := applyOpts(WithTimeout(60 * time.Second))
+	assert.Equal(t, 60*time.Second, got.Timeout)
+}
+
+func TestWithTimeout_DoesNotMutateOriginalClient(t *testing.T) {
+	original := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: http.DefaultTransport,
+	}
+	_, got := applyOpts(WithHTTPClient(original), WithTimeout(99*time.Second))
+	assert.Equal(t, 99*time.Second, got.Timeout)
+	assert.Equal(t, 10*time.Second, original.Timeout, "original client timeout must not be mutated")
+	assert.Equal(t, http.DefaultTransport, original.Transport, "original client transport must be preserved")
+}
+
+func TestWithTimeout_PreservesCustomTransport(t *testing.T) {
+	customTransport := &http.Transport{MaxIdleConns: 42}
+	original := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: customTransport,
+	}
+	_, got := applyOpts(WithHTTPClient(original), WithTimeout(120*time.Second))
+	assert.Equal(t, 120*time.Second, got.Timeout)
+	assert.Same(t, customTransport, got.Transport, "custom transport must be preserved (same object) after WithTimeout")
+}
+
+func TestWithTimeout_ZeroDisablesDefault(t *testing.T) {
+	_, got := applyOpts(WithTimeout(0))
+	assert.Equal(t, time.Duration(0), got.Timeout, "WithTimeout(0) should disable default timeout")
+}
+
+func TestWithTimeout_NegativeIgnored(t *testing.T) {
+	_, got := applyOpts(WithTimeout(-1 * time.Second))
+	assert.Equal(t, 30*time.Second, got.Timeout, "negative timeout should be ignored, keeping default")
+}
+
+func TestWithTimeout_OrderIndependent(t *testing.T) {
+	custom := &http.Client{Timeout: 5 * time.Second, Transport: http.DefaultTransport}
+	_, got1 := applyOpts(WithHTTPClient(custom), WithTimeout(60*time.Second))
+	_, got2 := applyOpts(WithTimeout(60*time.Second), WithHTTPClient(custom))
+	assert.Equal(t, 60*time.Second, got1.Timeout)
+	assert.Equal(t, 60*time.Second, got2.Timeout)
+	assert.Equal(t, 5*time.Second, custom.Timeout, "original must not be mutated regardless of order")
+}
+
+// blockingRoundTripper blocks until the request context is cancelled. This lets
+// us exercise the Client.Timeout path deterministically - when the timeout
+// fires, net/http cancels the request context and RoundTrip returns its error.
+// No time.Sleep, no race, no real server.
+//
+// The short fail-safe branch guards against a regression where WithTimeout
+// stops being applied: without it, the context would never cancel and the test
+// would hang until the package-level go test timeout. The fail-safe returns a
+// distinct (non-DeadlineExceeded) error so the timeout assertion fails fast.
+type blockingRoundTripper struct{}
+
+func (blockingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-time.After(200 * time.Millisecond):
+		return nil, fmt.Errorf("blockingRoundTripper fail-safe: request context still active, WithTimeout may not be applied")
+	}
+}
+
+func TestWithTimeout_EnforcedAtCallPath(t *testing.T) {
+	original := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: blockingRoundTripper{},
+	}
+	toolSet, err := NewToolSet(
+		WithBaseURL("http://arxiv.invalid/test"),
+		WithHTTPClient(original),
+		WithTimeout(10*time.Millisecond),
+		WithDelaySeconds(time.Nanosecond),
+		WithNumRetries(1),
+	)
+	require.NoError(t, err)
+
+	_, err = toolSet.search(context.Background(), searchRequest{
+		Search: arxiv.Search{Query: "anything"},
+	})
+	require.Error(t, err, "expected timeout error from blocking transport")
+	low := strings.ToLower(err.Error())
+	assert.True(t,
+		strings.Contains(low, "deadline") || strings.Contains(low, "timeout") ||
+			strings.Contains(low, "canceled") || strings.Contains(low, "cancelled"),
+		"error should reference timeout/deadline/cancel, got: %s", err.Error())
+	assert.Equal(t, 30*time.Second, original.Timeout, "original client must remain unmutated")
+	assert.Equal(t, http.RoundTripper(blockingRoundTripper{}), original.Transport,
+		"original transport must remain unmutated")
+}
+
+func TestNormalizedMaxContentRunes(t *testing.T) {
+	assert.Equal(t, defaultArticleContentRunes, normalizedMaxContentRunes(0))
+	assert.Equal(t, defaultArticleContentRunes, normalizedMaxContentRunes(-1))
+	assert.Equal(t, 123, normalizedMaxContentRunes(123))
+	assert.Equal(t, maxArticleContentRunes,
+		normalizedMaxContentRunes(maxArticleContentRunes+1))
+}
+
+func TestIsEmptySearchTrimsWhitespace(t *testing.T) {
+	assert.True(t, isEmptySearch(arxiv.Search{
+		Query:             "  \t\n",
+		IDList:            []string{" ", "\t"},
+		SubmittedDateFrom: " ",
+		SubmittedDateTo:   "\n",
+	}))
+	assert.False(t, isEmptySearch(arxiv.Search{
+		IDList: []string{" ", "2301.00001"},
+	}))
+	assert.False(t, isEmptySearch(arxiv.Search{
+		SubmittedDateFrom: "2022-01-01",
+	}))
+}
+
+func TestAppendArticleContentAppliesRuneBudget(t *testing.T) {
+	var got article
+	appendArticleContent(&got, []*document.Document{
+		{Content: "alpha"},
+		{Content: "βγδε"},
+		{Content: "tail"},
+	}, 7)
+
+	require.Len(t, got.Content, 2)
+	assert.Equal(t, "alpha", got.Content[0].Text)
+	assert.False(t, got.Content[0].Truncated)
+	assert.Equal(t, "βγ", got.Content[1].Text)
+	assert.True(t, got.Content[1].Truncated)
+	assert.True(t, got.ContentTruncated)
+	assert.Equal(t, 13, got.ContentRunes)
+	assert.Equal(t, 7, got.ReturnedContentRunes)
+}
+
+func TestAppendArticleContentHandlesNilAndZeroBudget(t *testing.T) {
+	require.NotPanics(t, func() {
+		appendArticleContent(nil, []*document.Document{{Content: "ignored"}}, 1)
+	})
+
+	var got article
+	appendArticleContent(&got, []*document.Document{
+		nil,
+		{Content: "alpha"},
+	}, 0)
+
+	assert.Empty(t, got.Content)
+	assert.True(t, got.ContentTruncated)
+	assert.Equal(t, 5, got.ContentRunes)
+	assert.Equal(t, 0, got.ReturnedContentRunes)
+}
+
+func TestAppendArticleContentKeepsShortDocuments(t *testing.T) {
+	var got article
+	appendArticleContent(&got, []*document.Document{
+		{Content: "Hello World"},
+	}, defaultArticleContentRunes)
+
+	require.Len(t, got.Content, 1)
+	assert.Equal(t, "Hello World", got.Content[0].Text)
+	assert.False(t, got.Content[0].Truncated)
+	assert.False(t, got.ContentTruncated)
+	assert.Equal(t, 11, got.ContentRunes)
+	assert.Equal(t, 11, got.ReturnedContentRunes)
+}
+
+func TestNormalizePDFText(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "unchanged",
+			text: "Hello World",
+			want: "Hello World",
+		},
+		{
+			name: "line whitespace",
+			text: "  def f():  \n\treturn 1\t  ",
+			want: "def f():\nreturn 1",
+		},
+		{
+			name: "line endings",
+			text: "  first  \r\n\tsecond \r third  ",
+			want: "first\nsecond\nthird",
+		},
+		{
+			name: "blank",
+			text: " \n\t ",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizePDFText(tt.text))
+		})
+	}
+}
+
+func TestAppendArticleContentNormalizesBeforeRuneBudget(t *testing.T) {
+	var got article
+	appendArticleContent(&got, []*document.Document{
+		{Content: " \n\t "},
+		{Content: "  αβγ  \r\n\tδε  "},
+	}, 3)
+
+	require.Len(t, got.Content, 1)
+	assert.Equal(t, 2, got.Content[0].Page)
+	assert.Equal(t, "αβγ", got.Content[0].Text)
+	assert.True(t, got.Content[0].Truncated)
+	assert.True(t, got.ContentTruncated)
+	assert.Equal(t, 6, got.ContentRunes)
+	assert.Equal(t, 3, got.ReturnedContentRunes)
 }
 
 // TestNewTool tests the NewToolSet function

@@ -17,6 +17,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/llm"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/score"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
@@ -46,6 +50,10 @@ Verdict: no
 	require.NoError(t, err)
 	require.Len(t, result.RubricScores, 2)
 	assert.InDelta(t, 0.5, result.Score, 1e-9)
+	require.NotNil(t, result.Value)
+	assert.Equal(t, score.KindNumeric, result.Value.Kind)
+	require.NotNil(t, result.Value.Numeric)
+	assert.InDelta(t, result.Score, *result.Value.Numeric, 1e-9)
 	assert.Equal(t, "1", result.RubricScores[0].ID)
 	assert.Equal(t, "r1", result.RubricScores[0].Reason)
 	assert.InDelta(t, 1.0, result.RubricScores[0].Score, 1e-9)
@@ -94,4 +102,38 @@ Verdict: yes
 		ids = append(ids, strings.TrimSpace(s.ID))
 	}
 	assert.Equal(t, []string{"1", "2", "3"}, ids)
+}
+
+func TestScoreBasedOnResponseRequiresMatchingRubricCount(t *testing.T) {
+	scorer := New()
+	response := &model.Response{
+		Choices: []model.Choice{{
+			Message: model.Message{Content: `
+ID: 1
+Rubric: alpha
+Evidence: e1
+Reason: r1
+Verdict: yes
+`},
+		}},
+	}
+	evalMetric := &metric.EvalMetric{
+		Criterion: &criterion.Criterion{
+			LLMJudge: &llm.LLMCriterion{
+				Rubrics: []*llm.Rubric{
+					{
+						ID:      "1",
+						Content: &llm.RubricContent{Text: "alpha"},
+					},
+					{
+						ID:      "2",
+						Content: &llm.RubricContent{Text: "beta"},
+					},
+				},
+			},
+		},
+	}
+	_, err := scorer.ScoreBasedOnResponse(context.Background(), response, evalMetric)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match configured rubric count")
 }

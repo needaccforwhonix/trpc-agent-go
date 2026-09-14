@@ -38,7 +38,7 @@ const (
 
 	sqlCreateSessionEventsTable = `
 		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
-			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			id BIGINT AUTO_INCREMENT PRIMARY KEY, -- row identity only; not used for ordering or cursor logic
 			app_name VARCHAR(255) NOT NULL,
 			user_id VARCHAR(255) NOT NULL,
 			session_id VARCHAR(255) NOT NULL,
@@ -218,11 +218,24 @@ type tableIndex struct {
 	unique  bool     // Whether this is a unique index
 }
 
-// expectedSchema defines the expected schema for each table
-var expectedSchema = map[string]struct {
+type summaryIndexLayout uint8
+
+const (
+	summaryIndexUnknown summaryIndexLayout = iota
+	summaryIndexCurrent
+	summaryIndexIncompatibleCurrent
+	summaryIndexLegacyUnique
+	summaryIndexLegacyLookup
+)
+
+// tableSchema defines the expected schema for a table.
+type tableSchema struct {
 	columns []tableColumn
 	indexes []tableIndex
-}{
+}
+
+// expectedSchema defines the expected schema for each table.
+var expectedSchema = map[string]tableSchema{
 	sqldb.TableNameSessionStates: {
 		columns: []tableColumn{
 			{"id", "bigint", false},
@@ -328,6 +341,25 @@ var expectedSchema = map[string]struct {
 	},
 }
 
+// tdsqlExpectedSchema extends expectedSchema with TDSQL-specific indexes.
+var tdsqlExpectedSchema = func() map[string]tableSchema {
+	s := make(map[string]tableSchema, len(expectedSchema))
+	for k, v := range expectedSchema {
+		s[k] = v
+	}
+	ss := s[sqldb.TableNameSessionStates]
+	newIndexes := make([]tableIndex, len(ss.indexes)+1)
+	copy(newIndexes, ss.indexes)
+	newIndexes[len(ss.indexes)] = tableIndex{
+		table:   sqldb.TableNameSessionStates,
+		suffix:  "list",
+		columns: []string{"app_name", "user_id", "updated_at"},
+	}
+	ss.indexes = newIndexes
+	s[sqldb.TableNameSessionStates] = ss
+	return s
+}()
+
 // Global table definitions
 var tableDefs = []tableDefinition{
 	{sqldb.TableNameSessionStates, sqlCreateSessionStatesTable},
@@ -359,50 +391,197 @@ var indexDefs = []indexDefinition{
 	{sqldb.TableNameUserStates, sqldb.IndexSuffixExpires, sqlCreateUserStatesExpiresIndex},
 }
 
+// TDSQL table templates: PK includes shardkey (user_id for session tables, broadcast for app_states).
+const (
+	tdsqlCreateSessionStatesTable = `
+		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
+			id BIGINT NOT NULL AUTO_INCREMENT,
+			app_name VARCHAR(255) NOT NULL,
+			user_id VARCHAR(255) NOT NULL,
+			session_id VARCHAR(255) NOT NULL,
+			state JSON DEFAULT NULL,
+			created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+			updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+			expires_at TIMESTAMP(6) NULL DEFAULT NULL,
+			deleted_at TIMESTAMP(6) NULL DEFAULT NULL,
+			PRIMARY KEY (id, user_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci shardkey=user_id`
+
+	tdsqlCreateSessionEventsTable = `
+		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
+			id BIGINT NOT NULL AUTO_INCREMENT,
+			app_name VARCHAR(255) NOT NULL,
+			user_id VARCHAR(255) NOT NULL,
+			session_id VARCHAR(255) NOT NULL,
+			event JSON NOT NULL,
+			created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+			updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+			expires_at TIMESTAMP(6) NULL DEFAULT NULL,
+			deleted_at TIMESTAMP(6) NULL DEFAULT NULL,
+			PRIMARY KEY (id, user_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci shardkey=user_id`
+
+	tdsqlCreateSessionTrackEventsTable = `
+		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
+			id BIGINT NOT NULL AUTO_INCREMENT,
+			app_name VARCHAR(255) NOT NULL,
+			user_id VARCHAR(255) NOT NULL,
+			session_id VARCHAR(255) NOT NULL,
+			track VARCHAR(255) NOT NULL,
+			event JSON NOT NULL,
+			created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+			updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+			expires_at TIMESTAMP(6) NULL DEFAULT NULL,
+			deleted_at TIMESTAMP(6) NULL DEFAULT NULL,
+			PRIMARY KEY (id, user_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci shardkey=user_id`
+
+	// TDSQL session_summaries: app_name/session_id/filter_key use VARCHAR(128)
+	// so the UNIQUE KEY fits within InnoDB's 3072-byte limit at full length:
+	// 128*4*3 + 255*4 = 1536 + 1020 = 2556 < 3072. No prefix index needed.
+	tdsqlCreateSessionSummariesTable = `
+		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
+			id BIGINT NOT NULL AUTO_INCREMENT,
+			app_name VARCHAR(128) NOT NULL,
+			user_id VARCHAR(255) NOT NULL,
+			session_id VARCHAR(128) NOT NULL,
+			filter_key VARCHAR(128) NOT NULL DEFAULT '',
+			summary JSON DEFAULT NULL,
+			updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+			expires_at TIMESTAMP(6) NULL DEFAULT NULL,
+			deleted_at TIMESTAMP(6) NULL DEFAULT NULL,
+			PRIMARY KEY (id, user_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci shardkey=user_id`
+
+	tdsqlCreateAppStatesTable = `
+		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			app_name VARCHAR(255) NOT NULL,
+			` + "`key`" + ` VARCHAR(255) NOT NULL,
+			value TEXT DEFAULT NULL,
+			created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+			updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+			expires_at TIMESTAMP(6) NULL DEFAULT NULL,
+			deleted_at TIMESTAMP(6) NULL DEFAULT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci shardkey=noshardkey_allset`
+
+	tdsqlCreateUserStatesTable = `
+		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
+			id BIGINT NOT NULL AUTO_INCREMENT,
+			app_name VARCHAR(255) NOT NULL,
+			user_id VARCHAR(255) NOT NULL,
+			` + "`key`" + ` VARCHAR(255) NOT NULL,
+			value TEXT DEFAULT NULL,
+			created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+			updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+			expires_at TIMESTAMP(6) NULL DEFAULT NULL,
+			deleted_at TIMESTAMP(6) NULL DEFAULT NULL,
+			PRIMARY KEY (id, user_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci shardkey=user_id`
+
+	tdsqlCreateSessionStatesListIndex = `
+		CREATE INDEX {{INDEX_NAME}}
+		ON {{TABLE_NAME}}(app_name, user_id, updated_at)`
+
+	// TDSQL session_summaries uses VARCHAR(128) for app_name/session_id/filter_key,
+	// so UNIQUE KEY fits at full column length without prefix indexes.
+	tdsqlCreateSessionSummariesUniqueIndex = `
+		CREATE UNIQUE INDEX {{INDEX_NAME}}
+		ON {{TABLE_NAME}}(app_name, user_id, session_id, filter_key)`
+)
+
+var tdsqlTableDefs = []tableDefinition{
+	{sqldb.TableNameSessionStates, tdsqlCreateSessionStatesTable},
+	{sqldb.TableNameSessionEvents, tdsqlCreateSessionEventsTable},
+	{sqldb.TableNameSessionTrackEvents, tdsqlCreateSessionTrackEventsTable},
+	{sqldb.TableNameSessionSummaries, tdsqlCreateSessionSummariesTable},
+	{sqldb.TableNameAppStates, tdsqlCreateAppStatesTable},
+	{sqldb.TableNameUserStates, tdsqlCreateUserStatesTable},
+}
+
+var tdsqlIndexDefs = []indexDefinition{
+	// Unique indexes (same as MySQL, shardkey already in UNIQUE KEYs)
+	{sqldb.TableNameSessionStates, sqldb.IndexSuffixUniqueActive, sqlCreateSessionStatesUniqueIndex},
+	{sqldb.TableNameSessionSummaries, sqldb.IndexSuffixUniqueActive, tdsqlCreateSessionSummariesUniqueIndex},
+	{sqldb.TableNameAppStates, sqldb.IndexSuffixUniqueActive, sqlCreateAppStatesUniqueIndex},
+	{sqldb.TableNameUserStates, sqldb.IndexSuffixUniqueActive, sqlCreateUserStatesUniqueIndex},
+
+	// Lookup indexes (same as MySQL)
+	{sqldb.TableNameSessionEvents, sqldb.IndexSuffixLookup, sqlCreateSessionEventsLookupIndex},
+	{sqldb.TableNameSessionTrackEvents, sqldb.IndexSuffixLookup, sqlCreateSessionTracksIndex},
+
+	// TDSQL-specific: ListSessions sort index
+	{sqldb.TableNameSessionStates, "list", tdsqlCreateSessionStatesListIndex},
+
+	// TTL indexes (same as MySQL)
+	{sqldb.TableNameSessionStates, sqldb.IndexSuffixExpires, sqlCreateSessionStatesExpiresIndex},
+	{sqldb.TableNameSessionEvents, sqldb.IndexSuffixExpires, sqlCreateSessionEventsExpiresIndex},
+	{sqldb.TableNameSessionTrackEvents, sqldb.IndexSuffixExpires, sqlCreateSessionTracksExpiresIndex},
+	{sqldb.TableNameSessionSummaries, sqldb.IndexSuffixExpires, sqlCreateSessionSummariesExpiresIndex},
+	{sqldb.TableNameAppStates, sqldb.IndexSuffixExpires, sqlCreateAppStatesExpiresIndex},
+	{sqldb.TableNameUserStates, sqldb.IndexSuffixExpires, sqlCreateUserStatesExpiresIndex},
+}
+
 // initDB initializes the database schema.
+//
+// DDL is only executed for tables that do NOT already exist: a missing table is
+// created together with all of its indexes (a safe first-time bootstrap). For a
+// table that already exists, initDB never runs DDL against it — altering a live
+// table (e.g. adding an index, which can lock or rebuild it, and may require
+// privileges the runtime account intentionally lacks) is risky and is left to
+// the operator. Index drift on existing tables is surfaced by verifySchema: a
+// missing or incorrect UNIQUE index is fatal (the service refuses to start
+// without the uniqueness constraint), while other index drift is logged as a
+// warning.
+//
+// First-time creation still requires the account to hold CREATE and INDEX
+// privileges. If a freshly created table's index creation fails, the table is
+// left in place and treated as existing on the next start — but its missing
+// UNIQUE index is then caught by verifySchema and fails startup, so a partial
+// bootstrap cannot silently run without uniqueness enforcement.
 func (s *Service) initDB(ctx context.Context) error {
 	log.InfoContext(ctx, "initializing mysql session database schema...")
 
-	// Create tables
-	for _, tableDef := range tableDefs {
+	// Select table and index definitions based on TDSQL mode.
+	tables := tableDefs
+	indexes := indexDefs
+	if s.opts.tdsqlSharding {
+		tables = tdsqlTableDefs
+		indexes = tdsqlIndexDefs
+		log.InfoContext(ctx, "TDSQL sharding mode enabled, using TDSQL schema")
+	}
+
+	// Group index definitions by their table so a freshly created table can be
+	// populated with its indexes in the same bootstrap step.
+	indexesByTable := make(map[string][]indexDefinition, len(tables))
+	for _, indexDef := range indexes {
+		indexesByTable[indexDef.table] = append(indexesByTable[indexDef.table], indexDef)
+	}
+
+	// Create each missing table together with its indexes. Pre-existing tables
+	// are left untouched; any schema drift is reported by verifySchema below.
+	for _, tableDef := range tables {
 		fullTableName := sqldb.BuildTableName(s.opts.tablePrefix, tableDef.name)
-		sql := strings.ReplaceAll(tableDef.template, "{{TABLE_NAME}}", fullTableName)
 
-		if _, err := s.mysqlClient.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("create table %s failed: %w", fullTableName, err)
+		exists, err := s.tableExists(ctx, fullTableName)
+		if err != nil {
+			return fmt.Errorf("check table %s existence failed: %w", fullTableName, err)
 		}
-		log.InfofContext(ctx, "created table: %s", fullTableName)
-	}
+		if exists {
+			log.InfofContext(ctx, "table %s already exists, skipping schema DDL; "+
+				"missing indexes (if any) are reported by schema verification and must "+
+				"be applied manually", fullTableName)
+			continue
+		}
 
-	// Create indexes
-	for _, indexDef := range indexDefs {
-		fullTableName := sqldb.BuildTableName(s.opts.tablePrefix, indexDef.table)
-		indexName := sqldb.BuildIndexName(s.opts.tablePrefix, indexDef.table, indexDef.suffix)
-		sql := indexDef.template
-		sql = strings.ReplaceAll(sql, "{{TABLE_NAME}}", fullTableName)
-		sql = strings.ReplaceAll(sql, "{{INDEX_NAME}}", indexName)
-
-		// MySQL doesn't have "IF NOT EXISTS" for indexes in older versions
-		// We'll use a different approach: try to create and ignore duplicate key errors
-		if _, err := s.mysqlClient.Exec(ctx, sql); err != nil {
-			// Check if it's a duplicate index name error (error code 1061).
-			// This means the index already exists, which is safe to skip.
-			if !isDuplicateIndexNameError(err) {
-				return fmt.Errorf(
-					"create index %s on table %s failed: %w",
-					indexName,
-					fullTableName,
-					err,
-				)
-			}
-			// Index already exists, log and continue.
-			log.InfofContext(ctx, "index %s already exists on table %s, skipping", indexName, fullTableName)
-		} else {
-			log.InfofContext(ctx, "created index: %s on table %s", indexName, fullTableName)
+		if err := s.createTableWithIndexes(ctx, tableDef, indexesByTable[tableDef.name]); err != nil {
+			return err
 		}
 	}
 
-	// Verify schema
+	// Verify schema. Column type/nullability drift is fatal, timestamp
+	// precision drift is logged as an error, and index drift follows the
+	// policy documented by verifyIndexes.
 	if err := s.verifySchema(ctx); err != nil {
 		return fmt.Errorf("schema verification failed: %w", err)
 	}
@@ -411,12 +590,59 @@ func (s *Service) initDB(ctx context.Context) error {
 	return nil
 }
 
+// createTableWithIndexes creates a single table and all of its indexes. It is
+// only called for tables that do not yet exist, so executing DDL here is safe.
+func (s *Service) createTableWithIndexes(
+	ctx context.Context,
+	tableDef tableDefinition,
+	indexes []indexDefinition,
+) error {
+	fullTableName := sqldb.BuildTableName(s.opts.tablePrefix, tableDef.name)
+
+	// Create the table. IF NOT EXISTS guards against a concurrent creator.
+	tableSQL := strings.ReplaceAll(tableDef.template, "{{TABLE_NAME}}", fullTableName)
+	if _, err := s.mysqlClient.Exec(ctx, tableSQL); err != nil {
+		return fmt.Errorf("create table %s failed: %w", fullTableName, err)
+	}
+	log.InfofContext(ctx, "created table: %s", fullTableName)
+
+	// Create the table's indexes as part of the same first-time bootstrap.
+	for _, indexDef := range indexes {
+		indexName := sqldb.BuildIndexName(s.opts.tablePrefix, indexDef.table, indexDef.suffix)
+		indexSQL := strings.ReplaceAll(indexDef.template, "{{TABLE_NAME}}", fullTableName)
+		indexSQL = strings.ReplaceAll(indexSQL, "{{INDEX_NAME}}", indexName)
+
+		// MySQL doesn't have "IF NOT EXISTS" for indexes in older versions, so we
+		// try to create and tolerate the "duplicate index name" error (1061) in
+		// case the index already exists (e.g. a concurrent creator won the race).
+		if _, err := s.mysqlClient.Exec(ctx, indexSQL); err != nil {
+			if !isDuplicateIndexNameError(err) {
+				return fmt.Errorf(
+					"create index %s on table %s failed: %w",
+					indexName,
+					fullTableName,
+					err,
+				)
+			}
+			log.InfofContext(ctx, "index %s already exists on table %s, skipping", indexName, fullTableName)
+			continue
+		}
+		log.InfofContext(ctx, "created index: %s on table %s", indexName, fullTableName)
+	}
+	return nil
+}
+
 // verifySchema verifies that the database schema matches expectations.
 func (s *Service) verifySchema(ctx context.Context) error {
-	// Use tableDefs order for deterministic verification
-	for _, tableDef := range tableDefs {
+	tables := tableDefs
+	schemas := expectedSchema
+	if s.opts.tdsqlSharding {
+		tables = tdsqlTableDefs
+		schemas = tdsqlExpectedSchema
+	}
+	for _, tableDef := range tables {
 		tableName := tableDef.name
-		schema, ok := expectedSchema[tableName]
+		schema, ok := schemas[tableName]
 		if !ok {
 			continue
 		}
@@ -436,9 +662,11 @@ func (s *Service) verifySchema(ctx context.Context) error {
 			return fmt.Errorf("verify columns for table %s failed: %w", fullTableName, err)
 		}
 
-		// Verify indexes (non-fatal, just log warnings)
+		// Verify indexes. Missing or incorrect UNIQUE indexes are fatal except
+		// for known historical summary layouts supported by serialized writes;
+		// non-unique index drift is logged as a warning inside verifyIndexes.
 		if err := s.verifyIndexes(ctx, fullTableName, schema.indexes); err != nil {
-			log.WarnfContext(ctx, "verify indexes for table %s failed (non-fatal): %v", fullTableName, err)
+			return fmt.Errorf("verify indexes for table %s failed: %w", fullTableName, err)
 		}
 	}
 
@@ -458,13 +686,33 @@ func (s *Service) tableExists(ctx context.Context, tableName string) (bool, erro
 	return count > 0, nil
 }
 
-// verifyColumns verifies that table columns match expectations.
+func alterTimestampPrecisionClause(column tableColumn) string {
+	definition := "TIMESTAMP(6)"
+	switch column.name {
+	case "created_at":
+		definition += " NOT NULL DEFAULT CURRENT_TIMESTAMP(6)"
+	case "updated_at":
+		definition += " NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)"
+	default:
+		if column.nullable {
+			definition += " NULL DEFAULT NULL"
+		} else {
+			definition += " NOT NULL"
+		}
+	}
+	return fmt.Sprintf("MODIFY COLUMN `%s` %s", column.name, definition)
+}
+
+// verifyColumns verifies column types and nullability, and logs an error when
+// timestamp precision differs from TIMESTAMP(6).
 func (s *Service) verifyColumns(ctx context.Context, tableName string, expectedColumns []tableColumn) error {
 	// Get actual columns from database
 	actualColumns := make(map[string]tableColumn)
+	actualDatetimePrecisions := make(map[string]sql.NullInt64)
 	err := s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
 		var name, dataType, isNullable string
-		if err := rows.Scan(&name, &dataType, &isNullable); err != nil {
+		var datetimePrecision sql.NullInt64
+		if err := rows.Scan(&name, &dataType, &isNullable, &datetimePrecision); err != nil {
 			return err
 		}
 		actualColumns[name] = tableColumn{
@@ -472,8 +720,9 @@ func (s *Service) verifyColumns(ctx context.Context, tableName string, expectedC
 			dataType: dataType,
 			nullable: isNullable == "YES",
 		}
+		actualDatetimePrecisions[name] = datetimePrecision
 		return nil
-	}, `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+	}, `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, DATETIME_PRECISION
 		FROM information_schema.columns
 		WHERE table_schema = DATABASE()
 		AND table_name = ?
@@ -482,6 +731,9 @@ func (s *Service) verifyColumns(ctx context.Context, tableName string, expectedC
 	if err != nil {
 		return fmt.Errorf("query columns failed: %w", err)
 	}
+
+	var timestampMismatches []string
+	var timestampAlterClauses []string
 
 	// Check each expected column
 	for _, expected := range expectedColumns {
@@ -495,12 +747,37 @@ func (s *Service) verifyColumns(ctx context.Context, tableName string, expectedC
 			return fmt.Errorf("column %s.%s has type %s, expected %s",
 				tableName, expected.name, actual.dataType, expected.dataType)
 		}
+		if expected.dataType == "timestamp" {
+			precision := actualDatetimePrecisions[expected.name]
+			if !precision.Valid || precision.Int64 != 6 {
+				actualType := "TIMESTAMP"
+				if precision.Valid {
+					actualType = fmt.Sprintf("TIMESTAMP(%d)", precision.Int64)
+				}
+				timestampMismatches = append(timestampMismatches, fmt.Sprintf("%s uses %s", expected.name, actualType))
+				timestampAlterClauses = append(timestampAlterClauses, alterTimestampPrecisionClause(expected))
+			}
+		}
 
 		// Check nullable
 		if actual.nullable != expected.nullable {
 			return fmt.Errorf("column %s.%s nullable mismatch: got %v, expected %v",
 				tableName, expected.name, actual.nullable, expected.nullable)
 		}
+	}
+	if len(timestampMismatches) > 0 {
+		log.ErrorfContext(
+			ctx,
+			"table %s has timestamp precision mismatches: %s; expected TIMESTAMP(6); "+
+				"mismatches may cause incorrect time comparisons or ordering; canonical schema migration template "+
+				"(review SHOW CREATE TABLE first; preserve any custom defaults, ON UPDATE clauses, comments, "+
+				"and other column attributes; changing timestamp precision may rebuild the table and block writes): "+
+				"ALTER TABLE `%s` %s;",
+			tableName,
+			strings.Join(timestampMismatches, ", "),
+			tableName,
+			strings.Join(timestampAlterClauses, ", "),
+		)
 	}
 
 	return nil
@@ -515,16 +792,24 @@ func (s *Service) verifyIndexes(ctx context.Context, fullTableName string, expec
 		expectedIndexNames[expectedIndexName] = true
 	}
 
-	// Get actual indexes from database
+	// Get actual indexes, including uniqueness and per-column prefix lengths.
+	// NON_UNIQUE is repeated on every row for an index (0 means unique), while a
+	// NULL SUB_PART means the full column is indexed.
 	actualIndexes := make(map[string][]string)
+	actualNonUnique := make(map[string]bool)
+	actualSubParts := make(map[string][]sql.NullInt64)
 	err := s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
 		var indexName, columnName string
-		if err := rows.Scan(&indexName, &columnName); err != nil {
+		var nonUnique int
+		var subPart sql.NullInt64
+		if err := rows.Scan(&indexName, &columnName, &nonUnique, &subPart); err != nil {
 			return err
 		}
 		actualIndexes[indexName] = append(actualIndexes[indexName], columnName)
+		actualNonUnique[indexName] = nonUnique != 0
+		actualSubParts[indexName] = append(actualSubParts[indexName], subPart)
 		return nil
-	}, `SELECT INDEX_NAME, COLUMN_NAME
+	}, `SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SUB_PART
 		FROM information_schema.statistics
 		WHERE table_schema = DATABASE()
 		AND table_name = ?
@@ -534,27 +819,80 @@ func (s *Service) verifyIndexes(ctx context.Context, fullTableName string, expec
 		return fmt.Errorf("query indexes failed: %w", err)
 	}
 
-	// Check each expected index
+	// Summary writes are serialized through their parent session row, so the
+	// service can safely start on the two historical index layouts while an
+	// operator performs an online migration. Index detection is intentionally
+	// used only for validation and diagnostics; the write path is identical for
+	// every supported layout.
+	summaryIndexName, summaryUniqueCompatible, err := s.compatibleSummaryIndex(
+		ctx, fullTableName, expectedIndexes, actualIndexes, actualNonUnique, actualSubParts,
+	)
+	if err != nil {
+		return err
+	}
+	if summaryUniqueCompatible {
+		expectedIndexNames[summaryIndexName] = true
+	}
+
+	// Check each expected index. A missing/incorrect UNIQUE index is collected
+	// and returned as an error unless a known historical summary layout was
+	// accepted above; non-unique index drift is only logged as a warning.
+	var invalidUnique []string
 	for _, expected := range expectedIndexes {
+		if summaryUniqueCompatible && isSummaryUniqueIndex(expected) {
+			continue
+		}
 		expectedIndexName := sqldb.BuildIndexName(s.opts.tablePrefix, expected.table, expected.suffix)
 		actualColumns, exists := actualIndexes[expectedIndexName]
 		if !exists {
 			// Build CREATE INDEX statement for user reference.
-			columnsStr := buildIndexColumnsStr(expected.table, expected.suffix, expected.columns)
+			columnsStr := buildIndexColumnsStr(expected.table, expected.suffix, expected.columns, s.opts.tdsqlSharding)
 			createSQL := buildCreateIndexSQL(expectedIndexName, fullTableName, columnsStr, expected.unique)
-			log.WarnfContext(ctx, "index %s on table %s is missing, please run: %s",
-				expectedIndexName, fullTableName, createSQL)
+			if expected.unique {
+				// A missing UNIQUE index is correctness-critical: uniqueness is no
+				// longer enforced. Log at ERROR and mark it fatal.
+				log.ErrorfContext(ctx, "UNIQUE index %s on table %s is missing; uniqueness is NOT "+
+					"enforced (duplicate active rows possible). Please run: %s",
+					expectedIndexName, fullTableName, createSQL)
+				invalidUnique = append(invalidUnique, expectedIndexName)
+			} else {
+				log.WarnfContext(ctx, "index %s on table %s is missing, please run: %s",
+					expectedIndexName, fullTableName, createSQL)
+			}
 			continue
 		}
 
 		if !stringSlicesEqual(actualColumns, expected.columns) {
 			// Build DROP and CREATE INDEX statements for user reference.
-			columnsStr := buildIndexColumnsStr(expected.table, expected.suffix, expected.columns)
+			columnsStr := buildIndexColumnsStr(expected.table, expected.suffix, expected.columns, s.opts.tdsqlSharding)
 			dropSQL := fmt.Sprintf("DROP INDEX %s ON %s;", expectedIndexName, fullTableName)
 			createSQL := buildCreateIndexSQL(expectedIndexName, fullTableName, columnsStr, expected.unique)
-			log.WarnfContext(ctx, "index %s on table %s has wrong columns: got %v, want %v. "+
-				"Please drop and recreate: %s %s",
-				expectedIndexName, fullTableName, actualColumns, expected.columns, dropSQL, createSQL)
+			if expected.unique {
+				// A UNIQUE index on the wrong columns means uniqueness is not
+				// enforced as intended: log at ERROR and mark it fatal.
+				log.ErrorfContext(ctx, "UNIQUE index %s on table %s has wrong columns: got %v, want %v; "+
+					"uniqueness may not be enforced as expected. Please drop and recreate: %s %s",
+					expectedIndexName, fullTableName, actualColumns, expected.columns, dropSQL, createSQL)
+				invalidUnique = append(invalidUnique, expectedIndexName)
+			} else {
+				log.WarnfContext(ctx, "index %s on table %s has wrong columns: got %v, want %v. "+
+					"Please drop and recreate: %s %s",
+					expectedIndexName, fullTableName, actualColumns, expected.columns, dropSQL, createSQL)
+			}
+			continue
+		}
+
+		// Columns match. For a UNIQUE index, verify it is actually unique — a
+		// same-name index with the right columns could still be non-unique, which
+		// would leave the uniqueness constraint unenforced.
+		if expected.unique && actualNonUnique[expectedIndexName] {
+			columnsStr := buildIndexColumnsStr(expected.table, expected.suffix, expected.columns, s.opts.tdsqlSharding)
+			dropSQL := fmt.Sprintf("DROP INDEX %s ON %s;", expectedIndexName, fullTableName)
+			createSQL := buildCreateIndexSQL(expectedIndexName, fullTableName, columnsStr, expected.unique)
+			log.ErrorfContext(ctx, "index %s on table %s exists with the expected columns but is NOT unique; "+
+				"uniqueness is NOT enforced. Please drop and recreate: %s %s",
+				expectedIndexName, fullTableName, dropSQL, createSQL)
+			invalidUnique = append(invalidUnique, expectedIndexName)
 		}
 	}
 
@@ -570,6 +908,10 @@ func (s *Service) verifyIndexes(ctx context.Context, fullTableName string, expec
 		}
 	}
 
+	if len(invalidUnique) > 0 {
+		return fmt.Errorf("required unique index(es) missing or invalid on table %s: %v",
+			fullTableName, invalidUnique)
+	}
 	return nil
 }
 
@@ -585,11 +927,148 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
+func expectsSummaryUniqueIndex(indexes []tableIndex) bool {
+	for _, index := range indexes {
+		if isSummaryUniqueIndex(index) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) compatibleSummaryIndex(
+	ctx context.Context,
+	fullTableName string,
+	expectedIndexes []tableIndex,
+	actualIndexes map[string][]string,
+	actualNonUnique map[string]bool,
+	actualSubParts map[string][]sql.NullInt64,
+) (string, bool, error) {
+	if fullTableName != s.tableSessionSummaries || !expectsSummaryUniqueIndex(expectedIndexes) {
+		return "", false, nil
+	}
+
+	indexName, layout := classifySummaryIndexLayout(
+		actualIndexes, actualNonUnique, actualSubParts, s.opts.tdsqlSharding,
+	)
+	if layout == summaryIndexUnknown {
+		return "", false, nil
+	}
+
+	canonicalName := sqldb.BuildIndexName(
+		s.opts.tablePrefix,
+		sqldb.TableNameSessionSummaries,
+		sqldb.IndexSuffixUniqueActive,
+	)
+	switch layout {
+	case summaryIndexCurrent:
+		if indexName != canonicalName {
+			log.InfofContext(ctx, "using equivalent summary UNIQUE index %s on table %s",
+				indexName, fullTableName)
+		}
+	case summaryIndexIncompatibleCurrent:
+		expectedPrefix := fmt.Sprintf("full columns or prefixes of at least %d characters",
+			mysqlVarCharIndexPrefixLen)
+		if s.opts.tdsqlSharding {
+			expectedPrefix = "full columns"
+		}
+		log.ErrorfContext(ctx, "summary UNIQUE index %s on table %s has unsupported prefix lengths %s; "+
+			"expected %s", indexName, fullTableName,
+			formatIndexSubParts(actualSubParts[indexName]), expectedPrefix)
+		return "", false, fmt.Errorf("summary UNIQUE index %s has unsupported prefix lengths", indexName)
+	case summaryIndexLegacyUnique:
+		log.WarnfContext(ctx, "legacy five-column summary UNIQUE index %s detected on table %s; "+
+			"enabling serialized writes for compatibility; duplicate active rows should be removed before adding a "+
+			"four-column UNIQUE index", indexName, fullTableName)
+	case summaryIndexLegacyLookup:
+		log.WarnfContext(ctx, "legacy summary lookup index %s detected on table %s without a "+
+			"business-key UNIQUE constraint; enabling serialized writes for compatibility, but an "+
+			"online migration to a four-column UNIQUE index is recommended", indexName, fullTableName)
+	}
+	return indexName, true, nil
+}
+
+func isSummaryUniqueIndex(index tableIndex) bool {
+	return index.table == sqldb.TableNameSessionSummaries &&
+		index.suffix == sqldb.IndexSuffixUniqueActive && index.unique
+}
+
+func classifySummaryIndexLayout(
+	actualIndexes map[string][]string,
+	actualNonUnique map[string]bool,
+	actualSubParts map[string][]sql.NullInt64,
+	tdsqlSharding bool,
+) (string, summaryIndexLayout) {
+	currentColumns := []string{"app_name", "user_id", "session_id", "filter_key"}
+	legacyUniqueColumns := []string{"app_name", "user_id", "session_id", "filter_key", "deleted_at"}
+	legacyLookupColumns := []string{"app_name", "user_id", "session_id", "deleted_at"}
+
+	// Every matching four-column UNIQUE index participates in writes, even when
+	// another valid or legacy index also exists. Reject any one whose shorter
+	// prefixes can report a duplicate for distinct full business keys.
+	for name, columns := range actualIndexes {
+		if !actualNonUnique[name] && stringSlicesEqual(columns, currentColumns) &&
+			!summaryIndexSubPartsCompatible(actualSubParts[name], tdsqlSharding) {
+			return name, summaryIndexIncompatibleCurrent
+		}
+	}
+
+	// Prefer the current capability even when a legacy index remains during an
+	// online migration or the replacement index uses a temporary name.
+	for name, columns := range actualIndexes {
+		if !actualNonUnique[name] && stringSlicesEqual(columns, currentColumns) {
+			return name, summaryIndexCurrent
+		}
+	}
+	for name, columns := range actualIndexes {
+		if !actualNonUnique[name] && stringSlicesEqual(columns, legacyUniqueColumns) {
+			return name, summaryIndexLegacyUnique
+		}
+	}
+	for name, columns := range actualIndexes {
+		if actualNonUnique[name] && stringSlicesEqual(columns, legacyLookupColumns) {
+			return name, summaryIndexLegacyLookup
+		}
+	}
+	return "", summaryIndexUnknown
+}
+
+func summaryIndexSubPartsCompatible(subParts []sql.NullInt64, tdsqlSharding bool) bool {
+	if len(subParts) != 4 {
+		return false
+	}
+	for _, subPart := range subParts {
+		if tdsqlSharding {
+			if subPart.Valid {
+				return false
+			}
+			continue
+		}
+		if subPart.Valid && subPart.Int64 < mysqlVarCharIndexPrefixLen {
+			return false
+		}
+	}
+	return true
+}
+
+func formatIndexSubParts(subParts []sql.NullInt64) string {
+	formatted := make([]string, len(subParts))
+	for i, subPart := range subParts {
+		if subPart.Valid {
+			formatted[i] = fmt.Sprintf("%d", subPart.Int64)
+		} else {
+			formatted[i] = "full"
+		}
+	}
+	return "[" + strings.Join(formatted, ", ") + "]"
+}
+
 // buildIndexColumnsStr builds a comma-separated column list with appropriate
 // prefix lengths for indexes that require them.
-func buildIndexColumnsStr(table, suffix string, columns []string) string {
-	// session_summaries unique_active index requires prefix lengths to avoid Error 1071.
-	if table == sqldb.TableNameSessionSummaries && suffix == sqldb.IndexSuffixUniqueActive {
+func buildIndexColumnsStr(table, suffix string, columns []string, tdsqlSharding bool) string {
+	// MySQL mode: session_summaries unique_active index requires prefix lengths
+	// to avoid Error 1071. TDSQL mode uses VARCHAR(128) so no prefix needed.
+	if !tdsqlSharding && table == sqldb.TableNameSessionSummaries && suffix == sqldb.IndexSuffixUniqueActive {
 		var prefixed []string
 		for _, col := range columns {
 			prefixed = append(prefixed, fmt.Sprintf("%s(%d)", col, mysqlVarCharIndexPrefixLen))

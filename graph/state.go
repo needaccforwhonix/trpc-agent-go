@@ -23,6 +23,11 @@ const (
 	// StateKeyUserInput is the key of the user input.
 	// It is consumed once and then cleared after successful LLM execution.
 	StateKeyUserInput = "user_input"
+	// StateKeyAgentInputMessage is the key of the AgentNode input message.
+	// It lets an AgentNode pass a typed *model.Message, such as a tool result,
+	// to the child agent invocation. It is consumed once and then cleared after
+	// successful AgentNode execution.
+	StateKeyAgentInputMessage = "agent_input_message"
 	// StateKeyOneShotMessages is the key for one-shot messages that override
 	// the current round input completely. It is consumed once and then cleared.
 	StateKeyOneShotMessages = "one_shot_messages"
@@ -60,6 +65,8 @@ const (
 	// StateKeyParentAgent is the key for storing the parent GraphAgent that owns sub-agents.
 	StateKeyParentAgent = "parent_agent"
 )
+
+const currentTraceStepIDStateKey = "__current_trace_step_id__"
 
 // State represents the state that flows through the graph.
 // This is the shared data structure that flows between nodes.
@@ -218,7 +225,10 @@ func (s State) safeClone() State {
 		if isUnsafeStateKey(k) {
 			continue
 		}
-		clone[k] = v
+		// Use jsonSafeCopy so that nested non-serializable
+		// types (chan, func, sync.Mutex, etc.) are stripped
+		// and the result is safe for json.Marshal.
+		clone[k] = jsonSafeCopy(v)
 	}
 	return clone
 }

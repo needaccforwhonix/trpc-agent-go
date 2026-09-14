@@ -32,6 +32,14 @@ type ChatRequestCallbackFunc func(
 	chatRequest *openai.ChatCompletionNewParams,
 )
 
+// ChatRequestJSONCallbackFunc is the function type for the chat request
+// JSON callback.
+type ChatRequestJSONCallbackFunc func(
+	ctx context.Context,
+	chatRequestJSON []byte,
+	marshalErr error,
+)
+
 // ChatResponseCallbackFunc is the function type for the chat response callback.
 type ChatResponseCallbackFunc func(
 	ctx context.Context,
@@ -67,18 +75,24 @@ type options struct {
 	HTTPClientOptions []HTTPClientOption
 	// Callback for the chat request.
 	ChatRequestCallback ChatRequestCallbackFunc
+	// Callback for the marshaled chat request JSON.
+	ChatRequestJSONCallback ChatRequestJSONCallbackFunc
 	// Callback for the chat response.
 	ChatResponseCallback ChatResponseCallbackFunc
 	// Callback for the chat chunk.
 	ChatChunkCallback ChatChunkCallbackFunc
 	// Callback for the chat stream completion.
 	ChatStreamCompleteCallback ChatStreamCompleteCallbackFunc
+	// ChatTelemetry enables opt-in telemetry for direct model usage.
+	ChatTelemetry bool
 	// Options for the OpenAI client.
 	OpenAIOptions []openaiopt.RequestOption
 	// Extra fields to be added to the HTTP request body.
 	ExtraFields map[string]any
 	// Variant for model-specific behavior.
 	Variant Variant
+	// variantSet tracks whether WithVariant was explicitly provided.
+	variantSet bool
 	// Batch completion window for batch processing.
 	BatchCompletionWindow openai.BatchNewParamsCompletionWindow
 	// Batch metadata for batch processing.
@@ -93,6 +107,8 @@ type options struct {
 	TailoringStrategy model.TailoringStrategy
 	// MaxInputTokens is the max input tokens for token tailoring.
 	MaxInputTokens int
+	// ContextWindow is the model context window size in tokens.
+	ContextWindow int
 	// TokenTailoringConfig allows customization of token tailoring parameters.
 	TokenTailoringConfig *model.TokenTailoringConfig
 	// ShowToolCallDelta controls whether to expose tool call
@@ -100,14 +116,29 @@ type options struct {
 	// chunks from the provider will be forwarded via
 	// Response.Choices[].Delta.ToolCalls instead of being
 	// suppressed until the final aggregated response.
-	ShowToolCallDelta    bool
-	accumulateChunkUsage AccumulateChunkUsage
+	ShowToolCallDelta bool
+	// ReasoningContentBackfill controls whether assistant messages should
+	// replay an empty reasoning_content field when the message has no
+	// reasoning text.
+	ReasoningContentBackfill    bool
+	reasoningContentBackfillSet bool
+	accumulateChunkUsage        AccumulateChunkUsage
 	// OptimizeForCache controls whether to optimize message structure for prompt caching.
 	// When enabled, system messages will be moved to the front to improve cache hit rates.
 	// OpenAI's prompt caching is automatic and doesn't require explicit cache control,
 	// but message ordering affects cache effectiveness.
 	OptimizeForCache    bool
 	optimizeForCacheSet bool
+
+	// OmitFileContentParts controls whether file content parts are removed
+	// from requests sent to the model provider.
+	//
+	// This can be useful when a provider rejects file inputs in chat messages,
+	// while still keeping the file parts in-memory for downstream tools.
+	OmitFileContentParts bool
+
+	// textOnlyMessageContent overrides the variant default when set.
+	textOnlyMessageContent *bool
 }
 
 var (
@@ -121,7 +152,6 @@ var (
 			ReserveOutputTokens:    imodel.DefaultReserveOutputTokens,
 			SafetyMarginRatio:      imodel.DefaultSafetyMarginRatio,
 			InputTokensFloor:       imodel.DefaultInputTokensFloor,
-			OutputTokensFloor:      imodel.DefaultOutputTokensFloor,
 			MaxInputTokensRatio:    imodel.DefaultMaxInputTokensRatio,
 		},
 		OptimizeForCache: false,
@@ -155,10 +185,21 @@ func WithChannelBufferSize(size int) Option {
 	}
 }
 
-// WithChatRequestCallback sets the function to be called before sending a chat request.
+// WithChatRequestCallback sets the function to be called before sending a
+// chat request. The callback runs synchronously in GenerateContent before
+// the response goroutine starts. Start your own goroutine in the callback
+// if asynchronous behavior is needed.
 func WithChatRequestCallback(fn ChatRequestCallbackFunc) Option {
 	return func(opts *options) {
 		opts.ChatRequestCallback = fn
+	}
+}
+
+// WithChatRequestJSONCallback sets the function to be called with the
+// marshaled chat request JSON before sending the request.
+func WithChatRequestJSONCallback(fn ChatRequestJSONCallbackFunc) Option {
+	return func(opts *options) {
+		opts.ChatRequestJSONCallback = fn
 	}
 }
 
@@ -178,11 +219,35 @@ func WithChatChunkCallback(fn ChatChunkCallbackFunc) Option {
 	}
 }
 
-// WithChatStreamCompleteCallback sets the function to be called when streaming is completed.
+// WithChatStreamCompleteCallback sets the function to be called when
+// streaming is completed. The callback runs synchronously before the
+// terminal streaming result is surfaced to the caller.
 // Called for both successful and failed streaming completions.
 func WithChatStreamCompleteCallback(fn ChatStreamCompleteCallbackFunc) Option {
 	return func(opts *options) {
 		opts.ChatStreamCompleteCallback = fn
+	}
+}
+
+// WithChatTelemetry enables chat trace and metric reporting for direct
+// model/openai usage.
+//
+// This option is intended for users who call Model.GenerateContent or
+// Model.GenerateContentIter directly. The recommended runner + agent path
+// already reports chat telemetry from llmflow. Reusing a model with this
+// option enabled inside runner + agent may report duplicate chat telemetry.
+func WithChatTelemetry(enabled bool) Option {
+	return func(opts *options) {
+		opts.ChatTelemetry = enabled
+	}
+}
+
+// WithReasoningContentBackfill enables replay-time reasoning_content backfill
+// for assistant messages that have no reasoning text.
+func WithReasoningContentBackfill(enabled bool) Option {
+	return func(opts *options) {
+		opts.ReasoningContentBackfill = enabled
+		opts.reasoningContentBackfillSet = true
 	}
 }
 
@@ -251,9 +316,31 @@ func WithExtraFields(extraFields map[string]any) Option {
 // The default variant is VariantOpenAI.
 // Optional variants are:
 // - VariantHunyuan: Hunyuan variant with specific file handling.
+// - VariantDeepSeek: DeepSeek-compatible request behavior.
+// - VariantQwen: Qwen-compatible request behavior.
+// - VariantGLM: GLM-compatible request and response behavior.
+// - VariantMiniMax: MiniMax-compatible request behavior.
+// - VariantKimi: Kimi-compatible request and file behavior.
 func WithVariant(variant Variant) Option {
 	return func(opts *options) {
 		opts.Variant = variant
+		opts.variantSet = true
+	}
+}
+
+// WithOmitFileContentParts controls whether file content parts are removed
+// from requests sent to the model provider.
+func WithOmitFileContentParts(omit bool) Option {
+	return func(opts *options) {
+		opts.OmitFileContentParts = omit
+	}
+}
+
+// WithTextOnlyMessageContent controls whether user message content parts are
+// reduced to text-only payloads before sending them to the provider.
+func WithTextOnlyMessageContent(enabled bool) Option {
+	return func(opts *options) {
+		opts.textOnlyMessageContent = &enabled
 	}
 }
 
@@ -300,6 +387,16 @@ func WithMaxInputTokens(limit int) Option {
 	}
 }
 
+// WithContextWindow sets the model context window size in tokens for this
+// model instance.
+func WithContextWindow(tokens int) Option {
+	return func(opts *options) {
+		if tokens > 0 {
+			opts.ContextWindow = tokens
+		}
+	}
+}
+
 // AccumulateChunkUsage is the function type for accumulating chunk usage.
 type AccumulateChunkUsage func(u model.Usage, delta model.Usage) model.Usage
 
@@ -316,6 +413,12 @@ func inverseOpenAISDKAddChunkUsage(u model.Usage, delta model.Usage) model.Usage
 		PromptTokens:     u.PromptTokens - delta.PromptTokens,
 		CompletionTokens: u.CompletionTokens - delta.CompletionTokens,
 		TotalTokens:      u.TotalTokens - delta.TotalTokens,
+		PromptTokensDetails: model.PromptTokensDetails{
+			CachedTokens: int(u.PromptTokensDetails.CachedTokens - delta.PromptTokensDetails.CachedTokens),
+		},
+		CompletionTokensDetails: model.CompletionTokensDetails{
+			ReasoningTokens: int(u.CompletionTokensDetails.ReasoningTokens - delta.CompletionTokensDetails.ReasoningTokens),
+		},
 	}
 }
 
@@ -328,6 +431,9 @@ func completionUsageToModelUsage(usage openai.CompletionUsage) model.Usage {
 		PromptTokensDetails: model.PromptTokensDetails{
 			CachedTokens: int(usage.PromptTokensDetails.CachedTokens),
 		},
+		CompletionTokensDetails: model.CompletionTokensDetails{
+			ReasoningTokens: int(usage.CompletionTokensDetails.ReasoningTokens),
+		},
 	}
 }
 
@@ -339,6 +445,9 @@ func modelUsageToCompletionUsage(usage model.Usage) openai.CompletionUsage {
 		TotalTokens:      int64(usage.TotalTokens),
 		PromptTokensDetails: openai.CompletionUsagePromptTokensDetails{
 			CachedTokens: int64(usage.PromptTokensDetails.CachedTokens),
+		},
+		CompletionTokensDetails: openai.CompletionUsageCompletionTokensDetails{
+			ReasoningTokens: int64(usage.CompletionTokensDetails.ReasoningTokens),
 		},
 	}
 }
@@ -391,9 +500,6 @@ func WithTokenTailoringConfig(config *model.TokenTailoringConfig) Option {
 		}
 		if config.InputTokensFloor <= 0 {
 			config.InputTokensFloor = imodel.DefaultInputTokensFloor
-		}
-		if config.OutputTokensFloor <= 0 {
-			config.OutputTokensFloor = imodel.DefaultOutputTokensFloor
 		}
 		if config.MaxInputTokensRatio <= 0 {
 			config.MaxInputTokensRatio = imodel.DefaultMaxInputTokensRatio

@@ -11,10 +11,13 @@ package anthropic
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +27,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
 	agentlog "trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
@@ -63,6 +67,79 @@ func Test_Model_Info(t *testing.T) {
 	assert.Equal(t, "claude-3-5-sonnet-latest", info.Name)
 }
 
+func TestModel_CallbackPanicsAreRecovered(t *testing.T) {
+	t.Run("request callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatRequestCallback: func(ctx context.Context, req *anthropic.MessageNewParams) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatRequestCallback(context.Background(), &anthropic.MessageNewParams{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("response callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatResponseCallback: func(ctx context.Context, req *anthropic.MessageNewParams, resp *anthropic.Message) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatResponseCallback(context.Background(), &anthropic.MessageNewParams{}, &anthropic.Message{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("chunk callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatChunkCallback: func(ctx context.Context, req *anthropic.MessageNewParams, chunk *anthropic.MessageStreamEventUnion) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			chunk := anthropic.MessageStreamEventUnion{}
+			m.runChatChunkCallback(context.Background(), &anthropic.MessageNewParams{}, &chunk)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("stream complete callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatStreamCompleteCallback: func(
+				ctx context.Context,
+				req *anthropic.MessageNewParams,
+				resp *anthropic.Message,
+				err error,
+			) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatStreamCompleteCallback(
+				context.Background(),
+				&anthropic.MessageNewParams{},
+				&anthropic.Message{},
+				nil,
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+}
+
 func TestWithHeaders_AppendsOptions(t *testing.T) {
 	o := &options{}
 	headers := map[string]string{
@@ -90,6 +167,114 @@ func Test_Model_GenerateContent_NilRequest(t *testing.T) {
 	assert.Nil(t, ch)
 }
 
+func TestModel_GenerateContent_ToolsDisabledAfterCallback(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			var captured map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(
+				w http.ResponseWriter,
+				r *http.Request,
+			) {
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte(strings.Join([]string{
+						"event: message_start",
+						`data: {"type":"message_start","message":{"id":"msg-test","type":"message","role":"assistant","model":"claude-test","content":[]}}`,
+						"",
+						"event: content_block_start",
+						`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+						"",
+						"event: content_block_delta",
+						`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+						"",
+						"event: content_block_stop",
+						`data: {"type":"content_block_stop","index":0}`,
+						"",
+						"event: message_delta",
+						`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+						"",
+						"event: message_stop",
+						`data: {"type":"message_stop"}`,
+						"",
+					}, "\n")))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{
+					"id":"msg-test",
+					"type":"message",
+					"role":"assistant",
+					"model":"claude-test",
+					"content":[{"type":"text","text":"ok"}],
+					"stop_reason":"end_turn",
+					"stop_sequence":null,
+					"usage":{"input_tokens":1,"output_tokens":1}
+				}`))
+			}))
+			defer server.Close()
+
+			m := New(
+				"claude-test",
+				WithAPIKey("test-key"),
+				WithBaseURL(server.URL),
+				WithAnthropicClientOptions(
+					anthropicopt.WithJSONSet("tools", []any{}),
+					anthropicopt.WithJSONSet(
+						"client_option_field",
+						"preserved",
+					),
+				),
+				WithAnthropicRequestOptions(
+					anthropicopt.WithJSONSet(
+						"tool_choice",
+						map[string]any{"type": "any"},
+					),
+					anthropicopt.WithJSONSet(
+						"request_option_field",
+						"preserved",
+					),
+				),
+				WithChatRequestCallback(func(
+					_ context.Context,
+					request *anthropic.MessageNewParams,
+				) {
+					request.Tools = []anthropic.ToolUnionParam{{
+						OfTool: &anthropic.ToolParam{
+							Name: "callback_tool",
+						},
+					}}
+					request.ToolChoice =
+						anthropic.ToolChoiceParamOfTool("callback_tool")
+					request.SetExtraFields(map[string]any{
+						"tools":          []any{},
+						"tool_choice":    map[string]any{"type": "any"},
+						"callback_field": "preserved",
+					})
+				}),
+			)
+			ctx := imodelrequest.WithToolsDisabled(context.Background())
+
+			responseChan, err := m.GenerateContent(ctx, &model.Request{
+				Messages: []model.Message{model.NewUserMessage("test")},
+				GenerationConfig: model.GenerationConfig{
+					Stream: stream,
+				},
+			})
+			require.NoError(t, err)
+			for range responseChan {
+			}
+
+			require.NotNil(t, captured)
+			require.NotContains(t, captured, "tools")
+			require.NotContains(t, captured, "tool_choice")
+			require.Equal(t, "preserved", captured["callback_field"])
+			require.Equal(t, "preserved", captured["client_option_field"])
+			require.Equal(t, "preserved", captured["request_option_field"])
+		})
+	}
+}
+
 func Test_convertUserMessage(t *testing.T) {
 	p1 := "part-1"
 	p2 := "part-2"
@@ -101,7 +286,8 @@ func Test_convertUserMessage(t *testing.T) {
 			{Type: model.ContentTypeText, Text: &p2},
 		},
 	}
-	out := convertUserMessage(msg)
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
 	assert.Equal(t, 3, len(out.Content))
 	// Validate text blocks order and content.
 	assert.NotNil(t, out.Content[0].OfText)
@@ -131,7 +317,8 @@ func Test_convertAssistantMessageContent(t *testing.T) {
 			},
 		},
 	}
-	out := convertAssistantMessageContent(msg)
+	out, err := convertAssistantMessageContent(msg)
+	require.NoError(t, err)
 	// Expect: 1 head text + 1 part text + 1 tool use.
 	assert.Equal(t, 3, len(out.Content))
 	assert.NotNil(t, out.Content[0].OfText)
@@ -151,7 +338,8 @@ func Test_convertSystemMessageContent(t *testing.T) {
 			{Type: model.ContentTypeText, Text: &p},
 		},
 	}
-	blocks := convertSystemMessageContent(msg)
+	blocks, err := convertSystemMessageContent(msg)
+	require.NoError(t, err)
 	assert.Equal(t, 2, len(blocks))
 	assert.Equal(t, "sys", blocks[0].Text)
 	assert.Equal(t, p, blocks[1].Text)
@@ -169,6 +357,57 @@ func Test_convertTools(t *testing.T) {
 	assert.Equal(t, 1, len(params))
 	assert.NotNil(t, params[0].OfTool)
 	assert.Equal(t, "t1", params[0].OfTool.Name)
+}
+
+func Test_convertTools_NoArgObjectSchemaUsesEmptyProperties(t *testing.T) {
+	tests := []struct {
+		name                string
+		inputSchema         *tool.Schema
+		wantEmptyProperties bool
+		wantSerializedType  string
+	}{
+		{
+			name:                "explicit object type",
+			inputSchema:         &tool.Schema{Type: "object"},
+			wantEmptyProperties: true,
+			wantSerializedType:  "object",
+		},
+		{
+			name:                "implicit SDK object type",
+			inputSchema:         &tool.Schema{},
+			wantEmptyProperties: true,
+			wantSerializedType:  "object",
+		},
+		{
+			name:               "non-object type",
+			inputSchema:        &tool.Schema{Type: "array"},
+			wantSerializedType: "array",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			params := convertTools(map[string]tool.Tool{
+				"no_arg_tool": stubTool{decl: &tool.Declaration{
+					Name:        "no_arg_tool",
+					InputSchema: tt.inputSchema,
+				}},
+			})
+
+			body, err := json.Marshal(params)
+			require.NoError(t, err)
+			if tt.wantEmptyProperties {
+				require.Contains(t, string(body), `"properties":{}`)
+				require.NotContains(t, string(body), `"properties":null`)
+			} else {
+				require.Contains(t, string(body), `"properties":null`)
+				require.NotContains(t, string(body), `"properties":{}`)
+			}
+			require.Contains(t, string(body), `"type":"`+tt.wantSerializedType+`"`)
+			require.Equal(t, tt.inputSchema.Type, string(params[0].OfTool.InputSchema.Type))
+			require.Nil(t, tt.inputSchema.Properties)
+		})
+	}
 }
 
 func Test_buildToolDescription_AppendsOutputSchema(t *testing.T) {
@@ -383,12 +622,6 @@ func Test_convertMessages_AllEmptyDropped(t *testing.T) {
 		{
 			Role:    model.RoleUser,
 			Content: "",
-			ContentParts: []model.ContentPart{
-				{
-					Type: model.ContentTypeImage,
-					Text: nil,
-				},
-			},
 		},
 		{
 			Role:    model.RoleSystem,
@@ -436,7 +669,8 @@ func Test_convertAssistantMessageContent_TwoToolCalls(t *testing.T) {
 			},
 		},
 	}
-	out := convertAssistantMessageContent(msg)
+	out, err := convertAssistantMessageContent(msg)
+	require.NoError(t, err)
 	// 1 head text + 2 tool uses.
 	assert.Equal(t, 3, len(out.Content))
 	assert.NotNil(t, out.Content[0].OfText)
@@ -451,11 +685,13 @@ func Test_convertUserMessage_OnlyTextParts(t *testing.T) {
 		Role:    model.RoleUser,
 		Content: "",
 		ContentParts: []model.ContentPart{
+			{Type: model.ContentTypeText},
 			{Type: model.ContentTypeText, Text: &a},
 			{Type: model.ContentTypeText, Text: &b},
 		},
 	}
-	out := convertUserMessage(msg)
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
 	assert.Equal(t, 2, len(out.Content))
 	assert.NotNil(t, out.Content[0].OfText)
 	assert.Equal(t, a, out.Content[0].OfText.Text)
@@ -463,16 +699,495 @@ func Test_convertUserMessage_OnlyTextParts(t *testing.T) {
 	assert.Equal(t, b, out.Content[1].OfText.Text)
 }
 
-func Test_convertUserMessage_NonTextPartsIgnored(t *testing.T) {
-	msg := model.Message{
-		Role:    model.RoleUser,
-		Content: "",
-		ContentParts: []model.ContentPart{
-			{Type: model.ContentTypeImage},
+func Test_convertMessages_MultimodalErrorPropagation(t *testing.T) {
+	tests := []struct {
+		name    string
+		message model.Message
+		want    string
+	}{
+		{
+			name: "system",
+			message: model.Message{
+				Role:         model.RoleSystem,
+				ContentParts: []model.ContentPart{{Type: model.ContentTypeImage}},
+			},
+			want: "system content part 0",
+		},
+		{
+			name: "assistant",
+			message: model.Message{
+				Role:         model.RoleAssistant,
+				ContentParts: []model.ContentPart{{Type: model.ContentTypeImage}},
+			},
+			want: "assistant content part 0",
+		},
+		{
+			name: "user",
+			message: model.Message{
+				Role:         model.RoleUser,
+				ContentParts: []model.ContentPart{{Type: model.ContentTypeImage}},
+			},
+			want: "convert user content part 0",
+		},
+		{
+			name: "default role",
+			message: model.Message{
+				Role:         model.Role("custom"),
+				ContentParts: []model.ContentPart{{Type: model.ContentTypeImage}},
+			},
+			want: "convert user content part 0",
 		},
 	}
-	out := convertUserMessage(msg)
-	assert.Equal(t, 0, len(out.Content))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := convertMessages([]model.Message{tt.message})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func Test_convertUserMessage_ImageURL(t *testing.T) {
+	msg := model.Message{
+		Role:    model.RoleUser,
+		Content: "inspect",
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeImage,
+				Image: &model.Image{
+					URL: "https://example.com/image.png",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 2)
+	require.NotNil(t, out.Content[0].OfText)
+	require.NotNil(t, out.Content[1].OfImage)
+	require.NotNil(t, out.Content[1].OfImage.Source.OfURL)
+	assert.Equal(t, "inspect", out.Content[0].OfText.Text)
+	assert.Equal(t, "https://example.com/image.png", out.Content[1].OfImage.Source.OfURL.URL)
+}
+
+func Test_convertUserMessage_ImageURLWithoutMediaType(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeImage,
+				Image: &model.Image{
+					URL: "https://example.com/image",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfImage)
+	require.NotNil(t, out.Content[0].OfImage.Source.OfURL)
+	assert.Equal(t, "https://example.com/image", out.Content[0].OfImage.Source.OfURL.URL)
+}
+
+func Test_convertUserMessage_ImageURLUnsupportedFormatFallbackText(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeImage,
+				Image: &model.Image{
+					URL:    "https://example.com/icon.svg",
+					Format: "image/svg+xml",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfText)
+	assert.Equal(t, "Image URL (image/svg+xml): https://example.com/icon.svg", out.Content[0].OfText.Text)
+}
+
+func Test_convertUserMessage_ImageURLUnsupportedExtensionFallbackText(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeImage,
+				Image: &model.Image{
+					URL: "https://example.com/icon.svg",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfText)
+	assert.Equal(t, "Image URL: https://example.com/icon.svg", out.Content[0].OfText.Text)
+}
+
+func Test_convertUserMessage_ImageData(t *testing.T) {
+	data := []byte("image-bytes")
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeImage,
+				Image: &model.Image{
+					Data:   data,
+					Format: "png",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfImage)
+	require.NotNil(t, out.Content[0].OfImage.Source.OfBase64)
+	assert.Equal(t, "image/png", string(out.Content[0].OfImage.Source.OfBase64.MediaType))
+	assert.Equal(t, base64.StdEncoding.EncodeToString(data), out.Content[0].OfImage.Source.OfBase64.Data)
+}
+
+func Test_convertUserMessage_ImageDataDetectsMediaType(t *testing.T) {
+	data := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0, 'I', 'H', 'D', 'R'}
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeImage,
+				Image: &model.Image{
+					Data: data,
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfImage)
+	require.NotNil(t, out.Content[0].OfImage.Source.OfBase64)
+	assert.Equal(t, "image/png", string(out.Content[0].OfImage.Source.OfBase64.MediaType))
+	assert.Equal(t, base64.StdEncoding.EncodeToString(data), out.Content[0].OfImage.Source.OfBase64.Data)
+}
+
+func Test_convertUserMessage_FilePDFData(t *testing.T) {
+	data := []byte("%PDF-1.7\n")
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Name:     "report.pdf",
+					Data:     data,
+					MimeType: "application/pdf",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfDocument)
+	require.NotNil(t, out.Content[0].OfDocument.Source.OfBase64)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(data), out.Content[0].OfDocument.Source.OfBase64.Data)
+	assert.Equal(t, "report.pdf", out.Content[0].OfDocument.Title.Value)
+}
+
+func Test_convertUserMessage_FileDataWithURLUsesData(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Data: []byte("hello"),
+					URL:  "https://example.com/report.pdf",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfDocument)
+	require.NotNil(t, out.Content[0].OfDocument.Source.OfText)
+	assert.Equal(t, "hello", out.Content[0].OfDocument.Source.OfText.Data)
+}
+
+func Test_convertUserMessage_FilePDFURL(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Name:     "report.pdf",
+					URL:      "https://example.com/report.pdf?sign=1",
+					MimeType: "application/pdf",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfDocument)
+	require.NotNil(t, out.Content[0].OfDocument.Source.OfURL)
+	assert.Equal(t, "https://example.com/report.pdf?sign=1", out.Content[0].OfDocument.Source.OfURL.URL)
+	assert.Equal(t, "report.pdf", out.Content[0].OfDocument.Title.Value)
+}
+
+func Test_convertUserMessage_FilePDFURLByName(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Name: "report.pdf",
+					URL:  "https://example.com/download?sign=1",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfDocument)
+	require.NotNil(t, out.Content[0].OfDocument.Source.OfURL)
+	assert.Equal(t, "https://example.com/download?sign=1", out.Content[0].OfDocument.Source.OfURL.URL)
+	assert.Equal(t, "report.pdf", out.Content[0].OfDocument.Title.Value)
+}
+
+func Test_convertUserMessage_FileURLFallbackText(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Name:     "data.json",
+					URL:      "https://example.com/data.json",
+					MimeType: "application/json",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfText)
+	assert.Equal(t, "File URL: data.json (application/json): https://example.com/data.json", out.Content[0].OfText.Text)
+}
+
+func Test_convertUserMessage_FileImageURLFallbackText(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Name:     "photo.png",
+					URL:      "https://example.com/photo.png",
+					MimeType: "image/png",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfText)
+	assert.Equal(t, "File URL: photo.png (image/png): https://example.com/photo.png", out.Content[0].OfText.Text)
+}
+
+func Test_convertUserMessage_FileImageData(t *testing.T) {
+	data := []byte("image-bytes")
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Name:     "photo.png",
+					Data:     data,
+					MimeType: "image/png",
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfImage)
+	require.NotNil(t, out.Content[0].OfImage.Source.OfBase64)
+	assert.Equal(t, "image/png", string(out.Content[0].OfImage.Source.OfBase64.MediaType))
+	assert.Equal(t, base64.StdEncoding.EncodeToString(data), out.Content[0].OfImage.Source.OfBase64.Data)
+}
+
+func Test_convertUserMessage_FileTextData(t *testing.T) {
+	msg := model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{
+				Type: model.ContentTypeFile,
+				File: &model.File{
+					Name: "notes.txt",
+					Data: []byte("hello"),
+				},
+			},
+		},
+	}
+	out, err := convertUserMessage(msg)
+	require.NoError(t, err)
+	require.Len(t, out.Content, 1)
+	require.NotNil(t, out.Content[0].OfDocument)
+	require.NotNil(t, out.Content[0].OfDocument.Source.OfText)
+	assert.Equal(t, "hello", out.Content[0].OfDocument.Source.OfText.Data)
+	assert.Equal(t, "notes.txt", out.Content[0].OfDocument.Title.Value)
+}
+
+func Test_convertUserMessage_FileTextLikeDataFallbackText(t *testing.T) {
+	tests := []struct {
+		name     string
+		file     *model.File
+		wantText string
+	}{
+		{
+			name: "CSV",
+			file: &model.File{
+				Name:     "data.csv",
+				Data:     []byte("name,age\nAlice,30\n"),
+				MimeType: "text/csv",
+			},
+			wantText: "File: data.csv (text/csv)\n\nname,age\nAlice,30\n",
+		},
+		{
+			name: "HTML",
+			file: &model.File{
+				Name:     "page.html",
+				Data:     []byte("<h1>Hello</h1>"),
+				MimeType: "text/html",
+			},
+			wantText: "File: page.html (text/html)\n\n<h1>Hello</h1>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := model.Message{
+				Role: model.RoleUser,
+				ContentParts: []model.ContentPart{
+					{
+						Type: model.ContentTypeFile,
+						File: tt.file,
+					},
+				},
+			}
+			out, err := convertUserMessage(msg)
+			require.NoError(t, err)
+			require.Len(t, out.Content, 1)
+			require.NotNil(t, out.Content[0].OfText)
+			assert.Equal(t, tt.wantText, out.Content[0].OfText.Text)
+		})
+	}
+}
+
+func Test_convertMessages_ImageOnlyUserPreserved(t *testing.T) {
+	msgs := []model.Message{
+		{
+			Role: model.RoleUser,
+			ContentParts: []model.ContentPart{
+				{
+					Type: model.ContentTypeImage,
+					Image: &model.Image{
+						URL: "https://example.com/image.png",
+					},
+				},
+			},
+		},
+	}
+	converted, systemPrompts, err := convertMessages(msgs)
+	require.NoError(t, err)
+	assert.Empty(t, systemPrompts)
+	require.Len(t, converted, 1)
+	require.Len(t, converted[0].Content, 1)
+	assert.NotNil(t, converted[0].Content[0].OfImage)
+}
+
+func Test_convertUserMessage_UnsupportedMultimodalParts(t *testing.T) {
+	tests := []struct {
+		name string
+		part model.ContentPart
+		want string
+	}{
+		{
+			name: "nil image",
+			part: model.ContentPart{Type: model.ContentTypeImage},
+			want: "image payload is nil",
+		},
+		{
+			name: "audio",
+			part: model.ContentPart{Type: model.ContentTypeAudio, Audio: &model.Audio{Data: []byte("audio"), Format: "mp3"}},
+			want: "audio content is not supported",
+		},
+		{
+			name: "file id",
+			part: model.ContentPart{Type: model.ContentTypeFile, File: &model.File{FileID: "file_123"}},
+			want: "file_id content is not supported",
+		},
+		{
+			name: "unsupported file media type",
+			part: model.ContentPart{Type: model.ContentTypeFile, File: &model.File{Name: "data.json", Data: []byte("{}"), MimeType: "application/json"}},
+			want: "unsupported file media type",
+		},
+		{
+			name: "unknown content type",
+			part: model.ContentPart{Type: model.ContentType("unknown")},
+			want: "unsupported content type",
+		},
+		{
+			name: "empty image data",
+			part: model.ContentPart{Type: model.ContentTypeImage, Image: &model.Image{}},
+			want: "image data is empty",
+		},
+		{
+			name: "nil file",
+			part: model.ContentPart{Type: model.ContentTypeFile},
+			want: "file payload is nil",
+		},
+		{
+			name: "empty file",
+			part: model.ContentPart{Type: model.ContentTypeFile, File: &model.File{}},
+			want: "file data is empty",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := convertUserMessage(model.Message{Role: model.RoleUser, ContentParts: []model.ContentPart{tt.part}})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func Test_convertNonUserMessage_UnsupportedMultimodalParts(t *testing.T) {
+	imagePart := model.ContentPart{
+		Type: model.ContentTypeImage,
+		Image: &model.Image{
+			URL: "https://example.com/image.png",
+		},
+	}
+	_, err := convertAssistantMessageContent(model.Message{Role: model.RoleAssistant, ContentParts: []model.ContentPart{imagePart}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "assistant content part 0")
+	_, err = convertSystemMessageContent(model.Message{Role: model.RoleSystem, ContentParts: []model.ContentPart{imagePart}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "system content part 0")
 }
 
 func Test_convertSystemMessageContent_OnlyParts(t *testing.T) {
@@ -492,7 +1207,8 @@ func Test_convertSystemMessageContent_OnlyParts(t *testing.T) {
 			},
 		},
 	}
-	blocks := convertSystemMessageContent(msg)
+	blocks, err := convertSystemMessageContent(msg)
+	require.NoError(t, err)
 	assert.Equal(t, 2, len(blocks))
 	assert.Equal(t, a, blocks[0].Text)
 	assert.Equal(t, b, blocks[1].Text)
@@ -500,7 +1216,8 @@ func Test_convertSystemMessageContent_OnlyParts(t *testing.T) {
 
 func Test_convertSystemMessageContent_Empty(t *testing.T) {
 	msg := model.Message{Role: model.RoleSystem}
-	blocks := convertSystemMessageContent(msg)
+	blocks, err := convertSystemMessageContent(msg)
+	require.NoError(t, err)
 	assert.Equal(t, 0, len(blocks))
 }
 
@@ -557,54 +1274,104 @@ func Test_buildStreamingPartialResponse_TextAndThinkingAndStop(t *testing.T) {
 
 	// Text delta empty -> skip.
 	e1 := anthropicStreamEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`)
-	resp, err := buildStreamingPartialResponse(acc, e1)
+	resp, err := buildStreamingPartialResponse(acc, e1, false)
 	assert.NoError(t, err)
 	assert.Nil(t, resp)
 
 	// Text delta non-empty -> content delta.
 	e2 := anthropicStreamEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"abc"}}`)
-	resp, err = buildStreamingPartialResponse(acc, e2)
+	resp, err = buildStreamingPartialResponse(acc, e2, false)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.Equal(t, "abc", resp.Choices[0].Delta.Content)
 
 	// Thinking delta non-empty -> reasoning delta.
 	e3 := anthropicStreamEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}`)
-	resp, err = buildStreamingPartialResponse(acc, e3)
+	resp, err = buildStreamingPartialResponse(acc, e3, false)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.Equal(t, "think", resp.Choices[0].Delta.ReasoningContent)
 
 	// Message delta with stop_reason -> finish reason set.
 	e4 := anthropicStreamEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}`)
-	resp, err = buildStreamingPartialResponse(acc, e4)
+	resp, err = buildStreamingPartialResponse(acc, e4, false)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.NotNil(t, resp.Choices[0].FinishReason)
 
 	// Unknown type should be skipped.
 	e5 := anthropicStreamEvent("unknown", `{"type":"unknown"}`)
-	resp, err = buildStreamingPartialResponse(acc, e5)
+	resp, err = buildStreamingPartialResponse(acc, e5, false)
 	assert.NoError(t, err)
 	assert.Nil(t, resp)
 
 	// Content block delta with input_json_delta should be skipped.
 	e6 := anthropicStreamEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`)
-	resp, err = buildStreamingPartialResponse(acc, e6)
+	acc.Content = []anthropic.ContentBlockUnion{
+		anthropicContentUnion("tool_use", `{"type":"tool_use","id":"id1","name":"fn","input":{}}`),
+	}
+	resp, err = buildStreamingPartialResponse(acc, e6, false)
+	assert.NoError(t, err)
+	assert.Nil(t, resp)
+
+	// Content block delta with input_json_delta should be emitted when enabled.
+	resp, err = buildStreamingPartialResponse(acc, e6, true)
+	assert.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Choices[0].Delta.ToolCalls, 1)
+	assert.Equal(t, "id1", resp.Choices[0].Delta.ToolCalls[0].ID)
+	assert.Equal(t, "fn", resp.Choices[0].Delta.ToolCalls[0].Function.Name)
+	assert.Equal(t, "{}", string(resp.Choices[0].Delta.ToolCalls[0].Function.Arguments))
+	require.NotNil(t, resp.Choices[0].Delta.ToolCalls[0].Index)
+	assert.Equal(t, 0, *resp.Choices[0].Delta.ToolCalls[0].Index)
+
+	// Input JSON delta without a resolved tool_use block should be skipped.
+	acc.Content = []anthropic.ContentBlockUnion{
+		anthropicContentUnion("text", `{"type":"text","text":"not a tool"}`),
+	}
+	resp, err = buildStreamingPartialResponse(acc, e6, true)
+	assert.NoError(t, err)
+	assert.Nil(t, resp)
+	e6OutOfRange := anthropicStreamEvent("content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}`)
+	resp, err = buildStreamingPartialResponse(acc, e6OutOfRange, true)
 	assert.NoError(t, err)
 	assert.Nil(t, resp)
 
 	// Thinking delta empty should be skipped.
 	e7 := anthropicStreamEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
-	resp, err = buildStreamingPartialResponse(acc, e7)
+	resp, err = buildStreamingPartialResponse(acc, e7, false)
 	assert.NoError(t, err)
 	assert.Nil(t, resp)
 
 	// Message delta with empty stop_reason should be skipped.
 	e8 := anthropicStreamEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}`)
-	resp, err = buildStreamingPartialResponse(acc, e8)
+	resp, err = buildStreamingPartialResponse(acc, e8, false)
 	assert.NoError(t, err)
 	assert.Nil(t, resp)
+}
+
+func Test_buildStreamingPartialResponse_ToolCallDeltaIndexUsesToolCallOrdinal(t *testing.T) {
+	acc := anthropic.Message{
+		ID:    "acc1",
+		Model: anthropic.Model("claude-test"),
+		Content: []anthropic.ContentBlockUnion{
+			anthropicContentUnion("text", `{"type":"text","text":"before"}`),
+			anthropicContentUnion("tool_use", `{"type":"tool_use","id":"id1","name":"fn","input":{}}`),
+		},
+	}
+	event := anthropicStreamEvent(
+		"content_block_delta",
+		`{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}`,
+	)
+	resp, err := buildStreamingPartialResponse(acc, event, true)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Choices[0].Delta.ToolCalls, 1)
+	require.NotNil(t, resp.Choices[0].Delta.ToolCalls[0].Index)
+	assert.Equal(t, 0, *resp.Choices[0].Delta.ToolCalls[0].Index)
+	assert.Equal(t, "id1", resp.Choices[0].Delta.ToolCalls[0].ID)
+	assert.Equal(t, "fn", resp.Choices[0].Delta.ToolCalls[0].Function.Name)
+	assert.Equal(t, `{"a":1}`, string(resp.Choices[0].Delta.ToolCalls[0].Function.Arguments))
 }
 
 func Test_buildStreamingFinalResponse_Aggregation(t *testing.T) {
@@ -687,10 +1454,161 @@ func Test_buildChatRequest_ThinkingIgnoredWhenTokensNil(t *testing.T) {
 	}
 	chatReq, err := m.buildChatRequest(req)
 	assert.NoError(t, err)
-	// When tokens are nil, thinking should not be set.
-	// The SDK union has both enabled/disabled variants omitted by default.
-	// We assert nothing and only ensure no error and a valid request.
-	_ = chatReq
+	assert.Nil(t, chatReq.Thinking.OfAdaptive)
+	assert.Nil(t, chatReq.Thinking.OfEnabled)
+	assert.Nil(t, chatReq.Thinking.OfDisabled)
+}
+
+func Test_buildChatRequest_AdaptiveThinkingModels(t *testing.T) {
+	thinking := true
+	thinkingTokens := 1024
+	effort := "medium"
+	for _, modelName := range []string{
+		claudeMythosPreview,
+		claudeOpus47,
+		claudeOpus46,
+		claudeOpus46Alias,
+		claudeSonnet46,
+		claudeSonnet46Alias,
+		claudeOpus46 + "-20260427",
+	} {
+		t.Run(modelName, func(t *testing.T) {
+			m := New(modelName)
+			req := &model.Request{
+				Messages: []model.Message{model.NewUserMessage("u")},
+				GenerationConfig: model.GenerationConfig{
+					ThinkingEnabled: &thinking,
+					ThinkingTokens:  &thinkingTokens,
+					ReasoningEffort: &effort,
+				},
+			}
+			chatReq, err := m.buildChatRequest(req)
+			require.NoError(t, err)
+			require.NotNil(t, chatReq.Thinking.OfAdaptive)
+			assert.Nil(t, chatReq.Thinking.OfEnabled)
+			assert.Nil(t, chatReq.Thinking.OfDisabled)
+			assert.Equal(t, defaultThinkingDisplay, chatReq.Thinking.OfAdaptive.Display)
+			assert.Equal(t, anthropic.OutputConfigEffort(effort), chatReq.OutputConfig.Effort)
+			payload := marshalChatRequestMap(t, chatReq)
+			thinkingPayload, ok := payload["thinking"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, "adaptive", thinkingPayload["type"])
+			assert.Equal(t, "summarized", thinkingPayload["display"])
+			assert.NotContains(t, thinkingPayload, "budget_tokens")
+			outputConfigPayload, ok := payload["output_config"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, effort, outputConfigPayload["effort"])
+		})
+	}
+}
+
+func Test_buildChatRequest_DisabledThinking(t *testing.T) {
+	thinking := false
+	for _, modelName := range []string{claudeOpus47, claudeOpus46, claudeSonnet46} {
+		t.Run(modelName, func(t *testing.T) {
+			m := New(modelName)
+			req := &model.Request{
+				Messages: []model.Message{model.NewUserMessage("u")},
+				GenerationConfig: model.GenerationConfig{
+					ThinkingEnabled: &thinking,
+				},
+			}
+			chatReq, err := m.buildChatRequest(req)
+			require.NoError(t, err)
+			require.NotNil(t, chatReq.Thinking.OfDisabled)
+			assert.Nil(t, chatReq.Thinking.OfAdaptive)
+			assert.Nil(t, chatReq.Thinking.OfEnabled)
+			payload := marshalChatRequestMap(t, chatReq)
+			thinkingPayload, ok := payload["thinking"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, "disabled", thinkingPayload["type"])
+		})
+	}
+}
+
+func Test_buildChatRequest_LegacyDisabledThinkingLeavesThinkingUnset(t *testing.T) {
+	thinking := false
+	m := New("claude-3-haiku-20240307")
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("u")},
+		GenerationConfig: model.GenerationConfig{
+			ThinkingEnabled: &thinking,
+		},
+	}
+	chatReq, err := m.buildChatRequest(req)
+	require.NoError(t, err)
+	assert.Nil(t, chatReq.Thinking.OfAdaptive)
+	assert.Nil(t, chatReq.Thinking.OfEnabled)
+	assert.Nil(t, chatReq.Thinking.OfDisabled)
+	payload := marshalChatRequestMap(t, chatReq)
+	assert.NotContains(t, payload, "thinking")
+}
+
+func Test_buildChatRequest_MythosDisabledThinkingReturnsError(t *testing.T) {
+	thinking := false
+	m := New(claudeMythosPreview)
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("u")},
+		GenerationConfig: model.GenerationConfig{
+			ThinkingEnabled: &thinking,
+		},
+	}
+	chatReq, err := m.buildChatRequest(req)
+	require.Error(t, err)
+	assert.Nil(t, chatReq)
+	assert.Contains(t, err.Error(), "thinking cannot be disabled")
+}
+
+func Test_buildChatRequest_NilThinkingEnabledLeavesThinkingUnset(t *testing.T) {
+	for _, modelName := range []string{claudeMythosPreview, claudeOpus47, "claude-test"} {
+		t.Run(modelName, func(t *testing.T) {
+			m := New(modelName)
+			req := &model.Request{
+				Messages: []model.Message{model.NewUserMessage("u")},
+			}
+			chatReq, err := m.buildChatRequest(req)
+			require.NoError(t, err)
+			assert.Nil(t, chatReq.Thinking.OfAdaptive)
+			assert.Nil(t, chatReq.Thinking.OfEnabled)
+			assert.Nil(t, chatReq.Thinking.OfDisabled)
+			payload := marshalChatRequestMap(t, chatReq)
+			assert.NotContains(t, payload, "thinking")
+		})
+	}
+}
+
+func Test_buildChatRequest_LegacyThinkingUsesBudgetTokens(t *testing.T) {
+	thinking := true
+	thinkingTokens := 1024
+	m := New("claude-test")
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("u")},
+		GenerationConfig: model.GenerationConfig{
+			ThinkingEnabled: &thinking,
+			ThinkingTokens:  &thinkingTokens,
+		},
+	}
+	chatReq, err := m.buildChatRequest(req)
+	require.NoError(t, err)
+	require.NotNil(t, chatReq.Thinking.OfEnabled)
+	assert.Nil(t, chatReq.Thinking.OfAdaptive)
+	assert.Nil(t, chatReq.Thinking.OfDisabled)
+	assert.Equal(t, int64(thinkingTokens), chatReq.Thinking.OfEnabled.BudgetTokens)
+	payload := marshalChatRequestMap(t, chatReq)
+	thinkingPayload, ok := payload["thinking"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "enabled", thinkingPayload["type"])
+	assert.Equal(t, float64(thinkingTokens), thinkingPayload["budget_tokens"])
+	assert.NotContains(t, thinkingPayload, "display")
+}
+
+func marshalChatRequestMap(t *testing.T, chatReq *anthropic.MessageNewParams) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(chatReq)
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(raw, &payload))
+	return payload
 }
 
 func Test_convertTools_Multiple(t *testing.T) {
@@ -730,6 +1648,12 @@ type rtFunc func(*http.Request) (*http.Response, error)
 
 // RoundTrip implements http.RoundTripper.
 func (f rtFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type errReader struct{ err error }
+
+func (r *errReader) Read(_ []byte) (int, error) {
+	return 0, r.err
+}
 
 func Test_HandleNonStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 	// Mock HTTP client to return a fixed Anthropic message JSON body.
@@ -828,7 +1752,8 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 		})}
 	}
 
-	var chunkCalled, streamCompleteCalled bool
+	var chunkCalled bool
+	streamCompleteCalled := make(chan struct{})
 	m := New(
 		"claude-test",
 		WithHTTPClientOptions(),
@@ -838,7 +1763,7 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 		}),
 		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams,
 			_ *anthropic.Message, _ error) {
-			streamCompleteCalled = true
+			close(streamCompleteCalled)
 		}),
 	)
 	req := &model.Request{
@@ -856,6 +1781,12 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 	for resp := range ch {
 		if resp.Done {
 			final = resp
+			select {
+			case <-streamCompleteCalled:
+				// Success.
+			default:
+				t.Fatal("stream complete callback must run before final response is emitted")
+			}
 			break
 		}
 		if resp.IsPartial {
@@ -866,7 +1797,626 @@ func Test_HandleStreamingResponse_EndToEnd_NoNetwork(t *testing.T) {
 	assert.NotNil(t, final)
 	assert.True(t, final.Done)
 	assert.True(t, chunkCalled)
-	assert.True(t, streamCompleteCalled)
+	select {
+	case <-streamCompleteCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+}
+
+func Test_HandleStreamingResponse_StreamErrorUsesNilAccumulator(t *testing.T) {
+	streamErr := errors.New("stream read error")
+
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     h,
+				Body:       io.NopCloser(&errReader{err: streamErr}),
+			}, nil
+		})}
+	}
+
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	var callbackErr error
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context,
+			_ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			callbackAcc = acc
+			callbackErr = err
+			close(callbackCalled)
+		}),
+	)
+	ctx := context.Background()
+	ch, err := m.GenerateContent(ctx, &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+
+	var responses []*model.Response
+	for resp := range ch {
+		responses = append(responses, resp)
+		if resp.Done && resp.Error != nil {
+			select {
+			case <-callbackCalled:
+				assert.Nil(t, callbackAcc)
+				assert.ErrorIs(t, callbackErr, streamErr)
+			default:
+				t.Fatal("stream complete callback must run before terminal error response is emitted")
+			}
+		}
+	}
+
+	require.Len(t, responses, 1)
+	assert.NotNil(t, responses[0].Error)
+	assert.True(t, responses[0].Done)
+	select {
+	case <-callbackCalled:
+		assert.Nil(t, callbackAcc)
+		assert.ErrorIs(t, callbackErr, streamErr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+}
+
+func Test_HandleStreamingResponse_ToolInputDeltaOverridesStartInput(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_tool_1","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"a":1}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1,"}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"b\":2}"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":5,"server_tool_use":{"web_search_requests":0}}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithShowToolCallDelta(true),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			assert.NoError(t, err)
+			callbackAcc = acc
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var final *model.Response
+	var toolCallDeltas []model.ToolCall
+	for resp := range ch {
+		if len(resp.Choices) > 0 {
+			toolCallDeltas = append(toolCallDeltas, resp.Choices[0].Delta.ToolCalls...)
+		}
+		if resp.Done {
+			final = resp
+		}
+	}
+	require.Len(t, toolCallDeltas, 2)
+	assert.Equal(t, "toolu_1", toolCallDeltas[0].ID)
+	assert.Equal(t, "lookup", toolCallDeltas[0].Function.Name)
+	assert.Equal(t, `{"a":1,`, string(toolCallDeltas[0].Function.Arguments))
+	assert.Equal(t, `"b":2}`, string(toolCallDeltas[1].Function.Arguments))
+	require.NotNil(t, final)
+	require.Nil(t, final.Error)
+	require.Len(t, final.Choices, 1)
+	require.Len(t, final.Choices[0].Message.ToolCalls, 1)
+	assert.JSONEq(t, `{"a":1,"b":2}`, string(final.Choices[0].Message.ToolCalls[0].Function.Arguments))
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	require.NotNil(t, callbackAcc)
+	require.Len(t, callbackAcc.Content, 1)
+	toolUse, ok := callbackAcc.Content[0].AsAny().(anthropic.ToolUseBlock)
+	require.True(t, ok)
+	assert.JSONEq(t, `{"a":1,"b":2}`, string(toolUse.Input))
+}
+
+func Test_HandleStreamingResponse_ToolInputDeltaHiddenByDefault(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_tool_1","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"a":1}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1,"}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"b\":2}"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":5,"server_tool_use":{"web_search_requests":0}}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	m := New("claude-test", WithHTTPClientOptions())
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var final *model.Response
+	var toolCallDeltas []model.ToolCall
+	for resp := range ch {
+		if len(resp.Choices) > 0 {
+			toolCallDeltas = append(toolCallDeltas, resp.Choices[0].Delta.ToolCalls...)
+		}
+		if resp.Done {
+			final = resp
+		}
+	}
+	assert.Empty(t, toolCallDeltas)
+	require.NotNil(t, final)
+	require.Nil(t, final.Error)
+	require.Len(t, final.Choices, 1)
+	require.Len(t, final.Choices[0].Message.ToolCalls, 1)
+	assert.JSONEq(t, `{"a":1,"b":2}`, string(final.Choices[0].Message.ToolCalls[0].Function.Arguments))
+}
+
+func Test_HandleStreamingResponse_ToolInputPreservesStartInputWithoutDelta(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_tool_2","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_2","name":"lookup","input":{"a":1}}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":5,"server_tool_use":{"web_search_requests":0}}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			assert.NoError(t, err)
+			callbackAcc = acc
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var final *model.Response
+	for resp := range ch {
+		if resp.Done {
+			final = resp
+		}
+	}
+	require.NotNil(t, final)
+	require.Nil(t, final.Error)
+	require.Len(t, final.Choices, 1)
+	require.Len(t, final.Choices[0].Message.ToolCalls, 1)
+	assert.JSONEq(t, `{"a":1}`, string(final.Choices[0].Message.ToolCalls[0].Function.Arguments))
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	require.NotNil(t, callbackAcc)
+	require.Len(t, callbackAcc.Content, 1)
+	toolUse, ok := callbackAcc.Content[0].AsAny().(anthropic.ToolUseBlock)
+	require.True(t, ok)
+	assert.JSONEq(t, `{"a":1}`, string(toolUse.Input))
+}
+
+func Test_HandleStreamingResponse_ServerToolInputDeltaOverridesStartInput(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_server_tool_1","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"seed"}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"latest weather\"}"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":""},"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":5,"server_tool_use":{"web_search_requests":1}}}`,
+		"",
+		"event: message_stop",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			assert.NoError(t, err)
+			callbackAcc = acc
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var final *model.Response
+	for resp := range ch {
+		if resp.Done {
+			final = resp
+		}
+	}
+	require.NotNil(t, final)
+	require.Nil(t, final.Error)
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	require.NotNil(t, callbackAcc)
+	require.Len(t, callbackAcc.Content, 1)
+	serverToolUse, ok := callbackAcc.Content[0].AsAny().(anthropic.ServerToolUseBlock)
+	require.True(t, ok)
+	rawInput, marshalErr := json.Marshal(serverToolUse.Input)
+	require.NoError(t, marshalErr)
+	assert.JSONEq(t, `{"query":"latest weather"}`, string(rawInput))
+}
+
+func Test_HandleStreamingResponse_InvalidToolInputDeltaReturnsError(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"msg_sse_tool_3","type":"message","role":"assistant","model":"claude-3-sonnet","content":[],"usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":3,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}`,
+		"",
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_3","name":"lookup","input":{}}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1"}}`,
+		"",
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+		"",
+	}, "\n")
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: 200, Header: h, Body: io.NopCloser(strings.NewReader(sse))}, nil
+		})}
+	}
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	var callbackErr error
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context, _ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			callbackAcc = acc
+			callbackErr = err
+			close(callbackCalled)
+		}),
+	)
+	ch, err := m.GenerateContent(context.Background(), &model.Request{
+		Messages:         []model.Message{model.NewUserMessage("U")},
+		GenerationConfig: model.GenerationConfig{Stream: true},
+	})
+	require.NoError(t, err)
+	var responses []*model.Response
+	for resp := range ch {
+		responses = append(responses, resp)
+	}
+	require.Len(t, responses, 1)
+	require.NotNil(t, responses[0].Error)
+	assert.True(t, responses[0].Done)
+	assert.NotEmpty(t, responses[0].Error.Message)
+	select {
+	case <-callbackCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	assert.Nil(t, callbackAcc)
+	require.Error(t, callbackErr)
+	assert.Equal(t, responses[0].Error.Message, callbackErr.Error())
+}
+
+func Test_StreamingMessageAccumulator_HelperGuards(t *testing.T) {
+	var nilAcc *streamingMessageAccumulator
+	assert.Equal(t, anthropic.Message{}, nilAcc.Message())
+	require.EqualError(t, nilAcc.Accumulate(anthropic.MessageStreamEventUnion{}), "accumulate: cannot accumulate into nil accumulator")
+	require.NoError(t, nilAcc.Finalize())
+	acc := newStreamingMessageAccumulator()
+	_, _, err := acc.lastContentBlock()
+	require.EqualError(t, err, "no content block")
+	block := anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage(`{"seed":1}`)}
+	appendInputJSONDelta(nil, nil, "")
+	appendInputJSONDelta(&block, nil, `{"ignored":true}`)
+	assert.JSONEq(t, `{"seed":1}`, string(block.Input))
+	started := false
+	appendInputJSONDelta(&block, &started, "")
+	assert.False(t, started)
+	assert.JSONEq(t, `{"seed":1}`, string(block.Input))
+	appendInputJSONDelta(&block, &started, `{"fresh":1`)
+	assert.True(t, started)
+	assert.Equal(t, `{"fresh":1`, string(block.Input))
+	appendInputJSONDelta(&block, &started, `,"next":2}`)
+	assert.JSONEq(t, `{"fresh":1,"next":2}`, string(block.Input))
+	require.NoError(t, finalizeStreamingMessage(nil))
+	require.NoError(t, refreshContentBlockRawJSON(nil))
+	acc.message = anthropic.Message{
+		Content: []anthropic.ContentBlockUnion{{Type: "tool_use", Input: json.RawMessage(`{"done":true}`)}},
+	}
+	require.NoError(t, acc.Finalize())
+	assert.True(t, acc.finalized)
+	acc.message.Content[0].Input = json.RawMessage("{")
+	require.NoError(t, acc.Finalize())
+}
+
+func Test_StreamingMessageAccumulator_DeltaVariants(t *testing.T) {
+	acc := newStreamingMessageAccumulator()
+	acc.message = anthropic.Message{Content: []anthropic.ContentBlockUnion{{Type: "text", Text: "Hello"}}}
+	acc.inputDeltaStartedAt = []bool{false}
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"Hello","document_index":0,"document_title":"Doc","start_char_index":0,"end_char_index":5}}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)))
+	acc.message.Content = append(acc.message.Content, anthropic.ContentBlockUnion{Type: "thinking", Thinking: "Plan", Signature: "sig"})
+	acc.inputDeltaStartedAt = append(acc.inputDeltaStartedAt, false)
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":" more"}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"-next"}}`)))
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":1}`)))
+	require.NoError(t, acc.Finalize())
+	require.Len(t, acc.message.Content, 2)
+	textBlock, ok := acc.message.Content[0].AsAny().(anthropic.TextBlock)
+	require.True(t, ok)
+	assert.Equal(t, "Hello world", textBlock.Text)
+	require.Len(t, textBlock.Citations, 1)
+	citation, ok := textBlock.Citations[0].AsAny().(anthropic.CitationCharLocation)
+	require.True(t, ok)
+	assert.Equal(t, int64(0), citation.StartCharIndex)
+	assert.Equal(t, int64(5), citation.EndCharIndex)
+	thinkingBlock, ok := acc.message.Content[1].AsAny().(anthropic.ThinkingBlock)
+	require.True(t, ok)
+	assert.Equal(t, "Plan more", thinkingBlock.Thinking)
+	assert.Equal(t, "sig-next", thinkingBlock.Signature)
+}
+
+func Test_StreamingMessageAccumulator_ErrorPaths(t *testing.T) {
+	acc := newStreamingMessageAccumulator()
+	require.ErrorContains(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}`)), "no content block")
+	require.ErrorContains(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)), "no content block")
+	// Partial JSON in tool-use Input is now handled gracefully:
+	// ensureValidToolInput resets invalid Input to {} before refreshContentBlockRawJSON.
+	acc.message.Content = []anthropic.ContentBlockUnion{{Type: "tool_use", Input: json.RawMessage("{")}}
+	acc.inputDeltaStartedAt = []bool{false}
+	require.NoError(t, acc.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)))
+	// The invalid Input should have been reset to {}.
+	assert.Equal(t, json.RawMessage("{}"), acc.message.Content[0].Input)
+	// Proxy sends "input": null (literal JSON null) with no input_json_delta.
+	// ensureValidToolInput must treat this as empty and reset to {}.
+	acc3 := newStreamingMessageAccumulator()
+	acc3.message.Content = []anthropic.ContentBlockUnion{{Type: "tool_use", Input: json.RawMessage("null")}}
+	acc3.inputDeltaStartedAt = []bool{false}
+	require.NoError(t, acc3.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)))
+	assert.Equal(t, json.RawMessage("{}"), acc3.message.Content[0].Input)
+
+	// Non-tool_use blocks with malformed Input must NOT be auto-repaired.
+	acc2 := newStreamingMessageAccumulator()
+	acc2.message.Content = []anthropic.ContentBlockUnion{{Type: "text", Input: json.RawMessage("{")}}
+	acc2.inputDeltaStartedAt = []bool{false}
+	require.Error(t, acc2.Accumulate(mustMessageStreamEventUnion(t,
+		`{"type":"content_block_stop","index":0}`)))
+	// Input remains unchanged — auto-repair is tool_use-specific.
+	assert.Equal(t, json.RawMessage("{"), acc2.message.Content[0].Input)
+
+	// refreshContentBlockRawJSON and finalizeStreamingMessage still fail on
+	// invalid Input when called directly (no ensureValidToolInput guard).
+	require.Error(t, refreshContentBlockRawJSON(&anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage("{")}))
+	require.Error(t, finalizeStreamingMessage(&anthropic.Message{
+		Content: []anthropic.ContentBlockUnion{{Type: "tool_use", Input: json.RawMessage("{")}},
+	}))
+}
+
+func Test_ensureValidToolInput(t *testing.T) {
+	// nil input — no-op.
+	var nilBlock *anthropic.ContentBlockUnion
+	ensureValidToolInput(nilBlock) // should not panic
+
+	// non-tool_use block — no-op.
+	nonTool := &anthropic.ContentBlockUnion{Type: "text", Input: json.RawMessage("{bad")}
+	ensureValidToolInput(nonTool)
+	assert.Equal(t, json.RawMessage("{bad"), nonTool.Input, "non-tool_use Input must not be modified")
+
+	// tool_use with nil Input — reset to {}.
+	nilInput := &anthropic.ContentBlockUnion{Type: "tool_use"}
+	ensureValidToolInput(nilInput)
+	assert.Equal(t, json.RawMessage("{}"), nilInput.Input)
+
+	// tool_use with empty Input — reset to {}.
+	emptyInput := &anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage("")}
+	ensureValidToolInput(emptyInput)
+	assert.Equal(t, json.RawMessage("{}"), emptyInput.Input)
+
+	// tool_use with whitespace-only Input — reset to {}.
+	wsInput := &anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage("  ")}
+	ensureValidToolInput(wsInput)
+	assert.Equal(t, json.RawMessage("{}"), wsInput.Input)
+
+	// tool_use with partial JSON — reset to {}.
+	partialInput := &anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage("{")}
+	ensureValidToolInput(partialInput)
+	assert.Equal(t, json.RawMessage("{}"), partialInput.Input)
+
+	// tool_use with literal "null" (json.Valid("null") is true) — reset to {}.
+	nullLiteral := &anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage("null")}
+	ensureValidToolInput(nullLiteral)
+	assert.Equal(t, json.RawMessage("{}"), nullLiteral.Input)
+
+	// tool_use with valid JSON — unchanged.
+	validInput := &anthropic.ContentBlockUnion{Type: "tool_use", Input: json.RawMessage(`{"key":"val"}`)}
+	ensureValidToolInput(validInput)
+	assert.Equal(t, json.RawMessage(`{"key":"val"}`), validInput.Input)
+}
+
+func mustMessageStreamEventUnion(t *testing.T, raw string) anthropic.MessageStreamEventUnion {
+	t.Helper()
+	var event anthropic.MessageStreamEventUnion
+	require.NoError(t, event.UnmarshalJSON([]byte(raw)))
+	return event
+}
+
+func Test_HandleStreamingResponse_ContextCancelStillCallsCallback(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-sonnet\",\"content\":[]}}",
+		"",
+		"event: content_block_start",
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+		"",
+		"event: content_block_delta",
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}",
+		"",
+		"",
+	}, "\n")
+
+	orig := model.DefaultNewHTTPClient
+	t.Cleanup(func() { model.DefaultNewHTTPClient = orig })
+	model.DefaultNewHTTPClient = func(_ ...HTTPClientOption) model.HTTPClient {
+		return &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			h := make(http.Header)
+			h.Set("Content-Type", "text/event-stream")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     h,
+				Body:       io.NopCloser(strings.NewReader(sse)),
+			}, nil
+		})}
+	}
+
+	callbackCalled := make(chan struct{})
+	var callbackAcc *anthropic.Message
+	var callbackErr error
+	m := New(
+		"claude-test",
+		WithHTTPClientOptions(),
+		WithChatStreamCompleteCallback(func(_ context.Context,
+			_ *anthropic.MessageNewParams, acc *anthropic.Message, err error) {
+			callbackAcc = acc
+			callbackErr = err
+			close(callbackCalled)
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	responseChan := make(chan *model.Response)
+	m.handleStreamingResponse(ctx, anthropic.MessageNewParams{}, responseChan)
+
+	select {
+	case <-callbackCalled:
+		assert.Nil(t, callbackAcc)
+		require.ErrorIs(t, callbackErr, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	select {
+	case resp := <-responseChan:
+		t.Fatalf("unexpected response: %#v", resp)
+	default:
+	}
 }
 
 func Test_HTTPClientOptions_AndAnthropicClientOptions(t *testing.T) {
@@ -1033,6 +2583,18 @@ func (testStubStrategy) TailorMessages(
 	return append([]model.Message{messages[0]}, messages[2:]...), nil
 }
 
+type overflowTailoringStrategy struct {
+	tailored []model.Message
+}
+
+func (s overflowTailoringStrategy) TailorMessages(
+	ctx context.Context,
+	messages []model.Message,
+	maxTokens int,
+) ([]model.Message, error) {
+	return s.tailored, errors.New("minimal protected context exceeds token budget")
+}
+
 // TestWithTokenTailoring tests token tailoring functionality in Anthropic.
 func TestWithTokenTailoring(t *testing.T) {
 	// Capture the built Anthropic request to check messages count reflects tailoring.
@@ -1064,6 +2626,28 @@ func TestWithTokenTailoring(t *testing.T) {
 	require.NotNil(t, captured, "expected request callback to capture request")
 	// After tailoring, messages should be reduced (1 message after tailoring).
 	require.Len(t, captured.Messages, 1, "expected 1 message after tailoring, got %d", len(captured.Messages))
+}
+
+func TestWithTokenTailoring_UsesProtectedContextOnOverflow(t *testing.T) {
+	tailored := []model.Message{
+		model.NewSystemMessage("sys"),
+		model.NewUserMessage("q"),
+	}
+	m := &Model{
+		name:                 "test-model",
+		enableTokenTailoring: true,
+		maxInputTokens:       1,
+		tailoringStrategy:    overflowTailoringStrategy{tailored: tailored},
+	}
+	req := &model.Request{Messages: []model.Message{
+		model.NewSystemMessage("sys"),
+		model.NewUserMessage("old"),
+		model.NewUserMessage("q"),
+	}}
+
+	m.applyTokenTailoring(context.Background(), req)
+
+	require.Equal(t, tailored, req.Messages)
 }
 
 // TestWithEnableTokenTailoring_SimpleMode tests simple token tailoring mode.
@@ -1169,17 +2753,17 @@ func TestWithEnableTokenTailoring_Disabled(t *testing.T) {
 func TestWithEnableTokenTailoring_UnknownModel(t *testing.T) {
 	// Capture the built Anthropic request.
 	var captured *anthropic.MessageNewParams
-	m := New("unknown-model-xyz", // Unknown model should fallback to default context window
+	m := New("unknown-model-xyz", // Unknown model should fallback to the 128000-token default context window
 		WithEnableTokenTailoring(true),
 		WithChatRequestCallback(func(ctx context.Context, req *anthropic.MessageNewParams) {
 			captured = req
 		}),
 	)
 
-	// Create many messages to trigger tailoring.
+	// Create messages large enough to trigger tailoring with the unknown-model fallback window.
 	messages := []model.Message{model.NewSystemMessage("You are a helpful assistant.")}
 	for i := 0; i < 50; i++ {
-		messages = append(messages, model.NewUserMessage(fmt.Sprintf("Message %d: %s", i, strings.Repeat("lorem ipsum ", 50))))
+		messages = append(messages, model.NewUserMessage(fmt.Sprintf("Message %d: %s", i, strings.Repeat("lorem ipsum ", 1000))))
 	}
 
 	req := &model.Request{Messages: messages}
@@ -1321,8 +2905,8 @@ func TestWithEnableTokenTailoring_ErrorInCountTokens(t *testing.T) {
 	require.NotNil(t, captured, "expected request callback to capture request")
 	// Tailoring succeeds but token counting fails, messages should be tailored.
 	require.Len(t, captured.Messages, 1, "expected tailored messages even when token counting fails, got %d", len(captured.Messages))
-	// MaxTokens should not be set when token counting fails.
-	require.Equal(t, int64(0), captured.MaxTokens, "expected MaxTokens to be 0 when token counting fails")
+	// MaxTokens defaults to 4096 when unset (Anthropic requires max_tokens >= 1).
+	require.Equal(t, int64(4096), captured.MaxTokens)
 }
 
 // zeroTokenCounter always returns 0 for testing edge cases.
@@ -1369,12 +2953,7 @@ func TestWithEnableTokenTailoring_RemainingTokensNegative(t *testing.T) {
 	}
 
 	require.NotNil(t, captured, "expected request callback to capture request")
-	// With maxInputTokens=1 and usedTokens=0 (zeroTokenCounter), remaining tokens
-	// should be positive, so MaxTokens should be set to at least the floor (256).
-	// The actual calculation: contextWindow - 0 - 512 - safetyMargin
-	// For claude-3-5-sonnet (200000): 200000 - 0 - 512 - 20000 = 179488
-	// So MaxTokens should be max(179488, 256) = 179488
-	require.Greater(t, captured.MaxTokens, int64(0), "expected MaxTokens to be set when sufficient tokens available")
+	require.Equal(t, int64(4096), captured.MaxTokens)
 }
 
 // TestWithEnableTokenTailoring_AutoSetMaxTokens tests automatic MaxTokens setting.
@@ -1403,8 +2982,22 @@ func TestWithEnableTokenTailoring_AutoSetMaxTokens(t *testing.T) {
 	}
 
 	require.NotNil(t, captured, "expected request callback to capture request")
-	// MaxTokens should be auto-set when not specified by user.
-	require.Greater(t, captured.MaxTokens, int64(0), "expected MaxTokens > 0")
+	// Anthropic requires max_tokens >= 1; apply framework default when unset.
+	require.Equal(t, int64(4096), captured.MaxTokens)
+}
+
+func TestBuildChatRequest_ClampsMaxTokensToModelCap(t *testing.T) {
+	m := New("claude-3-5-sonnet-20241022")
+	over := 64000
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("hi")},
+		GenerationConfig: model.GenerationConfig{
+			MaxTokens: &over,
+		},
+	}
+	chatReq, err := m.buildChatRequest(req)
+	require.NoError(t, err)
+	require.Equal(t, int64(8192), chatReq.MaxTokens)
 }
 
 // TestWithEnableTokenTailoring_UserSpecifiedMaxTokens tests user-specified MaxTokens is preserved.
@@ -1493,350 +3086,42 @@ func TestWithEnableTokenTailoring_EmptyMessages(t *testing.T) {
 // Prompt Cache Tests
 // ============================================================================
 
-// TestWithEnablePromptCache tests the WithEnablePromptCache option.
-func TestWithEnablePromptCache(t *testing.T) {
-	tests := []struct {
-		name     string
-		enabled  bool
-		expected bool
-	}{
-		{
-			name:     "enable prompt cache",
-			enabled:  true,
-			expected: true,
-		},
-		{
-			name:     "disable prompt cache",
-			enabled:  false,
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{}
-			WithEnablePromptCache(tt.enabled)(opts)
-			assert.Equal(t, tt.expected, opts.enablePromptCache)
-		})
-	}
-}
-
-// TestPromptCache_DefaultEnabled tests that prompt cache is enabled by default.
-func TestPromptCache_DefaultEnabled(t *testing.T) {
+// TestPromptCache_DefaultDisabled tests that prompt cache is disabled by default.
+func TestPromptCache_DefaultDisabled(t *testing.T) {
 	m := New("claude-3-5-sonnet")
-	assert.True(t, m.enablePromptCache, "prompt cache should be enabled by default")
-	assert.True(t, m.cacheSystemPrompt, "cache system prompt should be enabled by default")
-	assert.True(t, m.cacheTools, "cache tools should be enabled by default")
-	assert.Equal(t, 1024, m.minCacheableTokens, "min cacheable tokens should be 1024 by default")
-}
-
-// TestWithMinCacheableTokens tests the WithMinCacheableTokens option.
-func TestWithMinCacheableTokens(t *testing.T) {
-	tests := []struct {
-		name     string
-		tokens   int
-		expected int
-	}{
-		{
-			name:     "set valid tokens",
-			tokens:   2048,
-			expected: 2048,
-		},
-		{
-			name:     "set below minimum - should clamp to 1024",
-			tokens:   500,
-			expected: 1024,
-		},
-		{
-			name:     "set exactly 1024",
-			tokens:   1024,
-			expected: 1024,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{}
-			WithMinCacheableTokens(tt.tokens)(opts)
-			assert.Equal(t, tt.expected, opts.minCacheableTokens)
-		})
-	}
+	assert.False(t, m.cacheSystemPrompt, "cache system prompt should be disabled by default")
+	assert.False(t, m.cacheTools, "cache tools should be disabled by default")
+	assert.False(t, m.cacheMessages, "cache messages should be disabled by default")
 }
 
 // TestWithCacheSystemPrompt tests the WithCacheSystemPrompt option.
 func TestWithCacheSystemPrompt(t *testing.T) {
-	tests := []struct {
-		name     string
-		cache    bool
-		expected bool
-	}{
-		{
-			name:     "enable cache system prompt",
-			cache:    true,
-			expected: true,
-		},
-		{
-			name:     "disable cache system prompt",
-			cache:    false,
-			expected: false,
-		},
-	}
+	t.Run("enable cache system prompt", func(t *testing.T) {
+		opts := &options{}
+		WithCacheSystemPrompt(true)(opts)
+		assert.True(t, opts.cacheSystemPrompt)
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{}
-			WithCacheSystemPrompt(tt.cache)(opts)
-			assert.Equal(t, tt.expected, opts.cacheSystemPrompt)
-		})
-	}
+	t.Run("disable cache system prompt", func(t *testing.T) {
+		opts := &options{}
+		WithCacheSystemPrompt(false)(opts)
+		assert.False(t, opts.cacheSystemPrompt)
+	})
 }
 
 // TestWithCacheTools tests the WithCacheTools option.
 func TestWithCacheTools(t *testing.T) {
-	tests := []struct {
-		name     string
-		cache    bool
-		expected bool
-	}{
-		{
-			name:     "enable cache tools",
-			cache:    true,
-			expected: true,
-		},
-		{
-			name:     "disable cache tools",
-			cache:    false,
-			expected: false,
-		},
-	}
+	t.Run("enable cache tools", func(t *testing.T) {
+		opts := &options{}
+		WithCacheTools(true)(opts)
+		assert.True(t, opts.cacheTools)
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{}
-			WithCacheTools(tt.cache)(opts)
-			assert.Equal(t, tt.expected, opts.cacheTools)
-		})
-	}
-}
-
-// TestShouldEnableCache tests the shouldEnableCache method.
-func TestShouldEnableCache(t *testing.T) {
-	largeSystemContent := strings.Repeat("This is a large system prompt. ", 200) // ~6000 chars = ~1500 tokens
-
-	tests := []struct {
-		name     string
-		model    *Model
-		request  *model.Request
-		expected bool
-	}{
-		{
-			name:     "cache disabled - should return false",
-			model:    New("claude-3-5-sonnet", WithEnablePromptCache(false)),
-			request:  &model.Request{Messages: []model.Message{{Role: model.RoleSystem, Content: largeSystemContent}}},
-			expected: false,
-		},
-		{
-			name:     "small system prompt - should return false",
-			model:    New("claude-3-5-sonnet", WithEnablePromptCache(true)),
-			request:  &model.Request{Messages: []model.Message{{Role: model.RoleSystem, Content: "Short prompt"}}},
-			expected: false,
-		},
-		{
-			name:     "large system prompt - should return true",
-			model:    New("claude-3-5-sonnet", WithEnablePromptCache(true)),
-			request:  &model.Request{Messages: []model.Message{{Role: model.RoleSystem, Content: largeSystemContent}}},
-			expected: true,
-		},
-		{
-			name:     "cache system prompt disabled - should return false",
-			model:    New("claude-3-5-sonnet", WithEnablePromptCache(true), WithCacheSystemPrompt(false)),
-			request:  &model.Request{Messages: []model.Message{{Role: model.RoleSystem, Content: largeSystemContent}}},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.model.shouldEnableCache(tt.request)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-// TestShouldEnableCache_WithTools tests shouldEnableCache with tools.
-func TestShouldEnableCache_WithTools(t *testing.T) {
-	largeSystemContent := strings.Repeat("This is a large system prompt. ", 200)
-
-	toolMap := map[string]tool.Tool{
-		"calculator": stubTool{decl: &tool.Declaration{
-			Name:        "calculator",
-			Description: strings.Repeat("A calculator tool that performs math. ", 50),
-		}},
-	}
-
-	tests := []struct {
-		name     string
-		model    *Model
-		request  *model.Request
-		expected bool
-	}{
-		{
-			name:  "tools with cache enabled",
-			model: New("claude-3-5-sonnet", WithEnablePromptCache(true), WithCacheTools(true)),
-			request: &model.Request{
-				Messages: []model.Message{{Role: model.RoleSystem, Content: largeSystemContent}},
-				Tools:    toolMap,
-			},
-			expected: true,
-		},
-		{
-			name:  "tools with cache disabled",
-			model: New("claude-3-5-sonnet", WithEnablePromptCache(true), WithCacheTools(false)),
-			request: &model.Request{
-				Messages: []model.Message{{Role: model.RoleSystem, Content: largeSystemContent}},
-				Tools:    toolMap,
-			},
-			expected: true, // Still true because system prompt is large enough
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.model.shouldEnableCache(tt.request)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-// TestEstimateSystemTokens tests the estimateSystemTokens method.
-func TestEstimateSystemTokens(t *testing.T) {
-	m := New("claude-3-5-sonnet")
-
-	tests := []struct {
-		name      string
-		messages  []model.Message
-		minTokens int
-		maxTokens int
-	}{
-		{
-			name:      "empty messages",
-			messages:  []model.Message{},
-			minTokens: 0,
-			maxTokens: 0,
-		},
-		{
-			name: "no system messages",
-			messages: []model.Message{
-				{Role: model.RoleUser, Content: "Hello"},
-			},
-			minTokens: 0,
-			maxTokens: 0,
-		},
-		{
-			name: "system message with content",
-			messages: []model.Message{
-				{Role: model.RoleSystem, Content: "You are a helpful assistant"},
-			},
-			minTokens: 5, // ~28 chars / 4 = 7
-			maxTokens: 10,
-		},
-		{
-			name: "system message with content parts",
-			messages: []model.Message{
-				{Role: model.RoleSystem, ContentParts: []model.ContentPart{
-					{Type: model.ContentTypeText, Text: ptrString("Part 1 content")},
-					{Type: model.ContentTypeText, Text: ptrString("Part 2 content")},
-				}},
-			},
-			minTokens: 5,
-			maxTokens: 15,
-		},
-		{
-			name: "multiple system messages",
-			messages: []model.Message{
-				{Role: model.RoleSystem, Content: "System 1"},
-				{Role: model.RoleUser, Content: "User message"},
-				{Role: model.RoleSystem, Content: "System 2"},
-			},
-			minTokens: 3,
-			maxTokens: 10,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := m.estimateSystemTokens(tt.messages)
-			assert.GreaterOrEqual(t, result, tt.minTokens)
-			assert.LessOrEqual(t, result, tt.maxTokens)
-		})
-	}
-}
-
-// TestEstimateToolTokens tests the estimateToolTokens method.
-func TestEstimateToolTokens(t *testing.T) {
-	m := New("claude-3-5-sonnet")
-
-	tests := []struct {
-		name      string
-		tools     map[string]tool.Tool
-		minTokens int
-		maxTokens int
-	}{
-		{
-			name:      "empty tools",
-			tools:     nil,
-			minTokens: 0,
-			maxTokens: 0,
-		},
-		{
-			name: "single tool without schema",
-			tools: map[string]tool.Tool{
-				"calc": stubTool{decl: &tool.Declaration{
-					Name:        "calculator",
-					Description: "Performs calculations",
-				}},
-			},
-			minTokens: 5, // name + description / 4
-			maxTokens: 20,
-		},
-		{
-			name: "single tool with schema",
-			tools: map[string]tool.Tool{
-				"calc": stubTool{decl: &tool.Declaration{
-					Name:        "calculator",
-					Description: "Performs calculations",
-					InputSchema: &tool.Schema{Type: "object"},
-				}},
-			},
-			minTokens: 100, // Base overhead for schema
-			maxTokens: 150,
-		},
-		{
-			name: "multiple tools with schema",
-			tools: map[string]tool.Tool{
-				"calc": stubTool{decl: &tool.Declaration{
-					Name:        "calculator",
-					Description: "Performs calculations",
-					InputSchema: &tool.Schema{Type: "object"},
-				}},
-				"time": stubTool{decl: &tool.Declaration{
-					Name:        "get_time",
-					Description: "Gets current time",
-					InputSchema: &tool.Schema{Type: "object"},
-				}},
-			},
-			minTokens: 200,
-			maxTokens: 300,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := m.estimateToolTokens(tt.tools)
-			assert.GreaterOrEqual(t, result, tt.minTokens)
-			assert.LessOrEqual(t, result, tt.maxTokens)
-		})
-	}
+	t.Run("disable cache tools", func(t *testing.T) {
+		opts := &options{}
+		WithCacheTools(false)(opts)
+		assert.False(t, opts.cacheTools)
+	})
 }
 
 // TestApplyCacheControlToSystem tests the applyCacheControlToSystem method.
@@ -1876,21 +3161,11 @@ func TestApplyCacheControlToSystem(t *testing.T) {
 // TestApplyCacheControlToTools tests the applyCacheControlToTools method.
 func TestApplyCacheControlToTools(t *testing.T) {
 	m := New("claude-3-5-sonnet", WithCacheTools(true))
-	mNoCacheTools := New("claude-3-5-sonnet", WithCacheTools(false))
 
 	t.Run("empty tools", func(t *testing.T) {
 		tools := []anthropic.ToolUnionParam{}
 		result := m.applyCacheControlToTools(tools)
 		assert.Empty(t, result)
-	})
-
-	t.Run("cache tools disabled", func(t *testing.T) {
-		tools := []anthropic.ToolUnionParam{
-			{OfTool: &anthropic.ToolParam{Name: "calc"}},
-		}
-		result := mNoCacheTools.applyCacheControlToTools(tools)
-		// When cache is disabled, should return original without modification
-		assert.Len(t, result, 1)
 	})
 
 	t.Run("single tool", func(t *testing.T) {
@@ -1911,8 +3186,19 @@ func TestApplyCacheControlToTools(t *testing.T) {
 		}
 		result := m.applyCacheControlToTools(tools)
 		assert.Len(t, result, 3)
-		// Check that cache control is set on the last item
-		assert.NotNil(t, result[2].OfTool.CacheControl)
+		// Check that cache control is set on the last item only
+		assert.NotEmpty(t, result[2].OfTool.CacheControl.Type)
+		assert.Empty(t, result[0].OfTool.CacheControl.Type)
+		assert.Empty(t, result[1].OfTool.CacheControl.Type)
+	})
+
+	t.Run("does not modify original", func(t *testing.T) {
+		original := []anthropic.ToolUnionParam{
+			{OfTool: &anthropic.ToolParam{Name: "calc"}},
+		}
+		_ = m.applyCacheControlToTools(original)
+		// Original should not be modified
+		assert.Empty(t, original[0].OfTool.CacheControl.Type)
 	})
 }
 
@@ -1923,36 +3209,23 @@ func ptrString(s string) *string {
 
 // TestWithCacheMessages tests the WithCacheMessages option.
 func TestWithCacheMessages(t *testing.T) {
-	tests := []struct {
-		name     string
-		cache    bool
-		expected bool
-	}{
-		{
-			name:     "enable cache messages",
-			cache:    true,
-			expected: true,
-		},
-		{
-			name:     "disable cache messages",
-			cache:    false,
-			expected: false,
-		},
-	}
+	t.Run("enable cache messages", func(t *testing.T) {
+		opts := &options{}
+		WithCacheMessages(true)(opts)
+		assert.True(t, opts.cacheMessages)
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			opts := &options{}
-			WithCacheMessages(tt.cache)(opts)
-			assert.Equal(t, tt.expected, opts.cacheMessages)
-		})
-	}
+	t.Run("disable cache messages", func(t *testing.T) {
+		opts := &options{}
+		WithCacheMessages(false)(opts)
+		assert.False(t, opts.cacheMessages)
+	})
 }
 
-// TestCacheMessages_DefaultEnabled tests that cache messages is enabled by default.
-func TestCacheMessages_DefaultEnabled(t *testing.T) {
+// TestCacheMessages_DefaultDisabled tests that cache messages is disabled by default.
+func TestCacheMessages_DefaultDisabled(t *testing.T) {
 	m := New("claude-3-5-sonnet")
-	assert.True(t, m.cacheMessages, "cache messages should be enabled by default")
+	assert.False(t, m.cacheMessages, "cache messages should be disabled by default")
 }
 
 // TestFindLastAssistantMessageIndex tests the findLastAssistantMessageIndex method.
@@ -2059,77 +3332,10 @@ func TestApplyCacheControlToMessages(t *testing.T) {
 	})
 }
 
-// TestEstimateMessageTokens tests the estimateMessageTokens method.
-func TestEstimateMessageTokens(t *testing.T) {
-	m := New("claude-3-5-sonnet")
-
-	tests := []struct {
-		name      string
-		messages  []model.Message
-		minTokens int
-		maxTokens int
-	}{
-		{
-			name:      "empty messages",
-			messages:  []model.Message{},
-			minTokens: 0,
-			maxTokens: 0,
-		},
-		{
-			name: "only system messages - should return 0",
-			messages: []model.Message{
-				{Role: model.RoleSystem, Content: "System prompt"},
-			},
-			minTokens: 0,
-			maxTokens: 0,
-		},
-		{
-			name: "user message",
-			messages: []model.Message{
-				{Role: model.RoleUser, Content: "Hello, how are you?"},
-			},
-			minTokens: 3,
-			maxTokens: 10,
-		},
-		{
-			name: "mixed messages",
-			messages: []model.Message{
-				{Role: model.RoleSystem, Content: "System prompt"},
-				{Role: model.RoleUser, Content: "User message"},
-				{Role: model.RoleAssistant, Content: "Assistant response"},
-			},
-			minTokens: 5,
-			maxTokens: 20,
-		},
-		{
-			name: "message with content parts",
-			messages: []model.Message{
-				{Role: model.RoleUser, ContentParts: []model.ContentPart{
-					{Type: model.ContentTypeText, Text: ptrString("Part 1")},
-					{Type: model.ContentTypeText, Text: ptrString("Part 2")},
-				}},
-			},
-			minTokens: 2,
-			maxTokens: 10,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := m.estimateMessageTokens(tt.messages)
-			assert.GreaterOrEqual(t, result, tt.minTokens)
-			assert.LessOrEqual(t, result, tt.maxTokens)
-		})
-	}
-}
-
-// TestApplyOptimalCacheControl tests the applyOptimalCacheControl method.
-func TestApplyOptimalCacheControl(t *testing.T) {
-	largeSystemContent := strings.Repeat("This is a large system prompt. ", 200)
-
-	t.Run("cache at messages when multi-turn", func(t *testing.T) {
+// TestApplyCacheControl tests the applyCacheControl method with independent multi-breakpoint strategy.
+func TestApplyCacheControl(t *testing.T) {
+	t.Run("all breakpoints applied when multi-turn with tools", func(t *testing.T) {
 		m := New("claude-3-5-sonnet",
-			WithEnablePromptCache(true),
 			WithCacheMessages(true),
 			WithCacheTools(true),
 			WithCacheSystemPrompt(true),
@@ -2147,79 +3353,22 @@ func TestApplyOptimalCacheControl(t *testing.T) {
 			}},
 		}
 		systemPrompts := []anthropic.TextBlockParam{
-			{Text: largeSystemContent},
-		}
-		tools := []anthropic.ToolUnionParam{}
-
-		resultMsgs, resultSys, resultTools := m.applyOptimalCacheControl(messages, systemPrompts, tools)
-
-		// Should cache at assistant message (index 1)
-		assert.Len(t, resultMsgs, 3)
-		assert.NotNil(t, resultMsgs[1].Content[0].OfText.CacheControl)
-		// System prompts should not have cache control (messages take priority)
-		assert.Empty(t, resultSys[0].CacheControl.Type)
-		assert.Empty(t, resultTools)
-	})
-
-	t.Run("cache at tools when no multi-turn history", func(t *testing.T) {
-		m := New("claude-3-5-sonnet",
-			WithEnablePromptCache(true),
-			WithCacheMessages(true),
-			WithCacheTools(true),
-			WithCacheSystemPrompt(true),
-		)
-
-		messages := []anthropic.MessageParam{
-			{Role: "user", Content: []anthropic.ContentBlockParamUnion{
-				{OfText: &anthropic.TextBlockParam{Text: "Hello"}},
-			}},
-		}
-		systemPrompts := []anthropic.TextBlockParam{
-			{Text: largeSystemContent},
+			{Text: "You are a helpful assistant."},
 		}
 		tools := []anthropic.ToolUnionParam{
 			{OfTool: &anthropic.ToolParam{Name: "calc"}},
 		}
 
-		resultMsgs, resultSys, resultTools := m.applyOptimalCacheControl(messages, systemPrompts, tools)
+		resultSys, resultTools, resultMsgs := m.applyCacheControl(systemPrompts, tools, messages)
 
-		// Should cache at tools
-		assert.Len(t, resultMsgs, 1)
-		assert.Len(t, resultTools, 1)
-		assert.NotNil(t, resultTools[0].OfTool.CacheControl)
-		// System prompts should not have cache control (tools take priority)
-		assert.Empty(t, resultSys[0].CacheControl.Type)
+		// All three breakpoints should be set independently
+		assert.NotEmpty(t, resultSys[0].CacheControl.Type, "system should have cache control")
+		assert.NotNil(t, resultTools[0].OfTool.CacheControl, "tools should have cache control")
+		assert.NotNil(t, resultMsgs[1].Content[0].OfText.CacheControl, "assistant message should have cache control")
 	})
 
-	t.Run("cache at system when no tools and no multi-turn", func(t *testing.T) {
+	t.Run("system and tools cached even when messages disabled", func(t *testing.T) {
 		m := New("claude-3-5-sonnet",
-			WithEnablePromptCache(true),
-			WithCacheMessages(true),
-			WithCacheTools(true),
-			WithCacheSystemPrompt(true),
-		)
-
-		messages := []anthropic.MessageParam{
-			{Role: "user", Content: []anthropic.ContentBlockParamUnion{
-				{OfText: &anthropic.TextBlockParam{Text: "Hello"}},
-			}},
-		}
-		systemPrompts := []anthropic.TextBlockParam{
-			{Text: largeSystemContent},
-		}
-		tools := []anthropic.ToolUnionParam{}
-
-		resultMsgs, resultSys, resultTools := m.applyOptimalCacheControl(messages, systemPrompts, tools)
-
-		// Should cache at system
-		assert.Len(t, resultMsgs, 1)
-		assert.Empty(t, resultTools)
-		assert.NotEmpty(t, resultSys[0].CacheControl.Type)
-	})
-
-	t.Run("messages caching disabled - fallback to tools", func(t *testing.T) {
-		m := New("claude-3-5-sonnet",
-			WithEnablePromptCache(true),
 			WithCacheMessages(false),
 			WithCacheTools(true),
 			WithCacheSystemPrompt(true),
@@ -2237,72 +3386,71 @@ func TestApplyOptimalCacheControl(t *testing.T) {
 			}},
 		}
 		systemPrompts := []anthropic.TextBlockParam{
-			{Text: largeSystemContent},
+			{Text: "You are a helpful assistant."},
 		}
 		tools := []anthropic.ToolUnionParam{
 			{OfTool: &anthropic.ToolParam{Name: "calc"}},
 		}
 
-		resultMsgs, resultSys, resultTools := m.applyOptimalCacheControl(messages, systemPrompts, tools)
+		resultSys, resultTools, resultMsgs := m.applyCacheControl(systemPrompts, tools, messages)
 
-		// Should cache at tools (messages caching disabled)
-		assert.NotNil(t, resultTools[0].OfTool.CacheControl)
-		// Messages should not have cache control
-		for _, msg := range resultMsgs {
-			if msg.Role == "assistant" && len(msg.Content) > 0 && msg.Content[0].OfText != nil {
-				assert.Empty(t, msg.Content[0].OfText.CacheControl.Type)
-			}
-		}
-		// System should not have cache control (tools take priority)
-		assert.Empty(t, resultSys[0].CacheControl.Type)
+		// System and tools should have cache control
+		assert.NotEmpty(t, resultSys[0].CacheControl.Type, "system should have cache control")
+		assert.NotNil(t, resultTools[0].OfTool.CacheControl, "tools should have cache control")
+		// Messages should NOT have cache control
+		assert.Empty(t, resultMsgs[1].Content[0].OfText.CacheControl.Type, "assistant message should not have cache control")
 	})
-}
 
-// TestShouldEnableCache_WithMessages tests shouldEnableCache with message history.
-func TestShouldEnableCache_WithMessages(t *testing.T) {
-	// Need at least 1024 tokens, 1 token ≈ 4 chars, so need ~4100 chars
-	largeContent := strings.Repeat("This is a message with content. ", 150)
+	t.Run("only system when no tools and messages disabled", func(t *testing.T) {
+		m := New("claude-3-5-sonnet",
+			WithCacheMessages(false),
+			WithCacheTools(true),
+			WithCacheSystemPrompt(true),
+		)
 
-	tests := []struct {
-		name     string
-		model    *Model
-		request  *model.Request
-		expected bool
-	}{
-		{
-			name:  "multi-turn conversation with sufficient tokens",
-			model: New("claude-3-5-sonnet", WithEnablePromptCache(true), WithCacheMessages(true)),
-			request: &model.Request{
-				Messages: []model.Message{
-					{Role: model.RoleSystem, Content: largeContent},
-					{Role: model.RoleUser, Content: "Hello"},
-					{Role: model.RoleAssistant, Content: largeContent},
-					{Role: model.RoleUser, Content: "How are you?"},
-				},
-			},
-			expected: true,
-		},
-		{
-			name:  "multi-turn with messages caching disabled",
-			model: New("claude-3-5-sonnet", WithEnablePromptCache(true), WithCacheMessages(false), WithCacheSystemPrompt(true)),
-			request: &model.Request{
-				Messages: []model.Message{
-					{Role: model.RoleSystem, Content: largeContent},
-					{Role: model.RoleUser, Content: "Hello"},
-					{Role: model.RoleAssistant, Content: "Hi"},
-					{Role: model.RoleUser, Content: "How are you?"},
-				},
-			},
-			expected: true, // Still true because system prompt is large enough (>1024 tokens)
-		},
-	}
+		messages := []anthropic.MessageParam{
+			{Role: "user", Content: []anthropic.ContentBlockParamUnion{
+				{OfText: &anthropic.TextBlockParam{Text: "Hello"}},
+			}},
+		}
+		systemPrompts := []anthropic.TextBlockParam{
+			{Text: "You are a helpful assistant."},
+		}
+		tools := []anthropic.ToolUnionParam{}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.model.shouldEnableCache(tt.request)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
+		resultSys, resultTools, _ := m.applyCacheControl(systemPrompts, tools, messages)
+
+		assert.NotEmpty(t, resultSys[0].CacheControl.Type, "system should have cache control")
+		assert.Empty(t, resultTools)
+	})
+
+	t.Run("no breakpoints when all caching disabled", func(t *testing.T) {
+		m := New("claude-3-5-sonnet")
+
+		messages := []anthropic.MessageParam{
+			{Role: "user", Content: []anthropic.ContentBlockParamUnion{
+				{OfText: &anthropic.TextBlockParam{Text: "Hello"}},
+			}},
+			{Role: "assistant", Content: []anthropic.ContentBlockParamUnion{
+				{OfText: &anthropic.TextBlockParam{Text: "Hi"}},
+			}},
+			{Role: "user", Content: []anthropic.ContentBlockParamUnion{
+				{OfText: &anthropic.TextBlockParam{Text: "Bye"}},
+			}},
+		}
+		systemPrompts := []anthropic.TextBlockParam{
+			{Text: "System"},
+		}
+		tools := []anthropic.ToolUnionParam{
+			{OfTool: &anthropic.ToolParam{Name: "calc"}},
+		}
+
+		resultSys, resultTools, resultMsgs := m.applyCacheControl(systemPrompts, tools, messages)
+
+		assert.Empty(t, resultSys[0].CacheControl.Type, "system should not have cache control")
+		assert.Empty(t, resultTools[0].OfTool.CacheControl.Type, "tools should not have cache control")
+		assert.Empty(t, resultMsgs[1].Content[0].OfText.CacheControl.Type, "messages should not have cache control")
+	})
 }
 
 // TestIntegration_AutoOptimalCacheStrategy tests the full integration of auto cache optimization.
@@ -2336,7 +3484,8 @@ func TestIntegration_AutoOptimalCacheStrategy(t *testing.T) {
 	}
 
 	m := New("claude-3-5-sonnet",
-		WithEnablePromptCache(true), // Just one switch like OpenAI
+		WithCacheSystemPrompt(true),
+		WithCacheMessages(true),
 		WithHTTPClientOptions(),
 		WithChatRequestCallback(func(ctx context.Context, req *anthropic.MessageNewParams) {
 			captured = req
@@ -2362,8 +3511,10 @@ func TestIntegration_AutoOptimalCacheStrategy(t *testing.T) {
 
 	require.NotNil(t, captured, "expected request callback to capture request")
 
-	// Verify that cache control was automatically applied
-	// With multi-turn, it should be on the last assistant message
+	// Verify that cache control was applied to system prompt
+	assert.NotEmpty(t, captured.System[0].CacheControl.Type, "expected cache control on system prompt")
+
+	// Verify that cache control was applied to assistant message
 	foundCacheControl := false
 	for _, msg := range captured.Messages {
 		if msg.Role == "assistant" {
@@ -2376,4 +3527,159 @@ func TestIntegration_AutoOptimalCacheStrategy(t *testing.T) {
 		}
 	}
 	assert.True(t, foundCacheControl, "expected cache control to be automatically applied to assistant message")
+}
+
+// TestChatRequestCallbackSynchronous verifies that
+// chatRequestCallback is invoked synchronously inside
+// GenerateContent, before the response goroutine starts.
+func TestChatRequestCallbackSynchronous(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming", stream: false},
+		{name: "streaming", stream: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := model.DefaultNewHTTPClient
+			t.Cleanup(func() {
+				model.DefaultNewHTTPClient = orig
+			})
+			if tt.stream {
+				sse := strings.Join([]string{
+					"event: message_start",
+					`data: {"type":"message_start",` +
+						`"message":{"id":"m1",` +
+						`"type":"message",` +
+						`"role":"assistant",` +
+						`"model":"claude","content":[]}}`,
+					"",
+					"event: content_block_start",
+					`data: {"type":` +
+						`"content_block_start",` +
+						`"index":0,"content_block":` +
+						`{"type":"text","text":""}}`,
+					"",
+					"event: content_block_delta",
+					`data: {"type":` +
+						`"content_block_delta",` +
+						`"index":0,"delta":` +
+						`{"type":"text_delta",` +
+						`"text":"hi"}}`,
+					"",
+					"event: content_block_stop",
+					`data: {"type":` +
+						`"content_block_stop","index":0}`,
+					"",
+					"event: message_delta",
+					`data: {"type":"message_delta",` +
+						`"delta":{"stop_reason":` +
+						`"end_turn","stop_sequence":""},` +
+						`"usage":{` +
+						`"cache_creation_input_tokens":0,` +
+						`"cache_read_input_tokens":0,` +
+						`"input_tokens":0,` +
+						`"output_tokens":0,` +
+						`"server_tool_use":` +
+						`{"web_search_requests":0}}}`,
+					"",
+					"event: message_stop",
+					`data: {"type":"message_stop"}`,
+					"",
+				}, "\n")
+				model.DefaultNewHTTPClient = func(
+					_ ...HTTPClientOption,
+				) model.HTTPClient {
+					return &http.Client{
+						Transport: rtFunc(
+							func(_ *http.Request,
+							) (*http.Response, error) {
+								h := make(http.Header)
+								h.Set("Content-Type",
+									"text/event-stream")
+								return &http.Response{
+									StatusCode: 200,
+									Header:     h,
+									Body: io.NopCloser(
+										strings.NewReader(sse)),
+								}, nil
+							}),
+					}
+				}
+			} else {
+				body := `{"id":"m1","model":"claude",` +
+					`"role":"assistant",` +
+					`"stop_reason":"end_turn",` +
+					`"stop_sequence":"",` +
+					`"type":"message",` +
+					`"usage":{` +
+					`"cache_creation_input_tokens":0,` +
+					`"cache_read_input_tokens":0,` +
+					`"input_tokens":1,` +
+					`"output_tokens":1,` +
+					`"server_tool_use":` +
+					`{"web_search_requests":0}},` +
+					`"content":[{"type":"text",` +
+					`"text":"hi"}]}`
+				model.DefaultNewHTTPClient = func(
+					_ ...HTTPClientOption,
+				) model.HTTPClient {
+					return &http.Client{
+						Transport: rtFunc(
+							func(_ *http.Request,
+							) (*http.Response, error) {
+								h := make(http.Header)
+								h.Set("Content-Type",
+									"application/json")
+								return &http.Response{
+									StatusCode: 200,
+									Header:     h,
+									Body: io.NopCloser(
+										strings.NewReader(body)),
+								}, nil
+							}),
+					}
+				}
+			}
+
+			var callCount int64
+			m := New("claude-test",
+				WithHTTPClientOptions(),
+				WithChatRequestCallback(
+					func(_ context.Context,
+						_ *anthropic.MessageNewParams,
+					) {
+						callCount++
+					}),
+			)
+
+			req := &model.Request{
+				Messages: []model.Message{
+					model.NewUserMessage("hi"),
+				},
+				GenerationConfig: model.GenerationConfig{
+					Stream: tt.stream,
+				},
+			}
+
+			ch, err := m.GenerateContent(
+				context.Background(), req)
+			require.NoError(t, err)
+
+			// Callback must have fired synchronously
+			// before GenerateContent returned.
+			assert.Equal(t, int64(1), callCount,
+				"callback must execute exactly once "+
+					"before GenerateContent returns")
+
+			// Drain the channel to avoid goroutine leak.
+			for range ch {
+			}
+
+			// Confirm no extra invocations after drain.
+			assert.Equal(t, int64(1), callCount,
+				"callback must not be called more than once")
+		})
+	}
 }

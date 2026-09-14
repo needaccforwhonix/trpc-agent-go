@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spaolacci/murmur3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -91,6 +90,77 @@ func TestWithEventTime(t *testing.T) {
 	}
 }
 
+func TestWithGetSessionEventPage(t *testing.T) {
+	option := WithGetSessionEventPage(20, 50)
+	opts := &Options{}
+	option(opts)
+
+	require.NotNil(t, opts.EventPage)
+	assert.Equal(t, 20, opts.EventPage.Offset)
+	assert.Equal(t, 50, opts.EventPage.Limit)
+}
+
+func TestValidateGetSessionOptions(t *testing.T) {
+	t.Run("no page", func(t *testing.T) {
+		err := ValidateGetSessionOptions(&Options{}, false)
+		require.NoError(t, err)
+	})
+
+	t.Run("unsupported backend", func(t *testing.T) {
+		err := ValidateGetSessionOptions(&Options{
+			EventPage: &EventPage{Offset: 0, Limit: 10},
+		}, false)
+		require.ErrorIs(t, err, ErrEventPageUnsupported)
+	})
+
+	t.Run("invalid page", func(t *testing.T) {
+		err := ValidateGetSessionOptions(&Options{
+			EventPage: &EventPage{Offset: -1, Limit: 0},
+		}, true)
+		require.ErrorIs(t, err, ErrInvalidEventPage)
+	})
+
+	t.Run("conflicts with event filters", func(t *testing.T) {
+		err := ValidateGetSessionOptions(&Options{
+			EventNum:  5,
+			EventPage: &EventPage{Offset: 0, Limit: 10},
+		}, true)
+		require.ErrorIs(t, err, ErrEventPageConflictsWithEventFilters)
+	})
+
+	t.Run("valid page", func(t *testing.T) {
+		err := ValidateGetSessionOptions(&Options{
+			EventPage: &EventPage{Offset: 0, Limit: 10},
+		}, true)
+		require.NoError(t, err)
+	})
+}
+
+func TestValidateListSessionsOptions(t *testing.T) {
+	err := ValidateListSessionsOptions(&Options{
+		EventPage: &EventPage{Offset: 0, Limit: 10},
+	})
+	require.ErrorIs(t, err, ErrEventPageOnlyForGetSession)
+
+	err = ValidateListSessionsOptions(&Options{
+		ListSessionPage: &ListSessionPage{Offset: -1, Limit: 10},
+	})
+	require.ErrorIs(t, err, ErrInvalidListSessionPage)
+
+	err = ValidateListSessionsOptions(&Options{
+		ListSessionPage: &ListSessionPage{Offset: 0, Limit: 0},
+	})
+	require.ErrorIs(t, err, ErrInvalidListSessionPage)
+
+	err = ValidateListSessionsOptions(&Options{
+		ListSessionPage: &ListSessionPage{Offset: 0, Limit: 10},
+	})
+	require.NoError(t, err)
+
+	err = ValidateListSessionsOptions(&Options{})
+	require.NoError(t, err)
+}
+
 func TestWithSummaryFilterKey(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -118,6 +188,255 @@ func TestWithSummaryFilterKey(t *testing.T) {
 			assert.Equal(t, tt.filterKey, opts.FilterKey)
 		})
 	}
+}
+
+func TestSummaryCutoffTimeAndClone(t *testing.T) {
+	updatedAt := time.Date(2025, 1, 2, 10, 0, 0, 0, time.UTC)
+	cutoff := updatedAt.Add(-time.Minute)
+
+	t.Run("legacy summary falls back to updated time", func(t *testing.T) {
+		sum := &Summary{Summary: "legacy", UpdatedAt: updatedAt}
+		assert.True(t, sum.CutoffTime().Equal(updatedAt))
+	})
+
+	t.Run("boundary cutoff wins over updated time", func(t *testing.T) {
+		sum := &Summary{
+			Summary:   "bounded",
+			UpdatedAt: updatedAt,
+			Boundary: NewSummaryBoundaryWithEventID(
+				"branch",
+				cutoff,
+				"event-1",
+			),
+		}
+		assert.True(t, sum.CutoffTime().Equal(cutoff))
+		assert.Equal(t, SummaryBoundaryVersion, sum.Boundary.Version)
+		assert.Equal(t, "event-1", sum.CutoffBoundary().LastEventID)
+	})
+
+	t.Run("clone deep copies mutable fields", func(t *testing.T) {
+		sum := &Summary{
+			Summary: "bounded",
+			Topics:  []string{"topic-a"},
+			Boundary: NewSummaryBoundary(
+				"branch",
+				cutoff,
+			),
+		}
+		cloned := sum.Clone()
+		require.NotNil(t, cloned)
+
+		sum.Topics[0] = "changed"
+		sum.Boundary.FilterKey = "other"
+		sum.Boundary.LastEventID = "changed"
+
+		assert.Equal(t, "topic-a", cloned.Topics[0])
+		assert.Equal(t, "branch", cloned.Boundary.FilterKey)
+		assert.Empty(t, cloned.Boundary.LastEventID)
+	})
+
+	t.Run("clone deep copies empty topics backing array", func(t *testing.T) {
+		sum := &Summary{
+			Summary: "bounded",
+			Topics:  make([]string, 0, 1),
+		}
+		cloned := sum.Clone()
+		require.NotNil(t, cloned)
+
+		sum.Topics = append(sum.Topics, "original")
+		cloned.Topics = append(cloned.Topics, "clone")
+
+		assert.Equal(t, "original", sum.Topics[0])
+		assert.Equal(t, "clone", cloned.Topics[0])
+	})
+}
+
+func TestSummaryPositionalLiteralCompatibility(t *testing.T) {
+	updatedAt := time.Date(2025, 1, 2, 10, 0, 0, 0, time.UTC)
+	sum := Summary{
+		"summary",
+		[]string{"topic"},
+		updatedAt,
+		NewSummaryBoundary("branch", updatedAt),
+	}
+
+	require.Equal(t, "summary", sum.Summary)
+	require.Equal(t, []string{"topic"}, sum.Topics)
+	require.Equal(t, updatedAt, sum.UpdatedAt)
+	require.Equal(t, "branch", sum.Boundary.FilterKey)
+}
+
+func TestSummaryPrefixCutoff(t *testing.T) {
+	base := time.Date(2025, 1, 2, 10, 0, 0, 0, time.UTC)
+
+	t.Run("uses earliest matching cutoff", func(t *testing.T) {
+		cutoff, ok := SummaryPrefixCutoff(
+			map[string]*Summary{
+				"root/a": {
+					Summary: "summary a",
+					Boundary: NewSummaryBoundary(
+						"root/a",
+						base,
+					),
+				},
+				"root/b": {
+					Summary: "summary b",
+					Boundary: NewSummaryBoundary(
+						"root/b",
+						base.Add(time.Minute),
+					),
+				},
+				"rooted/c": {
+					Summary: "summary c",
+					Boundary: NewSummaryBoundary(
+						"rooted/c",
+						base.Add(-time.Hour),
+					),
+				},
+			},
+			"root",
+		)
+
+		require.True(t, ok)
+		assert.True(t, cutoff.Equal(base))
+	})
+
+	t.Run("returns zero cutoff when metadata is missing", func(t *testing.T) {
+		cutoff, ok := SummaryPrefixCutoff(
+			map[string]*Summary{
+				"root/a": {
+					Summary: "summary a",
+					Boundary: NewSummaryBoundary(
+						"root/a",
+						base,
+					),
+				},
+				"root/b": {
+					Summary: "summary b",
+				},
+			},
+			"root",
+		)
+
+		require.True(t, ok)
+		assert.True(t, cutoff.IsZero())
+	})
+
+	t.Run("reports no match", func(t *testing.T) {
+		cutoff, ok := SummaryPrefixCutoff(
+			map[string]*Summary{
+				"other": {
+					Summary: "summary",
+					Boundary: NewSummaryBoundary(
+						"other",
+						base,
+					),
+				},
+			},
+			"root",
+		)
+
+		assert.False(t, ok)
+		assert.True(t, cutoff.IsZero())
+	})
+
+	t.Run("ignores whitespace-only summaries", func(t *testing.T) {
+		cutoff, ok := SummaryPrefixCutoff(
+			map[string]*Summary{
+				"root/a": {
+					Summary:   " \t\n",
+					UpdatedAt: base,
+				},
+			},
+			"root",
+		)
+
+		assert.False(t, ok)
+		assert.True(t, cutoff.IsZero())
+	})
+
+	t.Run("clears ambiguous event id for tied prefix cutoff", func(t *testing.T) {
+		boundary, ok := SummaryPrefixBoundary(
+			map[string]*Summary{
+				"root/a": {
+					Summary: "summary a",
+					Boundary: NewSummaryBoundaryWithEventID(
+						"root/a",
+						base,
+						"event-a",
+					),
+				},
+				"root/b": {
+					Summary: "summary b",
+					Boundary: NewSummaryBoundaryWithEventID(
+						"root/b",
+						base,
+						"event-b",
+					),
+				},
+			},
+			"root",
+		)
+
+		require.True(t, ok)
+		require.NotNil(t, boundary)
+		assert.True(t, boundary.CutoffTime().Equal(base))
+		assert.Empty(t, boundary.LastEventID)
+	})
+
+	t.Run("clears branch event id for single prefix match", func(t *testing.T) {
+		boundary, ok := SummaryPrefixBoundary(
+			map[string]*Summary{
+				"root/a": {
+					Summary: "summary a",
+					Boundary: NewSummaryBoundaryWithEventID(
+						"root/a",
+						base,
+						"event-a",
+					),
+				},
+			},
+			"root",
+		)
+
+		require.True(t, ok)
+		require.NotNil(t, boundary)
+		assert.True(t, boundary.CutoffTime().Equal(base))
+		assert.Empty(t, boundary.LastEventID)
+	})
+}
+
+func TestSummaryBoundaryJSONCompatibility(t *testing.T) {
+	cutoff := time.Date(2025, 1, 2, 10, 0, 0, 0, time.UTC)
+
+	t.Run("round trip boundary", func(t *testing.T) {
+		sum := &Summary{
+			Summary: "bounded",
+			Boundary: NewSummaryBoundaryWithEventID(
+				"branch",
+				cutoff,
+				"event-1",
+			),
+		}
+		raw, err := json.Marshal(sum)
+		require.NoError(t, err)
+
+		var decoded Summary
+		require.NoError(t, json.Unmarshal(raw, &decoded))
+		require.NotNil(t, decoded.Boundary)
+		assert.Equal(t, "branch", decoded.Boundary.FilterKey)
+		assert.Equal(t, "event-1", decoded.Boundary.LastEventID)
+		assert.True(t, decoded.CutoffTime().Equal(cutoff))
+	})
+
+	t.Run("old summary falls back to updated time", func(t *testing.T) {
+		raw := []byte(`{"summary":"legacy","updated_at":"2025-01-02T10:00:00Z"}`)
+
+		var decoded Summary
+		require.NoError(t, json.Unmarshal(raw, &decoded))
+		require.Nil(t, decoded.Boundary)
+		assert.True(t, decoded.CutoffTime().Equal(cutoff))
+	})
 }
 
 func TestKey_CheckSessionKey(t *testing.T) {
@@ -1279,6 +1598,31 @@ func TestSession_SnapshotState_NilStateMap(t *testing.T) {
 	assert.Nil(t, snap)
 }
 
+func TestSession_HasStateKeyWithPrefix(t *testing.T) {
+	t.Run("nil session", func(t *testing.T) {
+		var sess *Session
+		assert.False(t, sess.HasStateKeyWithPrefix("x:"))
+	})
+
+	t.Run("empty prefix", func(t *testing.T) {
+		sess := NewSession("app", "user", "sid")
+		assert.False(t, sess.HasStateKeyWithPrefix(""))
+		assert.False(t, sess.HasStateKeyWithPrefix(" "))
+	})
+
+	t.Run("prefix match requires non-empty value", func(t *testing.T) {
+		sess := NewSession("app", "user", "sid")
+		sess.SetState("foo:bar", []byte("1"))
+		sess.SetState("foo:nil", nil)
+		sess.SetState("foo:empty", []byte{})
+
+		assert.True(t, sess.HasStateKeyWithPrefix("foo:"))
+		assert.False(t, sess.HasStateKeyWithPrefix("foo:nil"))
+		assert.False(t, sess.HasStateKeyWithPrefix("foo:empty"))
+		assert.False(t, sess.HasStateKeyWithPrefix("missing:"))
+	})
+}
+
 func TestUpdateUserSession(t *testing.T) {
 	now := time.Now()
 	baseTime := now.Add(-5 * time.Minute)
@@ -1814,6 +2158,34 @@ func TestSession_Clone_Concurrent(t *testing.T) {
 	wg.Wait()
 }
 
+func TestSession_Clone_ConcurrentUpdateUserSession(t *testing.T) {
+	sess := NewSession("app", "user", "session")
+	updatedAt := sess.UpdatedAt
+	ev := &event.Event{}
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			sess.Clone()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			sess.UpdateUserSession(ev)
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	assert.True(t, sess.UpdatedAt.After(updatedAt))
+}
+
 func TestNewSession(t *testing.T) {
 	fixedTime := time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC)
 
@@ -2078,7 +2450,7 @@ func TestNewSession(t *testing.T) {
 
 			// Test that Hash is computed correctly
 			expectedHashKey := fmt.Sprintf("%s:%s:%s", tt.appName, tt.userID, tt.sessionID)
-			expectedHash := int(murmur3.Sum32([]byte(expectedHashKey)))
+			expectedHash := HashString(expectedHashKey)
 			if got.Hash != expectedHash {
 				t.Errorf("NewSession() Hash = %v, want %v", got.Hash, expectedHash)
 			}
@@ -2108,4 +2480,318 @@ func TestNewSession_OptionOrder(t *testing.T) {
 	if !sess.CreatedAt.Equal(secondTime) {
 		t.Errorf("NewSession() option order: CreatedAt = %v, want %v (last option should win)", sess.CreatedAt, secondTime)
 	}
+}
+
+// TestSession_Clone_ServiceMeta tests that ServiceMeta is properly deep copied during Clone.
+func TestSession_Clone_ServiceMeta(t *testing.T) {
+	tests := []struct {
+		name           string
+		setupSession   func() *Session
+		expectNilMeta  bool
+		expectedValues map[string]string
+	}{
+		{
+			name: "session with ServiceMeta populated",
+			setupSession: func() *Session {
+				return &Session{
+					ID:      "session-with-meta",
+					AppName: "test-app",
+					UserID:  "user-123",
+					ServiceMeta: map[string]string{
+						"version":    "v2",
+						"storage":    "hashidx",
+						"routingKey": "abc123",
+					},
+					State:     StateMap{},
+					Events:    []event.Event{},
+					Summaries: map[string]*Summary{},
+				}
+			},
+			expectNilMeta: false,
+			expectedValues: map[string]string{
+				"version":    "v2",
+				"storage":    "hashidx",
+				"routingKey": "abc123",
+			},
+		},
+		{
+			name: "session with nil ServiceMeta",
+			setupSession: func() *Session {
+				return &Session{
+					ID:          "session-nil-meta",
+					AppName:     "test-app",
+					UserID:      "user-123",
+					ServiceMeta: nil,
+					State:       StateMap{},
+					Events:      []event.Event{},
+					Summaries:   map[string]*Summary{},
+				}
+			},
+			expectNilMeta:  true,
+			expectedValues: nil,
+		},
+		{
+			name: "session with empty ServiceMeta",
+			setupSession: func() *Session {
+				return &Session{
+					ID:          "session-empty-meta",
+					AppName:     "test-app",
+					UserID:      "user-123",
+					ServiceMeta: map[string]string{},
+					State:       StateMap{},
+					Events:      []event.Event{},
+					Summaries:   map[string]*Summary{},
+				}
+			},
+			expectNilMeta:  false,
+			expectedValues: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := tt.setupSession()
+			cloned := original.Clone()
+
+			// Check if ServiceMeta is nil as expected
+			if tt.expectNilMeta {
+				if cloned.ServiceMeta != nil {
+					t.Errorf("Clone() ServiceMeta = %v, want nil", cloned.ServiceMeta)
+				}
+				return
+			}
+
+			// Verify ServiceMeta is a different map instance (deep copy)
+			if (cloned.ServiceMeta == nil) != (original.ServiceMeta == nil) {
+				t.Error("Clone() ServiceMeta nil status mismatch")
+			}
+			if cloned.ServiceMeta != nil && original.ServiceMeta != nil {
+				// Check if they point to the same underlying map
+				if len(cloned.ServiceMeta) == len(original.ServiceMeta) {
+					// Modify cloned and check if original changes
+					cloned.ServiceMeta["__test_key__"] = "test"
+					if _, exists := original.ServiceMeta["__test_key__"]; exists {
+						t.Error("Clone() ServiceMeta should be a different map instance")
+					}
+					delete(cloned.ServiceMeta, "__test_key__")
+				}
+			}
+
+			// Verify content equality
+			if len(cloned.ServiceMeta) != len(tt.expectedValues) {
+				t.Errorf("Clone() ServiceMeta length = %v, want %v", len(cloned.ServiceMeta), len(tt.expectedValues))
+			}
+
+			for k, expectedVal := range tt.expectedValues {
+				if clonedVal, ok := cloned.ServiceMeta[k]; !ok {
+					t.Errorf("Clone() ServiceMeta missing key %s", k)
+				} else if clonedVal != expectedVal {
+					t.Errorf("Clone() ServiceMeta[%s] = %v, want %v", k, clonedVal, expectedVal)
+				}
+			}
+
+			// Test deep copy by modifying clone
+			if len(cloned.ServiceMeta) > 0 {
+				for k := range cloned.ServiceMeta {
+					originalVal := original.ServiceMeta[k]
+					cloned.ServiceMeta[k] = "modified"
+
+					// Original should remain unchanged
+					if original.ServiceMeta[k] != originalVal {
+						t.Errorf("Clone() ServiceMeta are not deep copied - modifying clone affected original at key %s", k)
+					}
+					break // Only need to test one key
+				}
+			}
+		})
+	}
+}
+
+func TestSession_Clone_WithTracksAndNilSummary(t *testing.T) {
+	original := &Session{
+		ID:      "session-tracks",
+		AppName: "app",
+		UserID:  "user",
+		Tracks: map[Track]*TrackEvents{
+			"track-empty": {
+				Track:  "track-empty",
+				Events: nil,
+			},
+			"track-data": {
+				Track: "track-data",
+				Events: []TrackEvent{
+					{Track: "track-data", Payload: json.RawMessage(`"payload"`), Timestamp: time.Now()},
+				},
+			},
+		},
+		Summaries: map[string]*Summary{
+			"empty": nil,
+			"full":  {Summary: "copied"},
+		},
+		State: StateMap{},
+	}
+
+	cloned := original.Clone()
+	require.NotNil(t, cloned)
+	require.NotNil(t, cloned.Tracks)
+	require.Contains(t, cloned.Tracks, Track("track-empty"))
+	require.Contains(t, cloned.Tracks, Track("track-data"))
+	assert.Nil(t, cloned.Summaries["empty"])
+	require.NotNil(t, cloned.Summaries["full"])
+	assert.Equal(t, "copied", cloned.Summaries["full"].Summary)
+}
+
+func TestSession_HasStateKeyWithPrefix_EmptyStateMap(t *testing.T) {
+	sess := &Session{State: StateMap{}}
+	assert.False(t, sess.HasStateKeyWithPrefix("foo:"))
+}
+
+func TestApplyEventStateDelta_InitializesStateAndCopiesNilValue(t *testing.T) {
+	sess := &Session{}
+	ev := createTestEvent(model.RoleUser, "test", time.Now(), StateMap{"key": nil})
+
+	sess.ApplyEventStateDelta(ev)
+
+	require.NotNil(t, sess.State)
+	value, ok := sess.State["key"]
+	require.True(t, ok)
+	assert.Nil(t, value)
+}
+
+func TestWithListSessionOnlyMeta(t *testing.T) {
+	opt := &Options{}
+	WithListSessionOnlyMeta()(opt)
+	assert.True(t, opt.ListSessionOnlyMeta)
+}
+
+func TestWithListSessionPage(t *testing.T) {
+	opt := &Options{}
+	WithListSessionPage(20, 50)(opt)
+	require.NotNil(t, opt.ListSessionPage)
+	assert.Equal(t, 20, opt.ListSessionPage.Offset)
+	assert.Equal(t, 50, opt.ListSessionPage.Limit)
+}
+
+// TestSession_SnapshotTracksState tests the SnapshotTracksState method.
+func TestSession_SnapshotTracksState(t *testing.T) {
+	tests := []struct {
+		name        string
+		setupState  func() StateMap
+		wantNil     bool
+		wantContent []byte
+	}{
+		{
+			name: "returns nil when State is nil",
+			setupState: func() StateMap {
+				return nil
+			},
+			wantNil: true,
+		},
+		{
+			name: "returns nil when tracks key not present",
+			setupState: func() StateMap {
+				return StateMap{
+					"otherKey": []byte("some value"),
+				}
+			},
+			wantNil: true,
+		},
+		{
+			name: "returns nil when tracks key is empty slice",
+			setupState: func() StateMap {
+				return StateMap{
+					tracksStateKey: []byte{},
+				}
+			},
+			wantNil: true,
+		},
+		{
+			name: "returns copy of tracks state",
+			setupState: func() StateMap {
+				return StateMap{
+					tracksStateKey: []byte(`["track1","track2"]`),
+				}
+			},
+			wantNil:     false,
+			wantContent: []byte(`["track1","track2"]`),
+		},
+		{
+			name: "returns copy not reference",
+			setupState: func() StateMap {
+				return StateMap{
+					tracksStateKey: []byte(`["alpha","beta"]`),
+				}
+			},
+			wantNil:     false,
+			wantContent: []byte(`["alpha","beta"]`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &Session{
+				ID:      "test-session",
+				AppName: "test-app",
+				UserID:  "user-123",
+				State:   tt.setupState(),
+			}
+
+			got := sess.SnapshotTracksState()
+
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("SnapshotTracksState() = %v, want nil", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Fatal("SnapshotTracksState() = nil, want non-nil")
+			}
+
+			// Verify content
+			if !bytes.Equal(got, tt.wantContent) {
+				t.Errorf("SnapshotTracksState() = %v, want %v", got, tt.wantContent)
+			}
+
+			// Verify it's a copy (modifying returned bytes doesn't affect original)
+			originalState := tt.setupState()
+			originalValue := originalState[tracksStateKey]
+			got[0] = 'X' // Modify first byte
+
+			if !bytes.Equal(sess.State[tracksStateKey], originalValue) {
+				t.Error("SnapshotTracksState() returned slice that shares underlying array with State")
+			}
+		})
+	}
+}
+
+// TestSession_SnapshotTracksState_Concurrent tests concurrent access to SnapshotTracksState.
+func TestSession_SnapshotTracksState_Concurrent(t *testing.T) {
+	sess := &Session{
+		ID:      "concurrent-track-session",
+		AppName: "test-app",
+		UserID:  "user-123",
+		State: StateMap{
+			tracksStateKey: []byte(`["track1","track2","track3"]`),
+		},
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := sess.SnapshotTracksState()
+			if result == nil {
+				t.Error("SnapshotTracksState() returned nil")
+				return
+			}
+			expected := []byte(`["track1","track2","track3"]`)
+			if !bytes.Equal(result, expected) {
+				t.Errorf("SnapshotTracksState() = %v, want %v", result, expected)
+			}
+		}()
+	}
+	wg.Wait()
 }

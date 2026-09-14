@@ -56,11 +56,15 @@ func NewSelectDocsTool(repo skill.Repository) *SelectDocsTool {
 func (t *SelectDocsTool) Declaration() *tool.Declaration {
 	return &tool.Declaration{
 		Name: selectDocsToolName,
-		Description: "Select docs for a skill. " +
-			"Prefer selecting only needed docs; " +
-			"avoid include_all_docs unless needed. " +
-			"Use mode=add to append, " +
-			"replace to overwrite, or clear to remove.",
+		Description: "Update the current selected-doc set for a loaded skill. " +
+			"Select all docs already known to be needed in one call. " +
+			"Use mode=add to preserve the current selection and append docs. " +
+			"Use mode=replace to set the complete selection. Omitting mode " +
+			"defaults to replace; if a non-enum value reaches the runtime, " +
+			"it also falls back to replace for backward compatibility. " +
+			"In either case, docs absent from the call are removed. " +
+			"Use mode=clear to remove the selection. " +
+			"Avoid include_all_docs unless needed.",
 		InputSchema: &tool.Schema{
 			Type:        "object",
 			Description: "Select docs input",
@@ -70,23 +74,33 @@ func (t *SelectDocsTool) Declaration() *tool.Declaration {
 					t.repo, "Skill name",
 				),
 				"docs": {
-					Type:        "array",
-					Description: "Doc names to select (prefer few)",
-					Items:       &tool.Schema{Type: "string"},
+					Type: "array",
+					Description: "Docs for this update. With replace " +
+						"(including the default), pass every doc that must " +
+						"remain selected; with add, pass only new docs.",
+					Items: &tool.Schema{Type: "string"},
 				},
 				"include_all_docs": {
-					Type:        "boolean",
-					Description: "Include all docs if true (use sparingly)",
+					Type: "boolean",
+					Description: "Select all docs if true (use sparingly). " +
+						"Once active, use clear before narrowing to a list.",
 				},
 				"mode": {
-					Type:        "string",
-					Description: "add | replace | clear",
+					Type: "string",
+					Description: "How to update the current selection: add " +
+						"preserves selected docs, replace sets the complete " +
+						"list, and clear empties it. Omit mode to use replace. " +
+						"The schema permits only these three values; if a " +
+						"non-enum value reaches the runtime, it falls back " +
+						"to replace for backward compatibility.",
+					Enum:    []any{modeAdd, modeReplace, modeClear},
+					Default: modeReplace,
 				},
 			},
 		},
 		OutputSchema: &tool.Schema{
 			Type:        "object",
-			Description: "Final selection info",
+			Description: "Complete active doc selection after the update",
 			Properties: map[string]*tool.Schema{
 				"skill": {Type: "string"},
 				"selected_docs": {
@@ -94,7 +108,11 @@ func (t *SelectDocsTool) Declaration() *tool.Declaration {
 					Items: &tool.Schema{Type: "string"},
 				},
 				"include_all_docs": {Type: "boolean"},
-				"mode":             {Type: "string"},
+				"mode": {
+					Type:        "string",
+					Description: "Normalized mode applied by the tool",
+					Enum:        []any{modeAdd, modeReplace, modeClear},
+				},
 			},
 		},
 	}
@@ -104,7 +122,7 @@ func (t *SelectDocsTool) Declaration() *tool.Declaration {
 func (t *SelectDocsTool) Call(
 	ctx context.Context, args []byte,
 ) (any, error) {
-	in, err := t.parseSelectArgs(args)
+	in, err := t.parseSelectArgs(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -131,28 +149,59 @@ func (t *SelectDocsTool) Call(
 
 // StateDelta writes the selection using the tool result JSON.
 func (t *SelectDocsTool) StateDelta(
-	_ []byte, resultJSON []byte,
+	_ string, _ []byte, resultJSON []byte,
 ) map[string][]byte {
+	delta, _ := t.stateDelta("", resultJSON)
+	return delta
+}
+
+// StateDeltaForInvocation writes agent-scoped state for the invocation.
+func (t *SelectDocsTool) StateDeltaForInvocation(
+	inv *agent.Invocation,
+	toolCallID string,
+	args []byte,
+	resultJSON []byte,
+) map[string][]byte {
+	_ = toolCallID
+	_ = args
+
+	var agentName string
+	if inv != nil {
+		agentName = inv.AgentName
+	}
+	delta, skillName := t.stateDelta(agentName, resultJSON)
+	return appendLoadedOrderStateDelta(
+		inv,
+		agentName,
+		delta,
+		skillName,
+	)
+}
+
+func (t *SelectDocsTool) stateDelta(
+	agentName string,
+	resultJSON []byte,
+) (map[string][]byte, string) {
 	var out selectDocsOutput
 	if err := json.Unmarshal(resultJSON, &out); err != nil {
-		return nil
+		return nil, ""
 	}
 	if out.Skill == "" {
-		return nil
+		return nil, ""
 	}
-	dk := skill.StateKeyDocsPrefix + out.Skill
+	dk := skill.DocsKey(agentName, out.Skill)
 	if out.IncludeAllDocs {
-		return map[string][]byte{dk: []byte("*")}
+		return map[string][]byte{dk: []byte("*")}, out.Skill
 	}
 	// Ensure empty slice encodes to [] rather than null.
 	if out.Selected == nil && !out.IncludeAllDocs {
-		return map[string][]byte{dk: []byte("[]")}
+		return map[string][]byte{dk: []byte("[]")}, out.Skill
 	}
 	b, err := json.Marshal(out.Selected)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
-	return map[string][]byte{dk: b}
+	return map[string][]byte{dk: b}, out.Skill
 }
 
 var _ tool.Tool = (*SelectDocsTool)(nil)
@@ -160,6 +209,7 @@ var _ tool.CallableTool = (*SelectDocsTool)(nil)
 
 // parseSelectArgs validates and normalizes the input.
 func (t *SelectDocsTool) parseSelectArgs(
+	ctx context.Context,
 	args []byte,
 ) (selectDocsInput, error) {
 	var in selectDocsInput
@@ -172,7 +222,7 @@ func (t *SelectDocsTool) parseSelectArgs(
 		return selectDocsInput{}, fmt.Errorf("skill is required")
 	}
 	if t.repo != nil {
-		if _, err := t.repo.Get(in.Skill); err != nil {
+		if _, err := skill.GetForContext(ctx, t.repo, in.Skill); err != nil {
 			return selectDocsInput{}, fmt.Errorf(
 				"unknown skill: %s", in.Skill,
 			)
@@ -198,7 +248,7 @@ func (t *SelectDocsTool) previousSelection(
 	if !ok || inv == nil || inv.Session == nil {
 		return nil, false
 	}
-	key := skill.StateKeyDocsPrefix + skillName
+	key := skill.DocsKey(inv.AgentName, skillName)
 	v, found := inv.Session.GetState(key)
 	if !found || len(v) == 0 {
 		return nil, false

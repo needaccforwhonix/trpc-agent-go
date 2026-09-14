@@ -122,13 +122,17 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 		s.startAsyncPersistWorker()
 	}
 
-	// Start async summary workers if summarizer is configured
-	if opts.summarizer != nil && opts.asyncSummaryNum > 0 {
+	// Start async summary workers if summary generation is configured.
+	if isummary.HasSummarizer(opts.summarizer) && opts.asyncSummaryNum > 0 {
 		s.asyncWorker = isummary.NewAsyncSummaryWorker(isummary.AsyncSummaryConfig{
 			Summarizer:        opts.summarizer,
 			AsyncSummaryNum:   opts.asyncSummaryNum,
 			SummaryQueueSize:  opts.summaryQueueSize,
 			SummaryJobTimeout: opts.summaryJobTimeout,
+			SummaryDispatchPolicy: isummary.NewSummaryDispatchPolicy(
+				opts.summaryFilterAllowlist,
+				opts.shouldCascadeFullSessionSummary(),
+			),
 			CreateSummaryFunc: s.CreateSessionSummary,
 		})
 		s.asyncWorker.Start()
@@ -283,6 +287,9 @@ func (s *Service) GetSession(
 		return nil, err
 	}
 	opt := applyOptions(opts...)
+	if err := session.ValidateGetSessionOptions(opt, false); err != nil {
+		return nil, err
+	}
 
 	hctx := &session.GetSessionContext{
 		Context: ctx,
@@ -293,14 +300,6 @@ func (s *Service) GetSession(
 		sess, err := s.getSession(c.Context, c.Key, c.Options.EventNum, c.Options.EventTime)
 		if err != nil {
 			return nil, fmt.Errorf("clickhouse session service get session state failed: %w", err)
-		}
-
-		// Refresh session TTL if configured and session exists
-		if sess != nil && s.opts.sessionTTL > 0 {
-			if err := s.refreshSessionTTL(c.Context, c.Key); err != nil {
-				log.WarnfContext(c.Context, "failed to refresh session TTL: %v", err)
-				// Don't fail the GetSession call, just log the warning
-			}
 		}
 		return sess, nil
 	}
@@ -317,7 +316,17 @@ func (s *Service) ListSessions(
 		return nil, err
 	}
 	opt := applyOptions(opts...)
-	sessList, err := s.listSessions(ctx, userKey, opt.EventNum, opt.EventTime)
+	if err := session.ValidateListSessionsOptions(opt); err != nil {
+		return nil, err
+	}
+	sessList, err := s.listSessions(
+		ctx,
+		userKey,
+		opt.EventNum,
+		opt.EventTime,
+		opt.ListSessionOnlyMeta,
+		opt.ListSessionPage,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse session service get session list failed: %w", err)
 	}
@@ -972,11 +981,11 @@ func (s *Service) softDeleteSessionSummaries(ctx context.Context, key session.Ke
 
 	if len(summaries) > 0 {
 		err = s.chClient.BatchInsert(ctx,
-			fmt.Sprintf(`INSERT INTO %s (app_name, user_id, session_id, filter_key, summary, created_at, updated_at, deleted_at)`,
+			fmt.Sprintf(`INSERT INTO %s (app_name, user_id, session_id, filter_key, summary, created_at, updated_at, version_at, deleted_at)`,
 				s.tableSessionSummaries),
 			func(batch driver.Batch) error {
 				for _, sum := range summaries {
-					if err := batch.Append(key.AppName, key.UserID, key.SessionID, sum.filterKey, sum.summaryData, sum.createdAt, now, now); err != nil {
+					if err := batch.Append(key.AppName, key.UserID, key.SessionID, sum.filterKey, sum.summaryData, sum.createdAt, sum.updatedAt, now, now); err != nil {
 						return err
 					}
 				}

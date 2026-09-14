@@ -23,6 +23,8 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	semconvtrace "trpc.group/trpc-go/trpc-agent-go/telemetry/semconv/trace"
 	"trpc.group/trpc-go/trpc-agent-go/telemetry/tracetransform"
 )
 
@@ -95,7 +97,7 @@ func transformSpan(span *tracepb.Span) {
 	// Find the operation name
 	var operationName string
 	for _, attr := range span.Attributes {
-		if attr.Key == itelemetry.KeyGenAIOperationName {
+		if attr.Key == semconvtrace.KeyGenAIOperationName {
 			if attr.Value != nil && attr.Value.GetStringValue() != "" {
 				operationName = attr.Value.GetStringValue()
 				break
@@ -118,6 +120,7 @@ func transformSpan(span *tracepb.Span) {
 
 func transformInvokeAgent(span *tracepb.Span) {
 	var newAttributes []*commonpb.KeyValue
+	var inputMessages, inputMessagesOTel, outputMessages, outputMessagesOTel *string
 
 	newAttributes = append(newAttributes, &commonpb.KeyValue{
 		Key: observationType,
@@ -128,25 +131,14 @@ func transformInvokeAgent(span *tracepb.Span) {
 
 	for _, attr := range span.Attributes {
 		switch attr.Key {
-		case itelemetry.KeyGenAIInputMessages:
-			if attr.Value != nil {
-				newAttributes = append(newAttributes, &commonpb.KeyValue{
-					Key: observationInput,
-					Value: &commonpb.AnyValue{
-						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
-					},
-				})
-			}
-			// Skip this attribute (delete it)
-		case itelemetry.KeyGenAIOutputMessages:
-			if attr.Value != nil {
-				newAttributes = append(newAttributes, &commonpb.KeyValue{
-					Key: observationOutput,
-					Value: &commonpb.AnyValue{
-						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
-					},
-				})
-			}
+		case semconvtrace.KeyGenAIInputMessages:
+			inputMessages = getStringPtr(attr.Value)
+		case semconvtrace.KeyGenAIInputMessagesOTel:
+			inputMessagesOTel = getStringPtr(attr.Value)
+		case semconvtrace.KeyGenAIOutputMessages:
+			outputMessages = getStringPtr(attr.Value)
+		case semconvtrace.KeyGenAIOutputMessagesOTel:
+			outputMessagesOTel = getStringPtr(attr.Value)
 			// Skip token usage attributes for InvokeAgent observations.
 			//
 			// Reason: the top-level span represents the whole trace, and Langfuse aggregates token
@@ -154,12 +146,18 @@ func transformInvokeAgent(span *tracepb.Span) {
 			// InvokeAgent spans (to support Galileo); previously only Chat spans had token usage.
 			// Keeping token attributes on InvokeAgent would make Langfuse double count tokens
 			// compared to the old behavior (Chat-only token accounting).
-		case itelemetry.KeyGenAIUsageInputTokens, itelemetry.KeyGenAIUsageOutputTokens,
-			itelemetry.KeyGenAIUsageInputTokensCached, itelemetry.KeyGenAIUsageInputTokensCacheRead,
-			itelemetry.KeyGenAIUsageInputTokensCacheCreation:
+		case semconvtrace.KeyGenAIUsageInputTokens, semconvtrace.KeyGenAIUsageOutputTokens,
+			semconvtrace.KeyGenAIUsageInputTokensCached, semconvtrace.KeyGenAIUsageInputTokensCacheRead,
+			semconvtrace.KeyGenAIUsageInputTokensCacheCreation:
 		default:
 			newAttributes = append(newAttributes, attr)
 		}
+	}
+	if input := preferredObservationInput(inputMessagesOTel, inputMessages); input != nil {
+		newAttributes = append(newAttributes, stringKV(observationInput, *input))
+	}
+	if output := preferredObservationOutput(outputMessagesOTel, outputMessages, nil); output != nil {
+		newAttributes = append(newAttributes, stringKV(observationOutput, *output))
 	}
 	span.Attributes = newAttributes
 }
@@ -167,12 +165,16 @@ func transformInvokeAgent(span *tracepb.Span) {
 // transformCallLLM transforms LLM call spans for Langfuse
 // llmSpanCollected holds the intermediate values collected from an LLM span's attributes.
 type llmSpanCollected struct {
-	sessionID       *commonpb.AnyValue
-	llmRequest      *string
-	inputMessages   *string
-	toolDefinitions *string
-	usage           usageDetails
-	attrs           []*commonpb.KeyValue // non-LLM attributes to keep
+	sessionID          *commonpb.AnyValue
+	llmRequest         *string
+	llmResponse        *string
+	inputMessages      *string
+	inputMessagesOTel  *string
+	outputMessages     *string
+	outputMessagesOTel *string
+	toolDefinitions    *string
+	usage              usageDetails
+	attrs              []*commonpb.KeyValue // non-LLM attributes to keep
 }
 
 // transformCallLLM transforms LLM call spans for Langfuse.
@@ -188,14 +190,18 @@ func transformCallLLM(span *tracepb.Span) {
 	// observation.input
 	newAttributes = append(newAttributes, stringKV(observationInput, buildLLMObservationInput(collected)))
 
+	// observation.output
+	newAttributes = append(newAttributes, stringKV(observationOutput, buildLLMObservationOutput(collected)))
+
 	// observation.model_parameters (generation_config from llm request)
 	if kv := extractModelParameters(collected.llmRequest); kv != nil {
 		newAttributes = append(newAttributes, kv)
 	}
 
 	// observation.usage_details
-	if !collected.usage.empty() {
-		if usageJSON, err := json.Marshal(collected.usage); err == nil {
+	usage := collected.usage.normalized()
+	if !usage.empty() {
+		if usageJSON, err := json.Marshal(usage); err == nil {
 			newAttributes = append(newAttributes, stringKV(observationUsageDetails, string(usageJSON)))
 		}
 	}
@@ -213,27 +219,33 @@ func collectLLMSpanAttributes(attrs []*commonpb.KeyValue) llmSpanCollected {
 	var c llmSpanCollected
 	for _, attr := range attrs {
 		switch attr.Key {
-		case itelemetry.KeyGenAIConversationID, itelemetry.KeyRunnerSessionID, traceSessionID:
+		case semconvtrace.KeyGenAIConversationID, semconvtrace.KeyRunnerSessionID, traceSessionID:
 			c.sessionID = attr.Value
-		case itelemetry.KeyRunnerUserID:
+		case semconvtrace.KeyRunnerUserID:
 			c.attrs = append(c.attrs, &commonpb.KeyValue{Key: traceUserID, Value: attr.Value})
-		case itelemetry.KeyLLMRequest:
+		case semconvtrace.KeyLLMRequest:
 			c.llmRequest = getStringPtr(attr.Value)
-		case itelemetry.KeyGenAIInputMessages:
+		case semconvtrace.KeyGenAIInputMessages:
 			c.inputMessages = getStringPtr(attr.Value)
-		case itelemetry.KeyGenAIRequestToolDefinitions:
+		case semconvtrace.KeyGenAIInputMessagesOTel:
+			c.inputMessagesOTel = getStringPtr(attr.Value)
+		case semconvtrace.KeyGenAIOutputMessages:
+			c.outputMessages = getStringPtr(attr.Value)
+		case semconvtrace.KeyGenAIOutputMessagesOTel:
+			c.outputMessagesOTel = getStringPtr(attr.Value)
+		case semconvtrace.KeyGenAIRequestToolDefinitions:
 			c.toolDefinitions = getStringPtr(attr.Value)
-		case itelemetry.KeyLLMResponse:
-			c.attrs = append(c.attrs, stringKV(observationOutput, stringValueOrNA(attr.Value)))
-		case itelemetry.KeyGenAIUsageInputTokens:
+		case semconvtrace.KeyLLMResponse:
+			c.llmResponse = getStringPtr(attr.Value)
+		case semconvtrace.KeyGenAIUsageInputTokens:
 			c.usage.Input = attr.Value.GetIntValue()
-		case itelemetry.KeyGenAIUsageOutputTokens:
+		case semconvtrace.KeyGenAIUsageOutputTokens:
 			c.usage.Output = attr.Value.GetIntValue()
-		case itelemetry.KeyGenAIUsageInputTokensCached:
+		case semconvtrace.KeyGenAIUsageInputTokensCached:
 			c.usage.InputCached = attr.Value.GetIntValue()
-		case itelemetry.KeyGenAIUsageInputTokensCacheRead:
+		case semconvtrace.KeyGenAIUsageInputTokensCacheRead:
 			c.usage.InputCacheRead = attr.Value.GetIntValue()
-		case itelemetry.KeyGenAIUsageInputTokensCacheCreation:
+		case semconvtrace.KeyGenAIUsageInputTokensCacheCreation:
 			c.usage.InputCacheCreation = attr.Value.GetIntValue()
 		default:
 			c.attrs = append(c.attrs, attr)
@@ -245,16 +257,69 @@ func collectLLMSpanAttributes(attrs []*commonpb.KeyValue) llmSpanCollected {
 // buildLLMObservationInput constructs the Langfuse observation.input value from
 // collected LLM span data, wrapping tools+messages when both are present.
 func buildLLMObservationInput(c llmSpanCollected) string {
+	if c.inputMessagesOTel != nil && *c.inputMessagesOTel != "" {
+		return truncateObservationLLMInput(wrapWithToolsIfPresent(*c.inputMessagesOTel, c.toolDefinitions))
+	}
 	if c.inputMessages != nil && *c.inputMessages != "" {
-		return wrapWithToolsIfPresent(*c.inputMessages, c.toolDefinitions)
+		return truncateObservationLLMInput(wrapWithToolsIfPresent(*c.inputMessages, c.toolDefinitions))
 	}
 	if c.llmRequest != nil && *c.llmRequest != "" {
 		if messagesJSON, ok := extractMessagesJSONFromRequestJSON(*c.llmRequest); ok && messagesJSON != "" {
-			return wrapWithToolsIfPresent(messagesJSON, c.toolDefinitions)
+			return truncateObservationLLMInput(wrapWithToolsIfPresent(messagesJSON, c.toolDefinitions))
 		}
-		return *c.llmRequest
+		return truncateObservationLLMInput(*c.llmRequest)
 	}
-	return "N/A"
+	return truncateObservationLLMInput("N/A")
+}
+
+func buildLLMObservationOutput(c llmSpanCollected) string {
+	if output := preferredObservationOutput(c.outputMessagesOTel, c.outputMessages, c.llmResponse); output != nil {
+		return *output
+	}
+	return truncateObservationLLMResponse("N/A")
+}
+
+func preferredObservationInput(otelMessages, legacyMessages *string) *string {
+	if otelMessages != nil && *otelMessages != "" {
+		return otelObservationInput(otelMessages)
+	}
+	if legacyMessages != nil && *legacyMessages != "" {
+		value := truncateObservationLLMInput(*legacyMessages)
+		return &value
+	}
+	return nil
+}
+
+func preferredObservationOutput(otelMessages, legacyMessages, llmResponse *string) *string {
+	if otelMessages != nil && *otelMessages != "" {
+		return otelObservationOutput(otelMessages)
+	}
+	// Prefer conversation-shaped legacy output over the raw llm_response dump.
+	if legacyMessages != nil && *legacyMessages != "" {
+		value := truncateObservationLLMResponse(*legacyMessages)
+		return &value
+	}
+	if llmResponse != nil && *llmResponse != "" {
+		value := truncateObservationLLMResponse(*llmResponse)
+		return &value
+	}
+	return nil
+}
+
+func otelObservationInput(otelMessages *string) *string {
+	if otelMessages != nil {
+		value := truncateObservationJSONLeafValues(*otelMessages)
+		return &value
+	}
+	return nil
+}
+
+func otelObservationOutput(otelMessages *string) *string {
+	if otelMessages != nil {
+		value := truncateObservationJSONLeafValues(*otelMessages)
+		return &value
+	}
+	return nil
 }
 
 // wrapWithToolsIfPresent returns messagesJSON as-is, or wraps it with tool
@@ -302,12 +367,227 @@ func getStringPtr(v *commonpb.AnyValue) *string {
 	return &s
 }
 
-// stringValueOrNA returns the string value of v, or "N/A" if v is nil.
-func stringValueOrNA(v *commonpb.AnyValue) string {
-	if v == nil {
-		return "N/A"
+func truncateObservationInputMessages(raw string) string {
+	maxLeafBytes := getObservationMaxBytes()
+	if maxLeafBytes == 0 {
+		return ""
 	}
-	return v.GetStringValue()
+	if maxLeafBytes < 0 || len([]byte(raw)) <= maxLeafBytes {
+		return raw
+	}
+	if isOTelMessagesPayload(raw) {
+		return truncateObservationJSONLeafValues(raw)
+	}
+
+	var msgs []observationTelemetryMessage
+	if err := json.Unmarshal([]byte(raw), &msgs); err != nil {
+		return truncateObservationValue(raw)
+	}
+
+	if maxLeafBytes > 0 {
+		plan := truncateMessagesPlan{textLimit: maxLeafBytes, binaryLimit: maxLeafBytes}
+		sanitizeTelemetryMessagesForObservation(msgs, plan)
+	}
+	if b, err := json.Marshal(msgs); err == nil {
+		return string(b)
+	}
+	return truncateObservationValue(raw)
+}
+
+func isOTelMessagesPayload(raw string) bool {
+	var messages []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &messages); err != nil {
+		return false
+	}
+	for _, msg := range messages {
+		if _, ok := msg["parts"]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateObservationLLMInput(raw string) string {
+	maxLeafBytes := getObservationMaxBytes()
+	if maxLeafBytes < 0 {
+		return raw
+	}
+	if maxLeafBytes == 0 {
+		return ""
+	}
+	if len(raw) <= maxLeafBytes {
+		return raw
+	}
+
+	var prompt observationInputPrompt
+	if err := json.Unmarshal([]byte(raw), &prompt); err == nil && (len(prompt.Messages) > 0 || len(prompt.Tools) > 0) {
+		if len(prompt.Messages) > 0 {
+			msgs := truncateObservationInputMessages(string(prompt.Messages))
+			prompt.Messages = json.RawMessage([]byte(msgs))
+		}
+		if len(prompt.Tools) > 0 {
+			tools := truncateObservationJSONLeafValues(string(prompt.Tools))
+			prompt.Tools = json.RawMessage([]byte(tools))
+		}
+		if b, err := json.Marshal(prompt); err == nil {
+			return string(b)
+		}
+	}
+	if isOTelMessagesPayload(raw) {
+		return truncateObservationJSONLeafValues(raw)
+	}
+
+	var msgs []observationTelemetryMessage
+	if err := json.Unmarshal([]byte(raw), &msgs); err == nil {
+		plan := truncateMessagesPlan{textLimit: maxLeafBytes, binaryLimit: maxLeafBytes}
+		sanitizeTelemetryMessagesForObservation(msgs, plan)
+		if b, err := json.Marshal(msgs); err == nil {
+			return string(b)
+		}
+	}
+
+	return truncateObservationJSONLeafValues(raw)
+}
+
+func truncateObservationLLMResponse(raw string) string {
+	return truncateObservationJSONLeafValues(raw)
+}
+
+func truncateObservationJSONLeafValues(raw string) string {
+	maxLeafBytes := getObservationMaxBytes()
+	if maxLeafBytes < 0 {
+		return raw
+	}
+	if maxLeafBytes == 0 {
+		return ""
+	}
+	if len(raw) <= maxLeafBytes {
+		return raw
+	}
+
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return truncateObservationValue(raw)
+	}
+	v = truncateJSONLeafValue(v, maxLeafBytes)
+	if b, err := json.Marshal(v); err == nil {
+		return string(b)
+	}
+	return truncateObservationValue(raw)
+}
+
+func truncateJSONLeafValue(v any, maxLeafBytes int) any {
+	switch vv := v.(type) {
+	case map[string]any:
+		for k, val := range vv {
+			vv[k] = truncateJSONLeafValue(val, maxLeafBytes)
+		}
+		return vv
+	case []any:
+		for i, val := range vv {
+			vv[i] = truncateJSONLeafValue(val, maxLeafBytes)
+		}
+		return vv
+	case string:
+		return truncateStringBytes(vv, maxLeafBytes)
+	default:
+		return v
+	}
+}
+
+type truncateMessagesPlan struct {
+	textLimit   int
+	binaryLimit int
+}
+
+type observationTelemetryMessage struct {
+	Role             model.Role          `json:"role"`
+	Content          string              `json:"content,omitempty"`
+	ContentParts     []model.ContentPart `json:"content_parts,omitempty"`
+	ToolCallID       string              `json:"tool_call_id,omitempty"`
+	Name             string              `json:"name,omitempty"`
+	ToolCalls        []model.ToolCall    `json:"tool_calls,omitempty"`
+	ReasoningContent string              `json:"reasoning_content,omitempty"`
+}
+
+func sanitizeTelemetryMessagesForObservation(messages []observationTelemetryMessage, plan truncateMessagesPlan) {
+	for i := range messages {
+		sanitizeSingleTelemetryMessageForObservation(&messages[i], plan)
+	}
+}
+
+func sanitizeSingleTelemetryMessageForObservation(msg *observationTelemetryMessage, plan truncateMessagesPlan) {
+	msg.Content = truncateStringBytes(msg.Content, plan.textLimit)
+	msg.ReasoningContent = truncateStringBytes(msg.ReasoningContent, plan.textLimit)
+	msg.ToolCallID = truncateStringBytes(msg.ToolCallID, plan.textLimit)
+	msg.Name = truncateStringBytes(msg.Name, plan.textLimit)
+
+	compat := model.Message{
+		ContentParts: msg.ContentParts,
+		ToolCalls:    msg.ToolCalls,
+	}
+	sanitizeSingleMessageForObservation(&compat, plan)
+	msg.ContentParts = compat.ContentParts
+	msg.ToolCalls = compat.ToolCalls
+}
+
+func sanitizeSingleMessageForObservation(msg *model.Message, plan truncateMessagesPlan) {
+	msg.Content = truncateStringBytes(msg.Content, plan.textLimit)
+	msg.ReasoningContent = truncateStringBytes(msg.ReasoningContent, plan.textLimit)
+	msg.ToolID = truncateStringBytes(msg.ToolID, plan.textLimit)
+	msg.ToolName = truncateStringBytes(msg.ToolName, plan.textLimit)
+
+	for i := range msg.ToolCalls {
+		msg.ToolCalls[i].ID = truncateStringBytes(msg.ToolCalls[i].ID, plan.textLimit)
+		msg.ToolCalls[i].Function.Name = truncateStringBytes(msg.ToolCalls[i].Function.Name, plan.textLimit)
+		msg.ToolCalls[i].Function.Description = truncateStringBytes(msg.ToolCalls[i].Function.Description, plan.textLimit)
+		msg.ToolCalls[i].Function.Arguments = truncateBytesHeadTail(msg.ToolCalls[i].Function.Arguments, plan.textLimit)
+	}
+
+	for i := range msg.ContentParts {
+		part := &msg.ContentParts[i]
+		if part.Text != nil {
+			t := truncateStringBytes(*part.Text, plan.textLimit)
+			part.Text = &t
+		}
+		if part.File != nil {
+			part.File.Name = truncateStringBytes(part.File.Name, plan.textLimit)
+			part.File.FileID = truncateStringBytes(part.File.FileID, plan.textLimit)
+			part.File.MimeType = truncateStringBytes(part.File.MimeType, plan.textLimit)
+			part.File.Data = truncateBytesHeadTail(part.File.Data, plan.binaryLimit)
+		}
+		if part.Image != nil {
+			part.Image.URL = truncateStringBytes(part.Image.URL, plan.textLimit)
+			part.Image.Detail = truncateStringBytes(part.Image.Detail, plan.textLimit)
+			part.Image.Format = truncateStringBytes(part.Image.Format, plan.textLimit)
+			part.Image.Data = truncateBytesHeadTail(part.Image.Data, plan.binaryLimit)
+		}
+		if part.Audio != nil {
+			part.Audio.Format = truncateStringBytes(part.Audio.Format, plan.textLimit)
+			part.Audio.Data = truncateBytesHeadTail(part.Audio.Data, plan.binaryLimit)
+		}
+	}
+}
+
+func truncateBytesHeadTail(b []byte, maxBytes int) []byte {
+	if maxBytes <= 0 {
+		return nil
+	}
+	if len(b) <= maxBytes {
+		return b
+	}
+	marker := []byte("...[truncated]...")
+	if len(marker) >= maxBytes {
+		return marker[:maxBytes]
+	}
+	remaining := maxBytes - len(marker)
+	headBytes := remaining * 2 / 3
+	tailBytes := remaining - headBytes
+	out := make([]byte, 0, maxBytes)
+	out = append(out, b[:headBytes]...)
+	out = append(out, marker...)
+	out = append(out, b[len(b)-tailBytes:]...)
+	return out
 }
 
 func buildObservationInputPrompt(messagesJSON, toolDefsJSON string) (string, error) {
@@ -353,16 +633,16 @@ func transformExecuteTool(span *tracepb.Span) {
 	var llmSessionID *commonpb.AnyValue
 	for _, attr := range span.Attributes {
 		switch attr.Key {
-		case itelemetry.KeyGenAIConversationID, itelemetry.KeyRunnerSessionID, traceSessionID:
+		case semconvtrace.KeyGenAIConversationID, semconvtrace.KeyRunnerSessionID, traceSessionID:
 			llmSessionID = attr.Value
-		case itelemetry.KeyRunnerUserID:
+		case semconvtrace.KeyRunnerUserID:
 			newAttributes = append(newAttributes, &commonpb.KeyValue{Key: traceUserID, Value: attr.Value})
-		case itelemetry.KeyGenAIToolCallArguments:
+		case semconvtrace.KeyGenAIToolCallArguments:
 			if attr.Value != nil {
 				newAttributes = append(newAttributes, &commonpb.KeyValue{
 					Key: observationInput,
 					Value: &commonpb.AnyValue{
-						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+						Value: &commonpb.AnyValue_StringValue{StringValue: truncateObservationJSONLeafValues(attr.Value.GetStringValue())},
 					},
 				})
 			} else {
@@ -374,12 +654,12 @@ func transformExecuteTool(span *tracepb.Span) {
 				})
 			}
 			// Skip this attribute (delete it)
-		case itelemetry.KeyGenAIToolCallResult:
+		case semconvtrace.KeyGenAIToolCallResult:
 			if attr.Value != nil {
 				newAttributes = append(newAttributes, &commonpb.KeyValue{
 					Key: observationOutput,
 					Value: &commonpb.AnyValue{
-						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+						Value: &commonpb.AnyValue_StringValue{StringValue: truncateObservationJSONLeafValues(attr.Value.GetStringValue())},
 					},
 				})
 			} else {
@@ -420,16 +700,16 @@ func transformWorkflow(span *tracepb.Span) {
 	var llmSessionID *commonpb.AnyValue
 	for _, attr := range span.Attributes {
 		switch attr.Key {
-		case itelemetry.KeyGenAIConversationID, itelemetry.KeyRunnerSessionID, traceSessionID:
+		case semconvtrace.KeyGenAIConversationID, semconvtrace.KeyRunnerSessionID, traceSessionID:
 			llmSessionID = attr.Value
-		case itelemetry.KeyRunnerUserID:
+		case semconvtrace.KeyRunnerUserID:
 			newAttributes = append(newAttributes, &commonpb.KeyValue{Key: traceUserID, Value: attr.Value})
-		case itelemetry.KeyGenAIWorkflowRequest:
+		case semconvtrace.KeyGenAIWorkflowRequest:
 			if attr.Value != nil {
 				newAttributes = append(newAttributes, &commonpb.KeyValue{
 					Key: observationInput,
 					Value: &commonpb.AnyValue{
-						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+						Value: &commonpb.AnyValue_StringValue{StringValue: truncateObservationJSONLeafValues(attr.Value.GetStringValue())},
 					},
 				})
 			} else {
@@ -441,12 +721,12 @@ func transformWorkflow(span *tracepb.Span) {
 				})
 			}
 			// Skip this attribute (delete it)
-		case itelemetry.KeyGenAIWorkflowResponse:
+		case semconvtrace.KeyGenAIWorkflowResponse:
 			if attr.Value != nil {
 				newAttributes = append(newAttributes, &commonpb.KeyValue{
 					Key: observationOutput,
 					Value: &commonpb.AnyValue{
-						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+						Value: &commonpb.AnyValue_StringValue{StringValue: truncateObservationJSONLeafValues(attr.Value.GetStringValue())},
 					},
 				})
 			} else {

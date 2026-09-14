@@ -67,6 +67,10 @@ runner := runner.NewRunner(
     runner.WithSessionService(sessionService),
     runner.WithMemoryService(memoryService), // Step 2: Set memory service in runner
 )
+
+// Caller owns the memory service lifecycle — runner does not close it.
+defer memoryService.Close()
+defer runner.Close()
 ```
 
 ## Prerequisites
@@ -85,6 +89,9 @@ runner := runner.NewRunner(
 
 | Variable                  | Description                  | Default Value            |
 | ------------------------- | ---------------------------- | ------------------------ |
+| `SQLITE_MEMORY_DSN`       | SQLite DSN                   | `file:memories.db?_busy_timeout=5000` |
+| `SQLITEVEC_MEMORY_DSN`    | SQLiteVec DSN                | `file:memories_vec.db?_busy_timeout=5000` |
+| `SQLITEVEC_EMBEDDER_MODEL` | SQLiteVec embedder model     | `text-embedding-3-small` |
 | `REDIS_ADDR`              | Redis server address         | `localhost:6379`         |
 | `PG_HOST`                 | PostgreSQL host              | `localhost`              |
 | `PG_PORT`                 | PostgreSQL port              | `5432`                   |
@@ -97,19 +104,43 @@ runner := runner.NewRunner(
 | `PGVECTOR_PASSWORD`       | pgvector PostgreSQL password | ``                       |
 | `PGVECTOR_DATABASE`       | pgvector PostgreSQL database | `trpc-agent-go-pgmemory` |
 | `PGVECTOR_EMBEDDER_MODEL` | pgvector embedder model      | `text-embedding-3-small` |
+| `CHROMA_BASE_URL`         | ChromaDB REST base URL       | `http://localhost:8000`  |
+| `CHROMA_API_KEY`          | ChromaDB API key             | ``                       |
+| `CHROMA_BEARER_TOKEN`     | ChromaDB bearer token        | ``                       |
+| `CHROMA_TENANT`           | ChromaDB tenant              | `default_tenant`         |
+| `CHROMA_DATABASE`         | ChromaDB database            | `default_database`       |
+| `CHROMA_COLLECTION`       | ChromaDB collection          | `memories`               |
+| `CHROMA_EMBEDDER_MODEL`   | ChromaDB embedder model      | `text-embedding-3-small` |
 | `MYSQL_HOST`              | MySQL host                   | `localhost`              |
 | `MYSQL_PORT`              | MySQL port                   | `3306`                   |
 | `MYSQL_USER`              | MySQL user                   | `root`                   |
 | `MYSQL_PASSWORD`          | MySQL password               | ``                       |
 | `MYSQL_DATABASE`          | MySQL database name          | `trpc_agent_go`          |
+| `MYSQLVEC_HOST`           | MySQL Vector host            | `localhost`              |
+| `MYSQLVEC_PORT`           | MySQL Vector port            | `3306`                   |
+| `MYSQLVEC_USER`           | MySQL Vector user            | `root`                   |
+| `MYSQLVEC_PASSWORD`       | MySQL Vector password        | ``                       |
+| `MYSQLVEC_DATABASE`       | MySQL Vector database name   | `trpc_agent_go`          |
+| `MYSQLVEC_EMBEDDER_MODEL` | MySQL Vector embedder model  | `text-embedding-3-small` |
+
+### Embedding Environment Variables (Optional)
+
+When using vector backends (`sqlitevec`, `mysqlvec`, `pgvector`, `chromadb`), you can configure a
+separate embedding endpoint / API key:
+
+| Variable                  | Description                      | Default Value |
+| ------------------------- | -------------------------------- | ------------- |
+| `OPENAI_EMBEDDING_API_KEY` | API key for embedding model      | (empty)       |
+| `OPENAI_EMBEDDING_BASE_URL` | Base URL for embedding endpoint  | (empty)       |
+| `OPENAI_EMBEDDING_MODEL`  | Override embedding model name     | (empty)       |
 
 ## Command Line Arguments
 
 | Argument       | Description                                                             | Default Value   |
 | -------------- | ----------------------------------------------------------------------- | --------------- |
-| `-model`       | Name of the model to use                                                | `deepseek-chat` |
-| `-memory`      | Memory service: `inmemory`, `redis`, `mysql`, `postgres`, or `pgvector` | `inmemory`      |
-| `-soft-delete` | Enable soft delete for MySQL/PostgreSQL/pgvector memory service         | `false`         |
+| `-model`       | Name of the model to use                                                | `deepseek-v4-flash` |
+| `-memory`      | Memory service: `inmemory`, `sqlite`, `sqlitevec`, `redis`, `mysql`, `mysqlvec`, `postgres`, `pgvector`, or `chromadb` | `inmemory` |
+| `-soft-delete` | Enable soft delete for SQLite/SQLiteVec/MySQL/MySQLVec/PostgreSQL/pgvector/ChromaDB memory service  | `false`         |
 | `-streaming`   | Enable streaming mode for responses                                     | `true`          |
 
 ## Usage
@@ -154,11 +185,20 @@ go run main.go -model gpt-4o -streaming=false
 
 ### Service Configuration
 
-The example supports five memory service backends: in-memory, Redis, MySQL, PostgreSQL, and pgvector:
+The example supports multiple memory service backends:
 
 ```bash
 # Default in-memory memory service
 go run main.go
+
+# SQLite memory service (local file)
+export SQLITE_MEMORY_DSN="file:memories.db?_busy_timeout=5000"
+go run main.go -memory sqlite
+
+# SQLiteVec memory service (local file + vector search)
+export SQLITEVEC_MEMORY_DSN="file:memories_vec.db?_busy_timeout=5000"
+export SQLITEVEC_EMBEDDER_MODEL="text-embedding-3-small"
+go run main.go -memory sqlitevec
 
 # Redis memory service (using default or environment variable)
 go run main.go -memory redis
@@ -187,7 +227,17 @@ export PGVECTOR_PASSWORD=""
 export PGVECTOR_DATABASE=trpc-agent-go-pgmemory
 export PGVECTOR_EMBEDDER_MODEL=text-embedding-3-small
 go run main.go -memory pgvector
+
+# ChromaDB memory service
+export CHROMA_BASE_URL=http://localhost:8000
+export CHROMA_COLLECTION=memories
+export CHROMA_EMBEDDER_MODEL=text-embedding-3-small
+go run main.go -memory chromadb
 ```
+
+ChromaDB runs as a separate server. `CHROMA_BASE_URL` may target localhost,
+a remote deployment, or Chroma Cloud; remote credentials require HTTPS.
+Changing the embedding model requires a new collection or a full re-embedding.
 
 ## Chat Interface
 
@@ -281,12 +331,16 @@ The example demonstrates a custom clear tool with enhanced logging:
 
 ### Memory Service Integration
 
-- Supports multiple backends: in-memory, Redis, MySQL, PostgreSQL, and pgvector
+- Supports in-memory, SQLite, SQLiteVec, Redis, MySQL, MySQL Vector, PostgreSQL, pgvector, and ChromaDB backends
 - Uses `memoryinmemory.NewMemoryService()` for in-memory storage
+- Uses `memorysqlite.NewService()` for SQLite storage
+- Uses `memorysqlitevec.NewService()` for SQLite vector storage
 - Uses `memoryredis.NewService()` for Redis-based storage
 - Uses `memorymysql.NewService()` for MySQL-based storage
+- Uses `memorymysqlvec.NewService()` for MySQL vector storage
 - Uses `memorypostgres.NewService()` for PostgreSQL-based storage
 - Uses `memorypgvector.NewService()` for pgvector-based storage with vector similarity search
+- Uses `memorychromadb.NewService()` for ChromaDB storage with cosine and hybrid search
 - Memory tools directly access the memory service
 - Two-step integration: Step 1 (manual tool registration) + Step 2 (runner service setup)
 

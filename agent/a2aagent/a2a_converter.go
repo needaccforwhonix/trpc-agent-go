@@ -11,6 +11,7 @@ package a2aagent
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/graph"
 	ia2a "trpc.group/trpc-go/trpc-agent-go/internal/a2a"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -41,6 +43,7 @@ type InvocationA2AConverter interface {
 }
 
 type defaultA2AEventConverter struct {
+	dataPartMappers []A2ADataPartMapper
 }
 
 func (d *defaultA2AEventConverter) ConvertToEvents(
@@ -72,12 +75,30 @@ func (d *defaultA2AEventConverter) ConvertToEvents(
 				events = append(events, evt)
 			}
 		}
+		if isTaskFailureState(v.Status.State) {
+			statusMsg := convertTaskStatusToMessage(&protocol.TaskStatusUpdateEvent{
+				TaskID:    v.ID,
+				ContextID: v.ContextID,
+				Metadata:  v.Metadata,
+				Status:    v.Status,
+			})
+			if evt := d.buildRespEvent(
+				false,
+				statusMsg,
+				agentName,
+				invocation,
+			); evt != nil {
+				events = append(events, evt)
+			}
+			break
+		}
 		// Artifacts contain the final response
 		for i := range v.Artifacts {
 			artifactMsg := &protocol.Message{
 				Role:      protocol.MessageRoleAgent,
 				MessageID: v.Artifacts[i].ArtifactID,
 				Parts:     v.Artifacts[i].Parts,
+				Metadata:  v.Artifacts[i].Metadata,
 			}
 			if evt := d.buildRespEvent(false, artifactMsg, agentName, invocation); evt != nil {
 				events = append(events, evt)
@@ -123,8 +144,17 @@ func (d *defaultA2AEventConverter) ConvertStreamingToEvents(
 	case *protocol.Task:
 		responseMsg = convertTaskToMessage(v)
 	case *protocol.TaskStatusUpdateEvent:
+		if !isTaskFailureState(v.Status.State) && !hasStructuredErrorMetadata(v.Metadata) {
+			// submitted/completed updates without structured errors are control signals.
+			return nil, nil
+		}
 		responseMsg = convertTaskStatusToMessage(v)
 	case *protocol.TaskArtifactUpdateEvent:
+		if v.IsFinal() && !hasStructuredErrorMetadata(v.Metadata) {
+			// Final artifact chunk is either an aggregated result or a termination signal,
+			// not incremental content for the user.
+			return nil, nil
+		}
 		responseMsg = convertTaskArtifactToMessage(v)
 	default:
 		log.Infof("unexpected event type: %T", result.Result)
@@ -132,6 +162,7 @@ func (d *defaultA2AEventConverter) ConvertStreamingToEvents(
 	}
 
 	if evt := d.buildRespEvent(true, responseMsg, agentName, invocation); evt != nil {
+		markTerminalStructuredErrorEvent(evt, result.Result)
 		events = append(events, evt)
 	}
 	return events, nil
@@ -146,65 +177,8 @@ func (d *defaultEventA2AConverter) ConvertToA2AMessage(
 	agentName string,
 	invocation *agent.Invocation,
 ) (*protocol.Message, error) {
-	var parts []protocol.Part
+	parts := d.buildA2AParts(invocation)
 
-	// Convert invocation.Message.Content (text) to TextPart
-	if invocation.Message.Content != "" {
-		parts = append(parts, protocol.NewTextPart(invocation.Message.Content))
-	}
-
-	// Convert invocation.Message.ContentParts to A2A Parts
-	for _, contentPart := range invocation.Message.ContentParts {
-		switch contentPart.Type {
-		case model.ContentTypeText:
-			if contentPart.Text != nil {
-				parts = append(parts, protocol.NewTextPart(*contentPart.Text))
-			}
-		case model.ContentTypeImage:
-			if contentPart.Image != nil {
-				if len(contentPart.Image.Data) > 0 {
-					// Handle inline image data
-					parts = append(parts, protocol.NewFilePartWithBytes(
-						"image",
-						contentPart.Image.Format,
-						base64.StdEncoding.EncodeToString(contentPart.Image.Data),
-					))
-				} else if contentPart.Image.URL != "" {
-					// Handle image URL
-					parts = append(parts, protocol.NewFilePartWithURI(
-						"image",
-						contentPart.Image.Format,
-						contentPart.Image.URL,
-					))
-				}
-			}
-		case model.ContentTypeAudio:
-			if contentPart.Audio != nil && contentPart.Audio.Data != nil {
-				// Handle audio data as file with bytes
-				parts = append(parts, protocol.NewFilePartWithBytes(
-					"audio",
-					contentPart.Audio.Format,
-					base64.StdEncoding.EncodeToString(contentPart.Audio.Data),
-				))
-			}
-		case model.ContentTypeFile:
-			if contentPart.File != nil {
-				if len(contentPart.File.Data) > 0 {
-					fileName := contentPart.File.Name
-					if fileName == "" {
-						fileName = "file"
-					}
-					parts = append(parts, protocol.NewFilePartWithBytes(
-						fileName,
-						contentPart.File.MimeType,
-						base64.StdEncoding.EncodeToString(contentPart.File.Data),
-					))
-				}
-			}
-		}
-	}
-
-	// If no content, create an empty text part to ensure message is not empty
 	if len(parts) == 0 {
 		parts = append(parts, protocol.NewTextPart(""))
 	}
@@ -213,7 +187,135 @@ func (d *defaultEventA2AConverter) ConvertToA2AMessage(
 	if sess != nil {
 		message.ContextID = &sess.ID
 	}
+
+	message.Metadata = make(map[string]any)
+	if invocation.InvocationID != "" {
+		message.Metadata["invocation_id"] = invocation.InvocationID
+	}
+	if sess != nil && sess.UserID != "" {
+		message.Metadata["user_id"] = sess.UserID
+	}
+	message.Metadata[ia2a.MessageMetadataInteractionSpecVersionKey] = ia2a.InteractionVersion
+
 	return &message, nil
+}
+
+// buildA2AParts converts invocation message content and content parts to A2A protocol parts.
+func (d *defaultEventA2AConverter) buildA2AParts(invocation *agent.Invocation) []protocol.Part {
+	var parts []protocol.Part
+
+	if invocation.Message.Content != "" {
+		parts = append(parts, protocol.NewTextPart(invocation.Message.Content))
+	}
+
+	for _, contentPart := range invocation.Message.ContentParts {
+		parts = appendContentPart(parts, contentPart)
+	}
+
+	return parts
+}
+
+// appendContentPart converts a single model.ContentPart and appends it to parts.
+func appendContentPart(parts []protocol.Part, cp model.ContentPart) []protocol.Part {
+	switch cp.Type {
+	case model.ContentTypeText:
+		return appendTextPart(parts, cp)
+	case model.ContentTypeImage:
+		return appendImagePart(parts, cp)
+	case model.ContentTypeAudio:
+		return appendAudioPart(parts, cp)
+	case model.ContentTypeFile:
+		return appendFilePart(parts, cp)
+	default:
+		return parts
+	}
+}
+
+func appendTextPart(parts []protocol.Part, cp model.ContentPart) []protocol.Part {
+	if cp.Text == nil {
+		return parts
+	}
+	return append(parts, protocol.NewTextPart(*cp.Text))
+}
+
+func appendImagePart(parts []protocol.Part, cp model.ContentPart) []protocol.Part {
+	if cp.Image == nil {
+		return parts
+	}
+	if len(cp.Image.Data) > 0 {
+		fp := protocol.NewFilePartWithBytes(
+			"image",
+			cp.Image.Format,
+			base64.StdEncoding.EncodeToString(cp.Image.Data),
+		)
+		fp.Metadata = map[string]any{
+			ia2a.FilePartMetadataContentTypeKey: ia2a.FilePartMetadataContentTypeImage,
+		}
+		return append(parts, &fp)
+	}
+	if cp.Image.URL != "" {
+		fp := protocol.NewFilePartWithURI(
+			"image",
+			cp.Image.Format,
+			cp.Image.URL,
+		)
+		fp.Metadata = map[string]any{
+			ia2a.FilePartMetadataContentTypeKey: ia2a.FilePartMetadataContentTypeImage,
+		}
+		return append(parts, &fp)
+	}
+	return parts
+}
+
+func appendAudioPart(parts []protocol.Part, cp model.ContentPart) []protocol.Part {
+	if cp.Audio == nil || cp.Audio.Data == nil {
+		return parts
+	}
+	fp := protocol.NewFilePartWithBytes(
+		"audio",
+		cp.Audio.Format,
+		base64.StdEncoding.EncodeToString(cp.Audio.Data),
+	)
+	fp.Metadata = map[string]any{
+		ia2a.FilePartMetadataContentTypeKey: ia2a.FilePartMetadataContentTypeAudio,
+	}
+	return append(parts, &fp)
+}
+
+func appendFilePart(parts []protocol.Part, cp model.ContentPart) []protocol.Part {
+	if cp.File == nil {
+		return parts
+	}
+	fileName := cp.File.Name
+	if fileName == "" {
+		fileName = "file"
+	}
+	metadata := map[string]any{
+		ia2a.FilePartMetadataContentTypeKey: ia2a.FilePartMetadataContentTypeFile,
+	}
+	if len(cp.File.Data) > 0 {
+		fp := protocol.NewFilePartWithBytes(
+			fileName,
+			cp.File.MimeType,
+			base64.StdEncoding.EncodeToString(cp.File.Data),
+		)
+		fp.Metadata = metadata
+		return append(parts, &fp)
+	}
+	fileURL := cp.File.URL
+	if fileURL == "" {
+		fileURL = cp.File.FileID
+	}
+	if fileURL != "" {
+		fp := protocol.NewFilePartWithURI(
+			fileName,
+			cp.File.MimeType,
+			fileURL,
+		)
+		fp.Metadata = metadata
+		return append(parts, &fp)
+	}
+	return parts
 }
 
 // buildRespEvent converts A2A response to tRPC event (used for both streaming and non-streaming mode)
@@ -224,7 +326,7 @@ func (d *defaultA2AEventConverter) buildRespEvent(
 	invocation *agent.Invocation) *event.Event {
 
 	// Parse A2A message parts to extract content and tool information
-	parseResult := parseA2AMessageParts(msg)
+	parseResult := parseA2AMessagePartsWithMappers(msg, d.dataPartMappers)
 
 	// Create event with appropriate response structure
 	return buildEventResponse(isStreaming, msg.MessageID, parseResult, invocation, agentName, msg.Role)
@@ -237,6 +339,8 @@ type parseResult struct {
 
 	// reasoningContent holds thought/reasoning content from TextParts with thought metadata
 	reasoningContent string
+
+	contentParts []model.ContentPart
 
 	// toolCalls holds function call requests (assistant -> tool)
 	toolCalls []model.ToolCall
@@ -256,6 +360,21 @@ type parseResult struct {
 
 	// tag holds the event tag from A2A message metadata
 	tag string
+
+	// responseID holds the original LLM Response.ID from A2A message metadata
+	responseID string
+
+	// taskState holds the remote task lifecycle state when present.
+	taskState protocol.TaskState
+
+	// responseError holds structured error fields reconstructed from metadata.
+	responseError *model.ResponseError
+
+	// stateDelta holds structured state updates reconstructed from A2A metadata.
+	stateDelta map[string][]byte
+
+	// extensions holds custom event payloads reconstructed by DataPart mappers.
+	extensions map[string]json.RawMessage
 }
 
 // toolResponseData holds tool response information
@@ -265,26 +384,91 @@ type toolResponseData struct {
 	content string
 }
 
+func newDataPartMappingResult(result *parseResult) *A2ADataPartMappingResult {
+	if result == nil {
+		return &A2ADataPartMappingResult{}
+	}
+	return &A2ADataPartMappingResult{
+		textContent:         result.textContent,
+		reasoningContent:    result.reasoningContent,
+		codeExecution:       result.codeExecution,
+		codeExecutionResult: result.codeExecutionResult,
+		eventExtensions:     cloneA2AExtensions(result.extensions),
+	}
+}
+
+func applyDataPartMappingResult(dst *parseResult, mapped *A2ADataPartMappingResult) {
+	if dst == nil || mapped == nil {
+		return
+	}
+	if mapped.textContentSet {
+		dst.textContent = mapped.textContent
+	}
+	if mapped.reasoningContentSet {
+		dst.reasoningContent = mapped.reasoningContent
+	}
+	if mapped.codeExecutionSet {
+		dst.codeExecution = mapped.codeExecution
+	}
+	if mapped.codeExecutionResultSet {
+		dst.codeExecutionResult = mapped.codeExecutionResult
+	}
+	if len(mapped.eventExtensions) > 0 {
+		if dst.extensions == nil {
+			dst.extensions = make(map[string]json.RawMessage, len(mapped.eventExtensions))
+		}
+		for key, raw := range mapped.eventExtensions {
+			dst.extensions[key] = cloneA2AExtensionRawMessage(raw)
+		}
+	}
+	if len(mapped.toolCalls) > 0 {
+		dst.toolCalls = append(dst.toolCalls, mapped.toolCalls...)
+	}
+	if len(mapped.toolResponses) > 0 {
+		for _, resp := range mapped.toolResponses {
+			dst.toolResponses = append(dst.toolResponses, toolResponseData{
+				id:      resp.ID,
+				name:    resp.Name,
+				content: resp.Content,
+			})
+		}
+	}
+}
+
 // parseA2AMessageParts processes all parts in the A2A message and extracts content and tool information
 func parseA2AMessageParts(msg *protocol.Message) *parseResult {
+	return parseA2AMessagePartsWithMappers(msg, nil)
+}
+
+func parseA2AMessagePartsWithMappers(
+	msg *protocol.Message,
+	mappers []A2ADataPartMapper,
+) *parseResult {
 	parts := msg.Parts
-	var textContent strings.Builder
-	var reasoningContent strings.Builder
 	result := &parseResult{}
+	var textBuilder strings.Builder
+	var reasoningBuilder strings.Builder
 
 	for _, part := range parts {
 		switch part.GetKind() {
 		case protocol.KindText:
 			text, isThought := processTextPart(part)
 			if isThought {
-				reasoningContent.WriteString(text)
+				reasoningBuilder.WriteString(text)
 			} else {
-				textContent.WriteString(text)
+				textBuilder.WriteString(text)
 			}
 		case protocol.KindData:
-			processDataPart(part, result)
+			flushParseResultText(result, &textBuilder, &reasoningBuilder)
+			processDataPartWithMappers(part, result, mappers)
+		case protocol.KindFile:
+			flushParseResultText(result, &textBuilder, &reasoningBuilder)
+			if contentPart := convertResponseFilePart(part); contentPart != nil {
+				result.contentParts = append(result.contentParts, *contentPart)
+			}
 		}
 	}
+	flushParseResultText(result, &textBuilder, &reasoningBuilder)
 
 	if msg.Metadata != nil {
 		if objectType, ok := msg.Metadata[ia2a.MessageMetadataObjectTypeKey].(string); ok {
@@ -293,17 +477,161 @@ func parseA2AMessageParts(msg *protocol.Message) *parseResult {
 		if tag, ok := msg.Metadata[ia2a.MessageMetadataTagKey].(string); ok {
 			result.tag = tag
 		}
+		if responseID, ok := msg.Metadata[ia2a.MessageMetadataResponseIDKey].(string); ok {
+			result.responseID = responseID
+		}
+		if stateDelta, ok := msg.Metadata[ia2a.MessageMetadataStateDeltaKey]; ok {
+			result.stateDelta = ia2a.DecodeStateDeltaMetadata(stateDelta)
+		}
 	}
 
-	result.textContent = textContent.String()
-	result.reasoningContent = reasoningContent.String()
+	result.taskState = taskStateFromMetadata(msg.Metadata)
+	result.responseError = ia2a.ResponseErrorFromMetadata(
+		msg.Metadata,
+		result.textContent,
+		model.ErrorTypeFlowError,
+	)
 	return result
+}
+
+func convertResponseFilePart(part protocol.Part) *model.ContentPart {
+	var filePart *protocol.FilePart
+	switch value := part.(type) {
+	case *protocol.FilePart:
+		filePart = value
+	case protocol.FilePart:
+		filePart = &value
+	default:
+		return nil
+	}
+	if filePart == nil {
+		return nil
+	}
+
+	switch file := filePart.File.(type) {
+	case *protocol.FileWithBytes:
+		if file == nil {
+			return nil
+		}
+		data, err := base64.StdEncoding.DecodeString(file.Bytes)
+		if err != nil {
+			log.Warnf("decode A2A file part: %v; using raw bytes", err)
+			data = []byte(file.Bytes)
+		}
+		name, mimeType, contentType := legacyA2AFileIdentity(
+			filePart,
+			file.Name,
+			file.MimeType,
+		)
+		switch contentType {
+		case ia2a.FilePartMetadataContentTypeImage:
+			return &model.ContentPart{Type: model.ContentTypeImage, Image: &model.Image{
+				Data: data, Format: mimeType,
+			}}
+		case ia2a.FilePartMetadataContentTypeAudio:
+			return &model.ContentPart{Type: model.ContentTypeAudio, Audio: &model.Audio{
+				Data: data, Format: mimeType,
+			}}
+		default:
+			return &model.ContentPart{Type: model.ContentTypeFile, File: &model.File{
+				Name: name, Data: data, MimeType: mimeType,
+			}}
+		}
+	case *protocol.FileWithURI:
+		if file == nil {
+			return nil
+		}
+		name, mimeType, contentType := legacyA2AFileIdentity(
+			filePart,
+			file.Name,
+			file.MimeType,
+		)
+		if contentType == ia2a.FilePartMetadataContentTypeImage {
+			return &model.ContentPart{Type: model.ContentTypeImage, Image: &model.Image{
+				URL: file.URI, Format: mimeType,
+			}}
+		}
+		return &model.ContentPart{Type: model.ContentTypeFile, File: &model.File{
+			Name: name, URL: file.URI, MimeType: mimeType,
+		}}
+	default:
+		return nil
+	}
+}
+
+func legacyA2AFileIdentity(
+	filePart *protocol.FilePart,
+	name *string,
+	mimeType *string,
+) (string, string, string) {
+	var resolvedName, resolvedMimeType string
+	if name != nil {
+		resolvedName = *name
+	}
+	if mimeType != nil {
+		resolvedMimeType = *mimeType
+	}
+	if contentType, ok := filePart.Metadata[ia2a.FilePartMetadataContentTypeKey].(string); ok && contentType != "" {
+		return resolvedName, resolvedMimeType, contentType
+	}
+	normalizedMimeType := strings.TrimSpace(strings.ToLower(resolvedMimeType))
+	switch {
+	case strings.HasPrefix(normalizedMimeType, "image/"):
+		return resolvedName, resolvedMimeType, ia2a.FilePartMetadataContentTypeImage
+	case strings.HasPrefix(normalizedMimeType, "audio/"):
+		return resolvedName, resolvedMimeType, ia2a.FilePartMetadataContentTypeAudio
+	case normalizedMimeType == "png",
+		normalizedMimeType == "jpg",
+		normalizedMimeType == "jpeg",
+		normalizedMimeType == "gif",
+		normalizedMimeType == "webp",
+		normalizedMimeType == "bmp",
+		normalizedMimeType == "tiff":
+		return resolvedName, resolvedMimeType, ia2a.FilePartMetadataContentTypeImage
+	case normalizedMimeType == "mp3",
+		normalizedMimeType == "wav",
+		normalizedMimeType == "mpeg",
+		normalizedMimeType == "mpga",
+		normalizedMimeType == "ogg",
+		normalizedMimeType == "flac",
+		normalizedMimeType == "m4a",
+		normalizedMimeType == "aac":
+		return resolvedName, resolvedMimeType, ia2a.FilePartMetadataContentTypeAudio
+	case resolvedName == ia2a.FilePartMetadataContentTypeImage:
+		return resolvedName, resolvedMimeType, ia2a.FilePartMetadataContentTypeImage
+	case resolvedName == ia2a.FilePartMetadataContentTypeAudio:
+		return resolvedName, resolvedMimeType, ia2a.FilePartMetadataContentTypeAudio
+	default:
+		return resolvedName, resolvedMimeType, ia2a.FilePartMetadataContentTypeFile
+	}
+}
+
+func flushParseResultText(
+	result *parseResult,
+	textBuilder *strings.Builder,
+	reasoningBuilder *strings.Builder,
+) {
+	if result == nil {
+		return
+	}
+	if textBuilder != nil && textBuilder.Len() > 0 {
+		result.textContent += textBuilder.String()
+		textBuilder.Reset()
+	}
+	if reasoningBuilder != nil && reasoningBuilder.Len() > 0 {
+		result.reasoningContent += reasoningBuilder.String()
+		reasoningBuilder.Reset()
+	}
 }
 
 // processTextPart processes a TextPart and returns its content and whether it's a thought
 func processTextPart(part protocol.Part) (text string, isThought bool) {
-	p, ok := part.(*protocol.TextPart)
-	if !ok {
+	var p *protocol.TextPart
+	if textPart, ok := part.(*protocol.TextPart); ok {
+		p = textPart
+	} else if textPart, ok := part.(protocol.TextPart); ok {
+		p = &textPart
+	} else {
 		log.Warnf("unexpected part type: %T", part)
 		return "", false
 	}
@@ -329,37 +657,75 @@ func processTextPart(part protocol.Part) (text string, isThought bool) {
 
 // processDataPart processes a DataPart and updates the parseResult accordingly
 func processDataPart(part protocol.Part, result *parseResult) {
-	d, ok := part.(*protocol.DataPart)
-	if !ok {
+	processDataPartWithMappers(part, result, nil)
+}
+
+func processDataPartWithMappers(
+	part protocol.Part,
+	result *parseResult,
+	mappers []A2ADataPartMapper,
+) {
+	var d *protocol.DataPart
+	if dataPart, ok := part.(*protocol.DataPart); ok {
+		d = dataPart
+	} else if dataPart, ok := part.(protocol.DataPart); ok {
+		d = &dataPart
+	} else {
 		return
 	}
 
 	// Use GetDataPartType to get the type with correct precedence (adk_type first, then type)
 	// GetDataPartType handles nil metadata internally
 	typeStr := ia2a.GetDataPartType(d.Metadata)
-	if typeStr == "" {
+	builtInHandled := false
+	if typeStr != "" {
+		switch typeStr {
+		case ia2a.DataPartMetadataTypeFunctionCall:
+			if toolCall := processFunctionCall(d); toolCall != nil {
+				result.toolCalls = append(result.toolCalls, *toolCall)
+			}
+			builtInHandled = true
+		case ia2a.DataPartMetadataTypeFunctionResp:
+			content, id, name := processFunctionResponse(d)
+			result.toolResponses = append(result.toolResponses, toolResponseData{
+				id:      id,
+				name:    name,
+				content: content,
+			})
+			builtInHandled = true
+		case ia2a.DataPartMetadataTypeExecutableCode:
+			result.codeExecution = processExecutableCode(d)
+			builtInHandled = true
+		case ia2a.DataPartMetadataTypeCodeExecutionResult:
+			result.codeExecutionResult = processCodeExecutionResult(d)
+			builtInHandled = true
+		}
+	}
+
+	if builtInHandled {
 		return
 	}
 
-	switch typeStr {
-	case ia2a.DataPartMetadataTypeFunctionCall:
-		if toolCall := processFunctionCall(d); toolCall != nil {
-			result.toolCalls = append(result.toolCalls, *toolCall)
+	for _, mapper := range mappers {
+		if mapper == nil {
+			continue
 		}
-	case ia2a.DataPartMetadataTypeFunctionResp:
-		content, id, name := processFunctionResponse(d)
-		result.toolResponses = append(result.toolResponses, toolResponseData{
-			id:      id,
-			name:    name,
-			content: content,
-		})
-	case ia2a.DataPartMetadataTypeExecutableCode:
-		result.codeExecution = processExecutableCode(d)
-	case ia2a.DataPartMetadataTypeCodeExecutionResult:
-		result.codeExecutionResult = processCodeExecutionResult(d)
-	default:
-		log.Debugf("unknown DataPart type: %s", typeStr)
+		mappedResult := newDataPartMappingResult(result)
+		matched, err := mapper(d, mappedResult)
+		if err != nil {
+			log.Warnf("A2ADataPartMapper returns error, skip part: %v", err)
+			continue
+		}
+		if matched {
+			applyDataPartMappingResult(result, mappedResult)
+			return
+		}
 	}
+	if typeStr == "" {
+		log.Debugf("unknown DataPart with empty type skipped")
+		return
+	}
+	log.Debugf("unknown DataPart type skipped: %s", typeStr)
 }
 
 // processFunctionCall processes a function call DataPart and returns the ToolCall
@@ -384,8 +750,19 @@ func processFunctionCall(d *protocol.DataPart) *model.ToolCall {
 		toolCall.Function.Name = name
 	}
 
-	if args, ok := data[ia2a.ToolCallFieldArgs].(string); ok {
-		toolCall.Function.Arguments = []byte(args)
+	if args, ok := data[ia2a.ToolCallFieldArgs]; ok {
+		switch v := args.(type) {
+		case string:
+			toolCall.Function.Arguments = []byte(v)
+		case map[string]any:
+			if jsonBytes, err := json.Marshal(v); err == nil {
+				toolCall.Function.Arguments = jsonBytes
+			} else {
+				log.Warnf("Failed to marshal tool call arguments: %v", err)
+			}
+		default:
+			log.Warnf("Tool call arguments has unexpected type: %T", v)
+		}
 	}
 
 	// Validate that we have at least a name
@@ -413,12 +790,19 @@ func processFunctionResponse(d *protocol.DataPart) (content string, id string, n
 		name = toolName
 	}
 
-	// Extract response content - server sends it as raw string
+	// Extract response content. Keep strings as-is, otherwise prefer JSON for
+	// structured values.
 	if response, ok := data[ia2a.ToolCallFieldResponse]; ok {
 		if responseStr, ok := response.(string); ok {
 			content = responseStr
+		} else if jsonBytes, err := json.Marshal(response); err == nil {
+			content = string(jsonBytes)
 		} else {
-			log.Debugf("Tool response is not a string: %T, skip", response)
+			log.Infof(
+				"Tool response JSON marshal failed for type %T, skip: %v",
+				response,
+				err,
+			)
 		}
 	}
 
@@ -481,16 +865,44 @@ func buildEventResponse(
 	if result.tag != "" {
 		opts = append(opts, event.WithTag(result.tag))
 	}
-
-	evt := event.New(invocation.InvocationID, agentName, opts...)
-
-	if isStreaming {
-		evt.Response = buildStreamingResponse(messageID, result, role)
-	} else {
-		evt.Response = buildNonStreamingResponse(messageID, result, role)
+	if result.stateDelta != nil {
+		opts = append(opts, event.WithStateDelta(result.stateDelta))
 	}
 
+	evt := event.New(invocation.InvocationID, agentName, opts...)
+	if len(result.extensions) > 0 {
+		evt.Extensions = cloneA2AExtensions(result.extensions)
+	}
+
+	// Use llm_response_id from metadata when available (preserves original LLM Response.ID),
+	// fall back to messageID (which is ArtifactID in streaming, or Message.MessageID in unary).
+	respID := messageID
+	if result.responseID != "" {
+		respID = result.responseID
+	}
+
+	if isStreaming {
+		evt.Response = buildStreamingResponse(respID, result, role)
+	} else {
+		evt.Response = buildNonStreamingResponse(respID, result, role)
+	}
+	markGraphCompletionEvent(evt, result)
+
 	return evt
+}
+
+func markGraphCompletionEvent(evt *event.Event, result *parseResult) {
+	if evt == nil || evt.Response == nil || result == nil {
+		return
+	}
+	if result.objectType != graph.ObjectTypeGraphExecution {
+		return
+	}
+
+	// graph.execution is a terminal subgraph event. Preserve completion
+	// semantics so parent graph agent nodes can reconstruct final state.
+	evt.Response.Done = true
+	evt.Response.IsPartial = false
 }
 
 // buildStreamingResponse creates a response for streaming mode.
@@ -499,6 +911,12 @@ func buildEventResponse(
 // - Text content uses Delta for incremental updates
 func buildStreamingResponse(messageID string, result *parseResult, role protocol.MessageRole) *model.Response {
 	now := time.Now()
+	if respErr := terminalStreamingResponseError(result); respErr != nil {
+		return buildErrorResponse(messageID, respErr, now)
+	}
+	if result != nil && result.responseError != nil {
+		return buildRecoverableErrorResponse(messageID, result, role, now)
+	}
 
 	// Tool call: use Message (tool calls are complete units, not streamed incrementally)
 	if len(result.toolCalls) > 0 {
@@ -510,6 +928,7 @@ func buildStreamingResponse(messageID string, result *parseResult, role protocol
 					Content:          result.textContent,
 					ReasoningContent: result.reasoningContent,
 					ToolCalls:        result.toolCalls,
+					ContentParts:     result.contentParts,
 				},
 			}},
 			Object:    model.ObjectTypeChatCompletion,
@@ -536,7 +955,7 @@ func buildStreamingResponse(messageID string, result *parseResult, role protocol
 		return &model.Response{
 			ID:        messageID,
 			Choices:   choices,
-			Object:    model.ObjectTypeChatCompletion,
+			Object:    model.ObjectTypeToolResponse,
 			Timestamp: now,
 			Created:   now.Unix(),
 			IsPartial: false,
@@ -545,14 +964,8 @@ func buildStreamingResponse(messageID string, result *parseResult, role protocol
 	}
 
 	// Text content: use Delta for streaming incremental updates
-	content := result.textContent
-	if result.codeExecution != "" {
-		content = result.codeExecution
-	} else if result.codeExecutionResult != "" {
-		content = result.codeExecutionResult
-	}
-
-	objectType := extractObjectType(result)
+	content := streamingResponseContent(result)
+	objectType := streamingResponseObjectType(result)
 	if objectType == "" {
 		objectType = model.ObjectTypeChatCompletionChunk
 	}
@@ -566,6 +979,7 @@ func buildStreamingResponse(messageID string, result *parseResult, role protocol
 				Role:             internalRole,
 				Content:          content,
 				ReasoningContent: result.reasoningContent,
+				ContentParts:     result.contentParts,
 			},
 		}},
 		Object:    objectType,
@@ -574,6 +988,51 @@ func buildStreamingResponse(messageID string, result *parseResult, role protocol
 		IsPartial: true,
 		Done:      false,
 	}
+}
+
+func terminalStreamingResponseError(result *parseResult) *model.ResponseError {
+	if result == nil || !isTaskFailureState(result.taskState) {
+		return nil
+	}
+	if result.responseError != nil {
+		return result.responseError
+	}
+	message := result.textContent
+	if message == "" {
+		message = taskFailureMessage(result.taskState)
+	}
+	return &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: message,
+	}
+}
+
+func streamingResponseContent(result *parseResult) string {
+	if result == nil {
+		return ""
+	}
+	content := result.textContent
+	if result.codeExecution != "" {
+		content = result.codeExecution
+	} else if result.codeExecutionResult != "" {
+		content = result.codeExecutionResult
+	}
+	// Some A2A servers surface invocation errors as a regular message decorated
+	// with structured error metadata. Preserve that message as normal stream
+	// content so callers can drain the stream to EOF instead of short-circuiting.
+	if content == "" && result.responseError != nil && !isTaskFailureState(result.taskState) {
+		content = result.responseError.Message
+	}
+	return content
+}
+
+func streamingResponseObjectType(result *parseResult) string {
+	objectType := extractObjectType(result)
+	if objectType == model.ObjectTypeError && result != nil &&
+		result.responseError != nil && !isTaskFailureState(result.taskState) {
+		return ""
+	}
+	return objectType
 }
 
 // extractObjectType determines the response object type from parseResult.
@@ -590,8 +1049,10 @@ func extractObjectType(result *parseResult) string {
 		return model.ObjectTypeChatCompletion
 	}
 
-	// Both code execution and code execution result use the same ObjectType.
-	// The distinction is made via the Tag field.
+	if len(result.toolResponses) > 0 {
+		return model.ObjectTypeToolResponse
+	}
+
 	if len(result.codeExecution) > 0 || len(result.codeExecutionResult) > 0 {
 		return model.ObjectTypePostprocessingCodeExecution
 	}
@@ -603,6 +1064,9 @@ func extractObjectType(result *parseResult) string {
 // In non-streaming mode, all content uses Message (not Delta).
 func buildNonStreamingResponse(messageID string, result *parseResult, role protocol.MessageRole) *model.Response {
 	now := time.Now()
+	if respErr := taskResponseError(result); respErr != nil {
+		return buildErrorResponse(messageID, respErr, now)
+	}
 	var choices []model.Choice
 	// Tool call: assistant requesting tool execution
 	if len(result.toolCalls) > 0 {
@@ -612,6 +1076,7 @@ func buildNonStreamingResponse(messageID string, result *parseResult, role proto
 				Content:          result.textContent,
 				ReasoningContent: result.reasoningContent,
 				ToolCalls:        result.toolCalls,
+				ContentParts:     result.contentParts,
 			},
 		})
 	}
@@ -632,19 +1097,16 @@ func buildNonStreamingResponse(messageID string, result *parseResult, role proto
 
 	// Text content: final assistant response
 	// Only add if no tool calls (tool calls already include text content)
-	if len(result.toolCalls) == 0 && (result.textContent != "" || result.reasoningContent != "" || result.codeExecution != "" || result.codeExecutionResult != "") {
-		content := result.textContent
-		if result.codeExecution != "" {
-			content = result.codeExecution
-		} else if result.codeExecutionResult != "" {
-			content = result.codeExecutionResult
-		}
+	content := nonStreamingResponseContent(result)
+	if len(result.toolCalls) == 0 &&
+		(content != "" || result.reasoningContent != "" || len(result.contentParts) > 0) {
 		internalRole := convertA2ARoleToModelRole(role)
 		choices = append(choices, model.Choice{
 			Message: model.Message{
 				Role:             internalRole,
 				Content:          content,
 				ReasoningContent: result.reasoningContent,
+				ContentParts:     result.contentParts,
 			},
 		})
 	}
@@ -659,7 +1121,7 @@ func buildNonStreamingResponse(messageID string, result *parseResult, role proto
 		}}
 	}
 
-	objectType := extractObjectType(result)
+	objectType := nonStreamingResponseObjectType(result)
 	if objectType == "" {
 		objectType = model.ObjectTypeChatCompletion
 	}
@@ -673,6 +1135,174 @@ func buildNonStreamingResponse(messageID string, result *parseResult, role proto
 		IsPartial: false,
 		Done:      false,
 	}
+}
+
+func buildErrorResponse(
+	messageID string,
+	respErr *model.ResponseError,
+	now time.Time,
+) *model.Response {
+	return &model.Response{
+		ID:        messageID,
+		Object:    model.ObjectTypeError,
+		Timestamp: now,
+		Created:   now.Unix(),
+		IsPartial: false,
+		Done:      true,
+		Error:     respErr,
+	}
+}
+
+func taskResponseError(
+	result *parseResult,
+) *model.ResponseError {
+	if result == nil {
+		return nil
+	}
+	if result.responseError != nil {
+		return result.responseError
+	}
+	if !isTaskFailureState(result.taskState) {
+		return nil
+	}
+	message := result.textContent
+	if message == "" {
+		message = taskFailureMessage(result.taskState)
+	}
+	return &model.ResponseError{
+		Type:    model.ErrorTypeFlowError,
+		Message: message,
+	}
+}
+
+func buildRecoverableErrorResponse(messageID string, result *parseResult, role protocol.MessageRole, now time.Time) *model.Response {
+	content := streamingResponseContent(result)
+	objectType := streamingResponseObjectType(result)
+	if objectType == "" || objectType == model.ObjectTypeError {
+		objectType = model.ObjectTypeChatCompletion
+	}
+	return &model.Response{
+		ID: messageID,
+		Choices: []model.Choice{{
+			Message: model.Message{
+				Role:             convertA2ARoleToModelRole(role),
+				Content:          content,
+				ReasoningContent: result.reasoningContent,
+				ContentParts:     result.contentParts,
+			},
+		}},
+		Object:    objectType,
+		Timestamp: now,
+		Created:   now.Unix(),
+		IsPartial: false,
+		Done:      false,
+		Error:     result.responseError,
+	}
+}
+
+func markTerminalStructuredErrorEvent(evt *event.Event, result protocol.StreamingMessageResult) {
+	if evt == nil || evt.Response == nil || evt.Response.Error == nil {
+		return
+	}
+	switch v := result.(type) {
+	case *protocol.TaskStatusUpdateEvent:
+		if isTaskFailureState(v.Status.State) || v.IsFinal() {
+			evt.Response.Done = true
+			evt.Response.IsPartial = false
+			evt.Response.Object = model.ObjectTypeError
+		}
+	case *protocol.TaskArtifactUpdateEvent:
+		if v.IsFinal() {
+			evt.Response.Done = true
+			evt.Response.IsPartial = false
+			evt.Response.Object = model.ObjectTypeError
+		}
+	}
+}
+
+func hasStructuredErrorMetadata(metadata map[string]any) bool {
+	return ia2a.ResponseErrorFromMetadata(metadata, "", "") != nil
+}
+
+func nonStreamingResponseContent(result *parseResult) string {
+	if result == nil {
+		return ""
+	}
+	content := result.textContent
+	if result.codeExecution != "" {
+		content = result.codeExecution
+	} else if result.codeExecutionResult != "" {
+		content = result.codeExecutionResult
+	}
+	if content == "" && result.responseError != nil && !isTaskFailureState(result.taskState) {
+		content = result.responseError.Message
+	}
+	return content
+}
+
+func nonStreamingResponseObjectType(result *parseResult) string {
+	objectType := extractObjectType(result)
+	if objectType == model.ObjectTypeError && result != nil &&
+		result.responseError != nil && !isTaskFailureState(result.taskState) {
+		return ""
+	}
+	return objectType
+}
+
+func taskFailureMessage(
+	state protocol.TaskState,
+) string {
+	switch state {
+	case protocol.TaskStateCanceled:
+		return "remote task canceled"
+	case protocol.TaskStateRejected:
+		return "remote task rejected"
+	default:
+		return "remote task failed"
+	}
+}
+
+func isTaskFailureState(
+	state protocol.TaskState,
+) bool {
+	switch state {
+	case protocol.TaskStateFailed,
+		protocol.TaskStateRejected,
+		protocol.TaskStateCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func taskStateFromMetadata(
+	metadata map[string]any,
+) protocol.TaskState {
+	if metadata == nil {
+		return ""
+	}
+	raw, ok := metadata[ia2a.MessageMetadataTaskStateKey].(string)
+	if !ok {
+		return ""
+	}
+	return protocol.TaskState(raw)
+}
+
+func cloneTaskMetadata(
+	metadata map[string]any,
+	taskState protocol.TaskState,
+) map[string]any {
+	if len(metadata) == 0 && taskState == "" {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata)+1)
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	if taskState != "" {
+		cloned[ia2a.MessageMetadataTaskStateKey] = string(taskState)
+	}
+	return cloned
 }
 
 // convertTaskToMessage converts a Task to a Message
@@ -694,7 +1324,7 @@ func convertTaskToMessage(task *protocol.Task) *protocol.Message {
 		Parts:     parts,
 		TaskID:    &task.ID,
 		ContextID: &task.ContextID,
-		Metadata:  task.Metadata,
+		Metadata:  cloneTaskMetadata(task.Metadata, task.Status.State),
 	}
 }
 
@@ -705,7 +1335,7 @@ func convertTaskStatusToMessage(event *protocol.TaskStatusUpdateEvent) *protocol
 		Kind:      protocol.KindMessage,
 		TaskID:    &event.TaskID,
 		ContextID: &event.ContextID,
-		Metadata:  event.Metadata,
+		Metadata:  cloneTaskMetadata(event.Metadata, event.Status.State),
 	}
 	if event.Status.Message != nil {
 		msg.Parts = event.Status.Message.Parts

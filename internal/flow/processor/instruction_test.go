@@ -170,6 +170,37 @@ func TestInstructionProc_Request(t *testing.T) {
 	}
 }
 
+func TestInstructionProcessor_RuntimeStatePlaceholders(t *testing.T) {
+	invocation := &agent.Invocation{
+		AgentName:    testAgentName,
+		InvocationID: testInvocationID,
+		RunOptions: agent.RunOptions{RuntimeState: map[string]any{
+			"document": "Current draft",
+			"version":  2,
+		}},
+	}
+	req := &model.Request{}
+	processor := NewInstructionRequestProcessor(
+		"Draft: {runtime:document}",
+		"Version: {runtime:version}",
+	)
+
+	processor.ProcessRequest(
+		context.Background(),
+		invocation,
+		req,
+		make(chan *event.Event, 1),
+	)
+
+	require.Len(t, req.Messages, 1)
+	require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+	require.Equal(
+		t,
+		"Version: 2\n\nDraft: Current draft",
+		req.Messages[0].Content,
+	)
+}
+
 func TestFindSystemMessageIndex(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -310,7 +341,7 @@ func TestInstructionProcessor_DynamicResolvers(t *testing.T) {
 	require.NotContains(t, req.Messages[0].Content, testDynamicSystemPrompt)
 }
 
-func TestInstructionProcessor_RunOptionsOverride(t *testing.T) {
+func TestInstructionProcessor_RunOptionsOverrideWithoutResolvers(t *testing.T) {
 	ctx := context.Background()
 	req := &model.Request{
 		Messages: []model.Message{},
@@ -328,18 +359,6 @@ func TestInstructionProcessor_RunOptionsOverride(t *testing.T) {
 	processor := NewInstructionRequestProcessor(
 		testInstructionContent,
 		testSystemPromptContent,
-		WithInstructionGetter(func() string {
-			return testDynamicInstruction
-		}),
-		WithSystemPromptGetter(func() string {
-			return testDynamicSystemPrompt
-		}),
-		WithInstructionResolver(func(*agent.Invocation) string {
-			return testResolvedInstruction
-		}),
-		WithSystemPromptResolver(func(*agent.Invocation) string {
-			return testResolvedSystemPrompt
-		}),
 	)
 
 	processor.ProcessRequest(ctx, inv, req, eventCh)
@@ -353,6 +372,44 @@ func TestInstructionProcessor_RunOptionsOverride(t *testing.T) {
 	require.NotContains(t, sysMsg.Content, testResolvedSystemPrompt)
 	require.NotContains(t, sysMsg.Content, testDynamicInstruction)
 	require.NotContains(t, sysMsg.Content, testDynamicSystemPrompt)
+}
+
+func TestInstructionProcessor_ResolversOverrideRunOptions(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	req := &model.Request{
+		Messages: []model.Message{},
+	}
+	inv := &agent.Invocation{
+		AgentName:    testAgentName,
+		InvocationID: testInvocationID,
+		RunOptions: agent.RunOptions{
+			Instruction:       testRunInstruction,
+			GlobalInstruction: testRunSystemPrompt,
+		},
+	}
+	eventCh := make(chan *event.Event, 1)
+	processor := NewInstructionRequestProcessor(
+		testInstructionContent,
+		testSystemPromptContent,
+		WithInstructionResolver(func(*agent.Invocation) string {
+			return testResolvedInstruction
+		}),
+		WithSystemPromptResolver(func(*agent.Invocation) string {
+			return testResolvedSystemPrompt
+		}),
+	)
+
+	processor.ProcessRequest(ctx, inv, req, eventCh)
+
+	require.NotEmpty(t, req.Messages)
+	sysMsg := req.Messages[0]
+	require.Equal(t, model.RoleSystem, sysMsg.Role)
+	require.Contains(t, sysMsg.Content, testResolvedInstruction)
+	require.Contains(t, sysMsg.Content, testResolvedSystemPrompt)
+	require.NotContains(t, sysMsg.Content, testRunInstruction)
+	require.NotContains(t, sysMsg.Content, testRunSystemPrompt)
 }
 
 func TestInstructionProcessor_ProcessRequest_NilRequest(t *testing.T) {
@@ -371,6 +428,27 @@ func TestInstructionProcessor_ProcessRequest_NilRequest(t *testing.T) {
 	processor.ProcessRequest(ctx, inv, nil, eventCh)
 
 	require.Equal(t, 0, len(eventCh))
+}
+
+func TestInstructionProcessor_ProcessRequest_EmptyInstructionDoesNotEmitEvent(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	inv := &agent.Invocation{
+		AgentName:    testAgentName,
+		InvocationID: testInvocationID,
+	}
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("hi")},
+	}
+	eventCh := make(chan *event.Event, 1)
+	processor := NewInstructionRequestProcessor("", "")
+
+	processor.ProcessRequest(ctx, inv, req, eventCh)
+
+	require.Len(t, req.Messages, 1)
+	require.Equal(t, model.RoleUser, req.Messages[0].Role)
+	require.Len(t, eventCh, 0)
 }
 
 func TestInstructionProcessor_SendPreprocessingEvent(t *testing.T) {

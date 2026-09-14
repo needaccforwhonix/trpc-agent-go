@@ -18,10 +18,79 @@ import (
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/session/summaryrestore"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/summaryfork"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/summaryview"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/toolresultround"
+	"trpc.group/trpc-go/trpc-agent-go/internal/summarytrigger"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	"trpc.group/trpc-go/trpc-agent-go/session/summary"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
+
+func TestRunnerEnqueuesModelVisibleSummaryView(t *testing.T) {
+	service := &mockSessionService{}
+	r := NewRunner(
+		"test-app",
+		&mockAgent{name: "test-agent"},
+		WithSessionService(service),
+	).(*runner)
+	sess := &session.Session{ID: "session"}
+	invocation := agent.NewInvocation(agent.WithInvocationSession(sess))
+	summaryview.AttachProjection(invocation, &summaryview.View{
+		SessionID:     sess.ID,
+		RequestTokens: 13_310,
+	})
+	evt := &event.Event{
+		Author: "assistant",
+		Response: &model.Response{
+			Done: true,
+			Choices: []model.Choice{{
+				Message: model.NewAssistantMessage("answer"),
+			}},
+		},
+	}
+
+	require.True(t, r.handleEventPersistence(
+		context.Background(),
+		invocation,
+		sess,
+		sess,
+		evt,
+	))
+	require.Len(t, service.enqueueSummaryJobCalls, 1)
+	view, ok := summaryview.FromContext(service.enqueueSummaryJobCalls[0].ctx)
+	require.True(t, ok)
+	require.Equal(t, 13_310, view.RequestTokens)
+}
+
+func TestRunnerPersistsErrorEventWithoutEnqueuingSummary(t *testing.T) {
+	service := &mockSessionService{}
+	r := NewRunner(
+		"test-app",
+		&mockAgent{name: "test-agent"},
+		WithSessionService(service),
+	).(*runner)
+	sess := &session.Session{ID: "session"}
+	invocation := agent.NewInvocation(agent.WithInvocationSession(sess))
+	errorEvent := errorEventWithContent(event.NewErrorEvent(
+		invocation.InvocationID,
+		"test-agent",
+		agent.ErrorTypeStopAgentError,
+		"cancelled",
+	))
+
+	require.True(t, r.handleEventPersistence(
+		context.Background(),
+		invocation,
+		sess,
+		sess,
+		errorEvent,
+	))
+	require.Len(t, service.appendEventCalls, 1)
+	require.Empty(t, service.enqueueSummaryJobCalls)
+}
 
 func TestRunner_EnqueueSummaryJob_Calls(t *testing.T) {
 	t.Run("calls EnqueueSummaryJob for qualifying events", func(t *testing.T) {
@@ -166,6 +235,7 @@ func TestRunner_EnqueueSummaryJob_ContextValuePreserved(t *testing.T) {
 	userID := "test-user"
 	sessionID := "test-session"
 
+	requestStartedLowerBound := time.Now().Add(-time.Second)
 	// Run the runner with qualifying event
 	_, err := RunWithMessages(ctx, runner, userID, sessionID, []model.Message{
 		{Role: model.RoleUser, Content: "Hello"},
@@ -182,22 +252,247 @@ func TestRunner_EnqueueSummaryJob_ContextValuePreserved(t *testing.T) {
 
 	// Verify the context value was preserved and passed to EnqueueSummaryJob
 	assert.Equal(t, "trace-12345", contextCapturingService.capturedTraceID, "Context value should be preserved and passed to EnqueueSummaryJob")
+	require.True(t, contextCapturingService.capturedRequestStartOK)
+	assert.NotEmpty(t, contextCapturingService.capturedRequestStart.RequestID)
+	assert.True(t, contextCapturingService.capturedRequestStart.StartedAt.After(requestStartedLowerBound))
+	assert.False(t, contextCapturingService.capturedRequestStart.StartedAt.After(time.Now()))
+}
+
+func TestRunner_EnqueueSummaryJob_AttachesCacheSafeForkRequest(t *testing.T) {
+	parent := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("stable system"),
+			model.NewUserMessage("parent request"),
+		},
+	}
+	svc := &cacheSafeForkCapturingSessionService{
+		mockSessionService: &mockSessionService{},
+		done:               make(chan struct{}),
+	}
+	r := NewRunner(
+		"test-app",
+		&cacheSafeForkMockAgent{name: "fork-agent", parent: parent},
+		WithSessionService(svc),
+	)
+
+	_, err := RunWithMessages(
+		context.Background(),
+		r,
+		"user1",
+		"sess1",
+		[]model.Message{{Role: model.RoleUser, Content: "hello"}},
+	)
+	require.NoError(t, err)
+
+	select {
+	case <-svc.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for context to be captured")
+	}
+
+	require.True(t, svc.capturedOK)
+	require.NotNil(t, svc.capturedParent)
+	require.Equal(
+		t,
+		[]model.Message{
+			model.NewSystemMessage("stable system"),
+			model.NewUserMessage("parent request"),
+			model.NewAssistantMessage("final"),
+		},
+		svc.capturedParent.Messages,
+	)
+}
+
+func TestRunner_EnqueueSummaryJob_CacheSafeForkIncludesToolResult(t *testing.T) {
+	parent := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("stable system"),
+			model.NewUserMessage("use lookup"),
+		},
+	}
+	svc := &cacheSafeForkCapturingSessionService{
+		mockSessionService: &mockSessionService{},
+		done:               make(chan struct{}),
+	}
+	r := NewRunner(
+		"test-app",
+		&cacheSafeForkToolResultMockAgent{
+			name:   "fork-agent",
+			parent: parent,
+		},
+		WithSessionService(svc),
+	)
+
+	_, err := RunWithMessages(
+		context.Background(),
+		r,
+		"user1",
+		"sess1",
+		[]model.Message{{Role: model.RoleUser, Content: "hello"}},
+	)
+	require.NoError(t, err)
+
+	select {
+	case <-svc.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for context to be captured")
+	}
+
+	require.True(t, svc.capturedOK)
+	require.NotNil(t, svc.capturedParent)
+	require.Len(t, svc.capturedParent.Messages, 4)
+	require.Equal(t, model.RoleAssistant, svc.capturedParent.Messages[2].Role)
+	require.Len(t, svc.capturedParent.Messages[2].ToolCalls, 1)
+	require.Equal(t, "call_1", svc.capturedParent.Messages[2].ToolCalls[0].ID)
+	require.Equal(t, model.RoleTool, svc.capturedParent.Messages[3].Role)
+	require.Equal(t, "call_1", svc.capturedParent.Messages[3].ToolID)
+	require.Equal(t, `{"answer":"ok"}`, svc.capturedParent.Messages[3].Content)
+}
+
+func TestRunner_PerToolCallResultEventsFailedIntermediatePersistenceUsesStandaloneSummary(
+	t *testing.T,
+) {
+	parent := &model.Request{Messages: []model.Message{
+		model.NewSystemMessage("stable system"),
+		model.NewUserMessage("run both tools"),
+	}}
+	capture := &cacheSafeForkCapturingSessionService{
+		mockSessionService: &mockSessionService{},
+		done:               make(chan struct{}),
+	}
+	svc := &failEventAppendSessionService{
+		Service:     capture,
+		failEventID: "evt-fast-result",
+	}
+	r := NewRunner(
+		"test-app",
+		&cacheSafeForkPerToolCallResultEventsMockAgent{
+			name:   "fork-agent",
+			parent: parent,
+		},
+		WithSessionService(svc),
+	)
+
+	events, err := RunWithMessages(
+		context.Background(),
+		r,
+		"user1",
+		"sess1",
+		[]model.Message{{Role: model.RoleUser, Content: "hello"}},
+	)
+	require.NoError(t, err)
+	for range events {
+	}
+
+	require.Len(t, capture.enqueueSummaryJobCalls, 1)
+	require.False(t, capture.capturedOK)
+	require.Nil(t, capture.capturedParent)
+}
+
+func TestRunner_SummaryAwareSessionRestoreHint(t *testing.T) {
+	t.Run("passes event filter key", func(t *testing.T) {
+		svc := &mockSessionService{}
+		r := NewRunner(
+			"test-app",
+			&mockAgent{name: "test-agent"},
+			WithSessionService(svc),
+		)
+
+		_, err := RunWithMessages(
+			context.Background(),
+			r,
+			"user1",
+			"sess1",
+			[]model.Message{{Role: model.RoleUser, Content: "hello"}},
+			agent.WithEventFilterKey("root/branch"),
+		)
+		require.NoError(t, err)
+		require.NotEmpty(t, svc.getSessionCalls)
+		assert.True(t, svc.getSessionCalls[0].restoreHintOK)
+		assert.Equal(
+			t,
+			"root/branch",
+			svc.getSessionCalls[0].restoreHint,
+		)
+	})
+
+	t.Run("falls back to app name", func(t *testing.T) {
+		svc := &mockSessionService{}
+		r := NewRunner(
+			"test-app",
+			&mockAgent{name: "test-agent"},
+			WithSessionService(svc),
+		)
+
+		_, err := RunWithMessages(
+			context.Background(),
+			r,
+			"user1",
+			"sess1",
+			[]model.Message{{Role: model.RoleUser, Content: "hello"}},
+		)
+		require.NoError(t, err)
+		require.NotEmpty(t, svc.getSessionCalls)
+		assert.True(t, svc.getSessionCalls[0].restoreHintOK)
+		assert.Equal(t, "test-app", svc.getSessionCalls[0].restoreHint)
+	})
+}
+
+// cacheSafeForkCapturingSessionService captures the cache-safe fork request
+// passed to EnqueueSummaryJob.
+type cacheSafeForkCapturingSessionService struct {
+	*mockSessionService
+	capturedParent *model.Request
+	capturedOK     bool
+	done           chan struct{}
+}
+
+func (c *cacheSafeForkCapturingSessionService) EnqueueSummaryJob(
+	ctx context.Context,
+	sess *session.Session,
+	filterKey string,
+	force bool,
+) error {
+	c.capturedParent, c.capturedOK = summary.CacheSafeForkRequestFromContext(ctx)
+	close(c.done)
+	return c.mockSessionService.EnqueueSummaryJob(ctx, sess, filterKey, force)
 }
 
 // contextCapturingSessionService captures the context passed to EnqueueSummaryJob.
 type contextCapturingSessionService struct {
 	*mockSessionService
-	capturedTraceID any
-	done            chan struct{}
+	capturedTraceID        any
+	capturedRequestStart   summarytrigger.RequestStart
+	capturedRequestStartOK bool
+	done                   chan struct{}
 }
 
 func (c *contextCapturingSessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Session, filterKey string, force bool) error {
 	// Capture the trace ID from context
 	c.capturedTraceID = ctx.Value(traceIDKey)
+	c.capturedRequestStart, c.capturedRequestStartOK =
+		summarytrigger.RequestStartFromContext(ctx)
 	close(c.done)
 
 	// Call parent to record the call
 	return c.mockSessionService.EnqueueSummaryJob(ctx, sess, filterKey, force)
+}
+
+type failEventAppendSessionService struct {
+	session.Service
+	failEventID string
+}
+
+func (s *failEventAppendSessionService) AppendEvent(
+	ctx context.Context,
+	sess *session.Session,
+	evt *event.Event,
+	opts ...session.Option,
+) error {
+	if evt != nil && evt.ID == s.failEventID {
+		return assert.AnError
+	}
+	return s.Service.AppendEvent(ctx, sess, evt, opts...)
 }
 
 // nonQualifyingMockAgent generates non-qualifying events (partial responses).
@@ -303,6 +598,203 @@ func (m *stateDeltaMockAgent) Tools() []tool.Tool {
 	return []tool.Tool{}
 }
 
+// cacheSafeForkMockAgent stores a parent request snapshot on the invocation
+// before emitting a final assistant event.
+type cacheSafeForkMockAgent struct {
+	name   string
+	parent *model.Request
+}
+
+func (m *cacheSafeForkMockAgent) Info() agent.Info {
+	return agent.Info{Name: m.name}
+}
+
+func (m *cacheSafeForkMockAgent) SubAgents() []agent.Agent { return nil }
+
+func (m *cacheSafeForkMockAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func (m *cacheSafeForkMockAgent) Tools() []tool.Tool { return nil }
+
+func (m *cacheSafeForkMockAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	summaryfork.Attach(invocation, m.parent)
+	if len(m.parent.Messages) > 1 {
+		m.parent.Messages[1].Content = "mutated after attach"
+	}
+
+	ch := make(chan *event.Event, 1)
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "fork-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:    model.RoleAssistant,
+					Content: "final",
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-fork",
+		Timestamp:    time.Now(),
+	}
+	close(ch)
+	return ch, nil
+}
+
+type cacheSafeForkToolResultMockAgent struct {
+	name   string
+	parent *model.Request
+}
+
+type cacheSafeForkPerToolCallResultEventsMockAgent struct {
+	name   string
+	parent *model.Request
+}
+
+func (m *cacheSafeForkPerToolCallResultEventsMockAgent) Info() agent.Info {
+	return agent.Info{Name: m.name}
+}
+
+func (m *cacheSafeForkPerToolCallResultEventsMockAgent) SubAgents() []agent.Agent {
+	return nil
+}
+
+func (m *cacheSafeForkPerToolCallResultEventsMockAgent) FindSubAgent(string) agent.Agent {
+	return nil
+}
+
+func (m *cacheSafeForkPerToolCallResultEventsMockAgent) Tools() []tool.Tool {
+	return nil
+}
+
+func (m *cacheSafeForkPerToolCallResultEventsMockAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	summaryfork.Attach(invocation, m.parent)
+
+	ch := make(chan *event.Event, 3)
+	ch <- &event.Event{
+		Response: &model.Response{Done: true, Choices: []model.Choice{{
+			Message: model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{
+					{ID: "call-slow"},
+					{ID: "call-fast"},
+				},
+			},
+		}}},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-tool-call",
+		Timestamp:    time.Now(),
+	}
+	fastResult := &event.Event{
+		Response: &model.Response{Done: true, Choices: []model.Choice{{
+			Message: model.NewToolMessage(
+				"call-fast",
+				"fast",
+				"fast result",
+			),
+		}}},
+		InvocationID: invocation.InvocationID,
+		Author:       "fast",
+		ID:           "evt-fast-result",
+		Timestamp:    time.Now(),
+	}
+	toolresultround.Mark(fastResult, true)
+	ch <- fastResult
+	slowResult := &event.Event{
+		Response: &model.Response{Done: true, Choices: []model.Choice{{
+			Message: model.NewToolMessage(
+				"call-slow",
+				"slow",
+				"slow result",
+			),
+		}}},
+		InvocationID: invocation.InvocationID,
+		Author:       "slow",
+		ID:           "evt-slow-result",
+		Timestamp:    time.Now(),
+	}
+	toolresultround.Mark(slowResult, false)
+	ch <- slowResult
+	close(ch)
+	return ch, nil
+}
+
+func (m *cacheSafeForkToolResultMockAgent) Info() agent.Info {
+	return agent.Info{Name: m.name}
+}
+
+func (m *cacheSafeForkToolResultMockAgent) SubAgents() []agent.Agent {
+	return nil
+}
+
+func (m *cacheSafeForkToolResultMockAgent) FindSubAgent(string) agent.Agent {
+	return nil
+}
+
+func (m *cacheSafeForkToolResultMockAgent) Tools() []tool.Tool { return nil }
+
+func (m *cacheSafeForkToolResultMockAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	summaryfork.Attach(invocation, m.parent)
+
+	ch := make(chan *event.Event, 2)
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "tool-call-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{
+						ID:   "call_1",
+						Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name:      "lookup",
+							Arguments: []byte(`{"q":"hello"}`),
+						},
+					}},
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-tool-call",
+		Timestamp:    time.Now(),
+	}
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "tool-result-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.NewToolMessage(
+					"call_1",
+					"lookup",
+					`{"answer":"ok"}`,
+				),
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       "lookup",
+		ID:           "evt-tool-result",
+		Timestamp:    time.Now(),
+	}
+	close(ch)
+	return ch, nil
+}
+
 // mockSessionService implements the session.Service interface for testing EnqueueSummaryJob calls.
 type mockSessionService struct {
 	enqueueSummaryJobCalls []enqueueSummaryJobCall
@@ -312,6 +804,7 @@ type mockSessionService struct {
 }
 
 type enqueueSummaryJobCall struct {
+	ctx       context.Context
 	sess      *session.Session
 	filterKey string
 	force     bool
@@ -330,8 +823,10 @@ type createSessionCall struct {
 }
 
 type getSessionCall struct {
-	key     session.Key
-	options []session.Option
+	key           session.Key
+	options       []session.Option
+	restoreHint   string
+	restoreHintOK bool
 }
 
 func (m *mockSessionService) CreateSession(ctx context.Context, key session.Key, state session.StateMap, options ...session.Option) (*session.Session, error) {
@@ -346,7 +841,13 @@ func (m *mockSessionService) CreateSession(ctx context.Context, key session.Key,
 }
 
 func (m *mockSessionService) GetSession(ctx context.Context, key session.Key, options ...session.Option) (*session.Session, error) {
-	m.getSessionCalls = append(m.getSessionCalls, getSessionCall{key, options})
+	hint, ok := summaryrestore.FilterKeyFromContext(ctx)
+	m.getSessionCalls = append(m.getSessionCalls, getSessionCall{
+		key:           key,
+		options:       options,
+		restoreHint:   hint,
+		restoreHintOK: ok,
+	})
 	return &session.Session{
 		ID:        key.SessionID,
 		AppName:   key.AppName,
@@ -402,7 +903,12 @@ func (m *mockSessionService) CreateSessionSummary(ctx context.Context, sess *ses
 }
 
 func (m *mockSessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Session, filterKey string, force bool) error {
-	m.enqueueSummaryJobCalls = append(m.enqueueSummaryJobCalls, enqueueSummaryJobCall{sess, filterKey, force})
+	m.enqueueSummaryJobCalls = append(m.enqueueSummaryJobCalls, enqueueSummaryJobCall{
+		ctx:       ctx,
+		sess:      sess,
+		filterKey: filterKey,
+		force:     force,
+	})
 	return nil
 }
 
@@ -420,7 +926,359 @@ type errorMockSessionService struct {
 }
 
 func (m *errorMockSessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Session, filterKey string, force bool) error {
-	// Call parent to record the call
+	// Call parent to record the call.
 	m.mockSessionService.EnqueueSummaryJob(ctx, sess, filterKey, force)
-	return assert.AnError // Return error
+	return assert.AnError // Return error.
+}
+
+// toolCallMockAgent generates a tool call sequence:
+// assistant(tool_call) -> tool(result) -> assistant(text).
+type toolCallMockAgent struct {
+	name string
+}
+
+func (m *toolCallMockAgent) Info() agent.Info {
+	return agent.Info{
+		Name:        m.name,
+		Description: "Mock agent that produces tool call events",
+	}
+}
+
+func (m *toolCallMockAgent) SubAgents() []agent.Agent { return nil }
+
+func (m *toolCallMockAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func (m *toolCallMockAgent) Tools() []tool.Tool { return nil }
+
+func (m *toolCallMockAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event, 3)
+
+	// 1. assistant tool_call event.
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "tc-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{
+						ID:   "call_1",
+						Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name:      "get_weather",
+							Arguments: []byte(`{"city":"Beijing"}`),
+						},
+					}},
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-tc",
+		Timestamp:    time.Now(),
+	}
+
+	// 2. tool result event.
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "tr-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:     model.RoleTool,
+					ToolID:   "call_1",
+					ToolName: "get_weather",
+					Content:  `{"temp":25}`,
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       "get_weather",
+		ID:           "evt-tr",
+		Timestamp:    time.Now(),
+	}
+
+	// 3. final assistant text response.
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "final-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:    model.RoleAssistant,
+					Content: "The weather is 25 degrees.",
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-final",
+		Timestamp:    time.Now(),
+	}
+
+	close(ch)
+	return ch, nil
+}
+
+// skipSummarizationMockAgent generates a tool result with
+// SkipSummarization action set.
+type skipSummarizationMockAgent struct {
+	name string
+}
+
+func (m *skipSummarizationMockAgent) Info() agent.Info {
+	return agent.Info{
+		Name:        m.name,
+		Description: "Mock agent for SkipSummarization test",
+	}
+}
+
+func (m *skipSummarizationMockAgent) SubAgents() []agent.Agent { return nil }
+
+func (m *skipSummarizationMockAgent) FindSubAgent(string) agent.Agent { return nil }
+
+func (m *skipSummarizationMockAgent) Tools() []tool.Tool { return nil }
+
+func (m *skipSummarizationMockAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event, 1)
+
+	// Final assistant response with SkipSummarization.
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "skip-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:    model.RoleAssistant,
+					Content: "Skipped summary response.",
+				},
+			}},
+		},
+		Actions: &event.EventActions{
+			SkipSummarization: true,
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-skip",
+		Timestamp:    time.Now(),
+	}
+
+	close(ch)
+	return ch, nil
+}
+
+// syncSummaryIntraRunMockAgent sets SyncSummaryIntraRunStateKey on the
+// invocation before emitting events, simulating the behavior of llmflow when
+// sync intra-run summary is active. It emits a tool-call sequence
+// (tool_call -> tool result) followed by a final assistant text response so
+// the test can verify that intermediate events are skipped while the final
+// response still triggers an async enqueue.
+type syncSummaryIntraRunMockAgent struct {
+	name string
+}
+
+func (m *syncSummaryIntraRunMockAgent) Info() agent.Info {
+	return agent.Info{
+		Name:        m.name,
+		Description: "Mock agent that sets sync intra-run summary state",
+	}
+}
+
+func (m *syncSummaryIntraRunMockAgent) SubAgents() []agent.Agent { return nil }
+
+func (m *syncSummaryIntraRunMockAgent) FindSubAgent(string) agent.Agent {
+	return nil
+}
+
+func (m *syncSummaryIntraRunMockAgent) Tools() []tool.Tool { return nil }
+
+func (m *syncSummaryIntraRunMockAgent) Run(
+	ctx context.Context,
+	invocation *agent.Invocation,
+) (<-chan *event.Event, error) {
+	// Simulate flow setting the sync intra-run summary state key.
+	invocation.SetState(agent.SyncSummaryIntraRunStateKey, true)
+
+	ch := make(chan *event.Event, 3)
+
+	// 1. assistant tool_call event (skipped by IsToolCallResponse).
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "intra-tc-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{
+						ID:   "call_intra",
+						Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name:      "step_worker",
+							Arguments: []byte(`{"step":1}`),
+						},
+					}},
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-intra-tc",
+		Timestamp:    time.Now(),
+	}
+
+	// 2. tool result event (intermediate, should be skipped
+	// by intra-run check).
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "intra-tr-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:     model.RoleTool,
+					ToolID:   "call_intra",
+					ToolName: "step_worker",
+					Content:  `{"step":1,"status":"ok"}`,
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       "step_worker",
+		ID:           "evt-intra-tr",
+		Timestamp:    time.Now(),
+	}
+
+	// 3. final assistant text response (should still trigger
+	// async enqueue).
+	ch <- &event.Event{
+		Response: &model.Response{
+			ID:    "intra-final-resp",
+			Model: "test-model",
+			Done:  true,
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:    model.RoleAssistant,
+					Content: "Done with intra-run summary active.",
+				},
+			}},
+		},
+		InvocationID: invocation.InvocationID,
+		Author:       m.name,
+		ID:           "evt-intra-final",
+		Timestamp:    time.Now(),
+	}
+
+	close(ch)
+	return ch, nil
+}
+
+func TestRunner_SyncSummaryIntraRun_SkipsIntermediateButAllowsFinal(
+	t *testing.T,
+) {
+	svc := &mockSessionService{}
+	r := NewRunner(
+		"test-app",
+		&syncSummaryIntraRunMockAgent{name: "sync-intra-agent"},
+		WithSessionService(svc),
+	)
+	_, err := RunWithMessages(
+		context.Background(), r,
+		"user1", "sess1",
+		[]model.Message{{
+			Role:    model.RoleUser,
+			Content: "hello",
+		}},
+	)
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+
+	// Intermediate tool result should be skipped, but the final
+	// assistant response should still trigger exactly one async
+	// EnqueueSummaryJob so the session summary is up-to-date at
+	// turn end.
+	require.Len(
+		t,
+		svc.enqueueSummaryJobCalls,
+		1,
+		"final response should trigger EnqueueSummaryJob "+
+			"even with sync intra-run summary active",
+	)
+}
+
+func TestRunner_EnqueueSummaryJob_ToolResultTrigger(t *testing.T) {
+	t.Run(
+		"tool result events trigger EnqueueSummaryJob",
+		func(t *testing.T) {
+			svc := &mockSessionService{}
+			r := NewRunner(
+				"test-app",
+				&toolCallMockAgent{name: "tc-agent"},
+				WithSessionService(svc),
+			)
+			_, err := RunWithMessages(
+				context.Background(), r,
+				"user1", "sess1",
+				[]model.Message{{
+					Role:    model.RoleUser,
+					Content: "weather?",
+				}},
+			)
+			require.NoError(t, err)
+			time.Sleep(100 * time.Millisecond)
+
+			// Expect 2 calls: one for tool result, one for
+			// final assistant text. Tool call events are still
+			// skipped.
+			require.Len(
+				t,
+				svc.enqueueSummaryJobCalls,
+				2,
+				"tool result + final text should each "+
+					"trigger EnqueueSummaryJob",
+			)
+		},
+	)
+
+	t.Run(
+		"SkipSummarization action prevents EnqueueSummaryJob",
+		func(t *testing.T) {
+			svc := &mockSessionService{}
+			r := NewRunner(
+				"test-app",
+				&skipSummarizationMockAgent{
+					name: "skip-agent",
+				},
+				WithSessionService(svc),
+			)
+			_, err := RunWithMessages(
+				context.Background(), r,
+				"user1", "sess1",
+				[]model.Message{{
+					Role:    model.RoleUser,
+					Content: "hello",
+				}},
+			)
+			require.NoError(t, err)
+			time.Sleep(100 * time.Millisecond)
+
+			assert.Len(
+				t,
+				svc.enqueueSummaryJobCalls,
+				0,
+				"SkipSummarization should prevent "+
+					"EnqueueSummaryJob",
+			)
+		},
+	)
 }

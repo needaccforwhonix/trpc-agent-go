@@ -24,11 +24,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ollama/ollama/api"
-
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
+	"trpc.group/trpc-go/trpc-agent-go/internal/toolorder"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
+	"trpc.group/trpc-go/trpc-agent-go/model/internal/modeltailoring"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -38,6 +41,8 @@ type Model struct {
 	name                       string
 	host                       string
 	contextWindow              int
+	contextWindowConfigured    bool
+	contextWindowDiscovered    bool
 	httpClient                 *http.Client
 	channelBufferSize          int
 	chatRequestCallback        ChatRequestCallbackFunc
@@ -124,6 +129,8 @@ func New(name string, opts ...Option) *Model {
 		tokenCounter:               o.tokenCounter,
 		tailoringStrategy:          o.tailoringStrategy,
 		maxInputTokens:             o.maxInputTokens,
+		contextWindow:              o.contextWindow,
+		contextWindowConfigured:    o.contextWindowConfigured,
 		protocolOverheadTokens:     o.tokenTailoringConfig.ProtocolOverheadTokens,
 		reserveOutputTokens:        o.tokenTailoringConfig.ReserveOutputTokens,
 		inputTokensFloor:           o.tokenTailoringConfig.InputTokensFloor,
@@ -133,23 +140,85 @@ func New(name string, opts ...Option) *Model {
 		options:                    o.options,
 		keepAlive:                  o.keepAlive,
 	}
-	m.contextWindow, err = m.getContextWindow()
-	if err != nil {
-		log.Warnf(
-			"failed to get context window for %s: %v",
-			m.name,
-			err,
-		)
-		m.contextWindow = imodel.ResolveContextWindow(m.name)
+	if m.contextWindow <= 0 {
+		m.contextWindow, err = m.getContextWindow()
+		if err != nil {
+			log.Warnf(
+				"failed to get context window for %s: %v",
+				m.name,
+				err,
+			)
+		} else if m.contextWindow > 0 {
+			m.contextWindowDiscovered = true
+		}
 	}
 	return m
 }
 
 // Info returns the model information.
 func (m *Model) Info() model.Info {
-	return model.Info{
-		Name: m.name,
+	contextWindow := 0
+	if m.contextWindowConfigured || m.contextWindowDiscovered {
+		contextWindow = m.contextWindow
 	}
+	return model.Info{
+		Name:          m.name,
+		ContextWindow: contextWindow,
+	}
+}
+
+func (m *Model) runChatRequestCallback(
+	ctx context.Context,
+	chatRequest *api.ChatRequest,
+) {
+	if m.chatRequestCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat request callback")
+	m.chatRequestCallback(ctx, chatRequest)
+}
+
+func disableChatRequestTools(request *api.ChatRequest) {
+	if request == nil {
+		return
+	}
+	request.Tools = nil
+}
+
+func (m *Model) runChatResponseCallback(
+	ctx context.Context,
+	chatRequest *api.ChatRequest,
+	chatResponse *api.ChatResponse,
+) {
+	if m.chatResponseCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat response callback")
+	m.chatResponseCallback(ctx, chatRequest, chatResponse)
+}
+
+func (m *Model) runChatChunkCallback(
+	ctx context.Context,
+	chatRequest *api.ChatRequest,
+	chatChunk *api.ChatResponse,
+) {
+	if m.chatChunkCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat chunk callback")
+	m.chatChunkCallback(ctx, chatRequest, chatChunk)
+}
+
+func (m *Model) runChatStreamCompleteCallback(
+	ctx context.Context,
+	chatRequest *api.ChatRequest,
+	streamErr error,
+) {
+	if m.chatStreamCompleteCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat stream complete callback")
+	m.chatStreamCompleteCallback(ctx, chatRequest, streamErr)
 }
 
 // GenerateContent generates content from the model.
@@ -169,18 +238,23 @@ func (m *Model) GenerateContent(
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
 
+	// Execute callback synchronously before starting the goroutine
+	// to avoid a race where the runner and HTTP handler finish
+	// (closing the SSE writer) while the callback is still running.
+	m.runChatRequestCallback(ctx, chatRequest)
+	if imodelrequest.ToolsDisabled(ctx) {
+		disableChatRequestTools(chatRequest)
+	}
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
+	responseID := newResponseID()
 	go func() {
 		defer close(responseChan)
-		if m.chatRequestCallback != nil {
-			m.chatRequestCallback(ctx, chatRequest)
-		}
 		if request.Stream {
-			m.handleStreamingResponse(ctx, *chatRequest, responseChan)
+			m.handleStreamingResponse(ctx, *chatRequest, responseID, responseChan)
 			return
 		}
-		m.handleNonStreamingResponse(ctx, *chatRequest, responseChan)
+		m.handleNonStreamingResponse(ctx, *chatRequest, responseID, responseChan)
 	}()
 	return responseChan, nil
 }
@@ -192,38 +266,35 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	// Determine max input tokens using priority: user config > auto calculation > default.
-	maxInputTokens := m.maxInputTokens
-	if maxInputTokens <= 0 {
-		// Auto-calculate based on model context window with custom or default parameters.
-		contextWindow := imodel.ResolveContextWindow(m.name)
-		if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
-			// Use custom parameters if any are set.
-			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
-				contextWindow,
-				m.protocolOverheadTokens,
-				m.reserveOutputTokens,
-				m.inputTokensFloor,
-				m.safetyMarginRatio,
-				m.maxInputTokensRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
-		}
+	maxInputTokens := m.InputTokenBudget(ctx, request)
+	if m.maxInputTokens <= 0 {
 		log.DebugfContext(
 			ctx,
 			"auto-calculated max input tokens: model=%s, "+
-				"contextWindow=%d, maxInputTokens=%d",
+				"maxInputTokens=%d",
 			m.name,
-			contextWindow,
 			maxInputTokens,
 		)
 	}
+	finishObservation := modeltailoring.ObserveChanges(
+		ctx, "ollama.Model", request, maxInputTokens,
+	)
+	defer finishObservation()
 
 	// Apply token tailoring.
 	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
 	if err != nil {
+		if len(tailored) > 0 {
+			log.WarnContext(
+				ctx,
+				"token tailoring returned best-effort messages in ollama.Model",
+				err,
+			)
+			modeltailoring.ApplyResult(
+				ctx, "ollama.Model", request, tailored,
+			)
+			return
+		}
 		log.WarnContext(
 			ctx,
 			"token tailoring failed in ollama.Model",
@@ -232,47 +303,32 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	request.Messages = tailored
+	modeltailoring.ApplyResult(
+		ctx, "ollama.Model", request, tailored,
+	)
+}
 
-	// Calculate remaining tokens for output based on context window.
-	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
-	if err != nil {
-		log.WarnContext(
-			ctx,
-			"failed to count tokens after tailoring",
-			err,
+// InputTokenBudget returns the same input budget used by token tailoring.
+func (m *Model) InputTokenBudget(_ context.Context, _ *model.Request) int {
+	if m.maxInputTokens > 0 {
+		return m.maxInputTokens
+	}
+	contextWindow := m.contextWindow
+	if contextWindow <= 0 ||
+		(!m.contextWindowConfigured && !m.contextWindowDiscovered) {
+		contextWindow = imodel.ResolveContextWindow(m.name)
+	}
+	if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
+		return imodel.CalculateMaxInputTokensWithParams(
+			contextWindow,
+			m.protocolOverheadTokens,
+			m.reserveOutputTokens,
+			m.inputTokensFloor,
+			m.safetyMarginRatio,
+			m.maxInputTokensRatio,
 		)
-		return
 	}
-
-	// Set max output tokens only if user hasn't specified it.
-	if request.GenerationConfig.MaxTokens == nil {
-		var maxOutputTokens int
-		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
-			// Use custom parameters if any are set.
-			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
-				m.contextWindow,
-				usedTokens,
-				m.protocolOverheadTokens,
-				m.outputTokensFloor,
-				m.safetyMarginRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxOutputTokens = imodel.CalculateMaxOutputTokens(m.contextWindow, usedTokens)
-		}
-		if maxOutputTokens > 0 {
-			request.GenerationConfig.MaxTokens = &maxOutputTokens
-			log.DebugfContext(
-				ctx,
-				"token tailoring: contextWindow=%d, usedTokens=%d, "+
-					"maxOutputTokens=%d",
-				m.contextWindow,
-				usedTokens,
-				maxOutputTokens,
-			)
-		}
-	}
+	return imodel.CalculateMaxInputTokens(contextWindow)
 }
 
 // buildChatRequest builds the chat request for the Ollama API.
@@ -310,8 +366,8 @@ func (m *Model) buildChatRequest(request *model.Request) (*api.ChatRequest, erro
 	if len(request.Stop) > 0 {
 		chatRequest.Options["stop"] = request.Stop
 	}
-	if request.MaxTokens != nil {
-		chatRequest.Options["num_predict"] = *request.MaxTokens
+	if mt := imodel.ClampMaxTokensForModel(m.name, request.MaxTokens); mt != nil {
+		chatRequest.Options["num_predict"] = *mt
 	}
 	if request.ThinkingEnabled != nil {
 		chatRequest.Think = &api.ThinkValue{
@@ -331,6 +387,7 @@ func (m *Model) buildChatRequest(request *model.Request) (*api.ChatRequest, erro
 func (m *Model) handleNonStreamingResponse(
 	ctx context.Context,
 	chatRequest api.ChatRequest,
+	responseID string,
 	responseChan chan<- *model.Response,
 ) {
 	// Issue non-streaming request.
@@ -340,17 +397,15 @@ func (m *Model) handleNonStreamingResponse(
 		return nil
 	})
 	if err != nil {
-		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeAPIError, err)
+		m.sendErrorResponse(ctx, responseChan, responseID, model.ErrorTypeAPIError, err)
 		return
 	}
 
-	if m.chatResponseCallback != nil {
-		m.chatResponseCallback(ctx, &chatRequest, &chatResponse)
-	}
+	m.runChatResponseCallback(ctx, &chatRequest, &chatResponse)
 
-	response, err := convertChatResponse(chatResponse)
+	response, err := convertChatResponse(chatResponse, responseID)
 	if err != nil {
-		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeAPIError, err)
+		m.sendErrorResponse(ctx, responseChan, responseID, model.ErrorTypeAPIError, err)
 		return
 	}
 
@@ -365,18 +420,24 @@ func (m *Model) handleNonStreamingResponse(
 func (m *Model) handleStreamingResponse(
 	ctx context.Context,
 	chatRequest api.ChatRequest,
+	responseID string,
 	responseChan chan<- *model.Response,
 ) {
-	var streamErr error
+	var (
+		streamErr     error
+		finalResponse *model.Response
+	)
 
 	err := m.client.Chat(ctx, &chatRequest, func(chunk api.ChatResponse) error {
-		if m.chatChunkCallback != nil {
-			m.chatChunkCallback(ctx, &chatRequest, &chunk)
-		}
+		m.runChatChunkCallback(ctx, &chatRequest, &chunk)
 
-		response, err := convertChatResponse(chunk)
+		response, err := convertChatResponse(chunk, responseID)
 		if err != nil {
 			return err
+		}
+		if response.Done {
+			finalResponse = response
+			return nil
 		}
 
 		// Emit partial response.
@@ -391,18 +452,34 @@ func (m *Model) handleStreamingResponse(
 
 	if err != nil {
 		streamErr = err
-		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
 	}
 
-	// Call the stream complete callback.
-	if m.chatStreamCompleteCallback != nil {
-		m.chatStreamCompleteCallback(ctx, &chatRequest, streamErr)
+	// Call the stream complete callback before surfacing the terminal result.
+	m.runChatStreamCompleteCallback(ctx, &chatRequest, streamErr)
+
+	if streamErr != nil {
+		m.sendErrorResponse(ctx, responseChan, responseID, model.ErrorTypeStreamError, streamErr)
+		return
+	}
+	if finalResponse == nil {
+		return
+	}
+	select {
+	case responseChan <- finalResponse:
+	case <-ctx.Done():
 	}
 }
 
 // sendErrorResponse sends an error response through the channel.
-func (m *Model) sendErrorResponse(ctx context.Context, responseChan chan<- *model.Response, errType string, err error) {
+func (m *Model) sendErrorResponse(
+	ctx context.Context,
+	responseChan chan<- *model.Response,
+	responseID string,
+	errType string,
+	err error,
+) {
 	errorResponse := &model.Response{
+		ID: responseID,
 		Error: &model.ResponseError{
 			Message: err.Error(),
 			Type:    errType,
@@ -414,6 +491,10 @@ func (m *Model) sendErrorResponse(ctx context.Context, responseChan chan<- *mode
 	case responseChan <- errorResponse:
 	case <-ctx.Done():
 	}
+}
+
+func newResponseID() string {
+	return "ollama-" + uuid.NewString()
 }
 
 // getContextWindow retrieves the context window size for the model.
@@ -500,7 +581,7 @@ func convertMessages(messages []model.Message) ([]api.Message, error) {
 	return result, nil
 }
 
-func convertChatResponse(resp api.ChatResponse) (*model.Response, error) {
+func convertChatResponse(resp api.ChatResponse, responseID string) (*model.Response, error) {
 	var toolCalls []model.ToolCall
 	for _, toolCall := range resp.Message.ToolCalls {
 		args, err := json.Marshal(toolCall.Function.Arguments)
@@ -546,6 +627,7 @@ func convertChatResponse(resp api.ChatResponse) (*model.Response, error) {
 	}
 	now := time.Now()
 	msg := &model.Response{
+		ID:        responseID,
 		Object:    obj,
 		Created:   now.Unix(),
 		Timestamp: now,
@@ -626,7 +708,7 @@ func convertMessage(msg model.Message) (api.Message, error) {
 // convertTools converts our tool declarations to Ollama tool parameters.
 func convertTools(tools map[string]tool.Tool) []api.Tool {
 	var result []api.Tool
-	for _, tl := range tools {
+	for _, tl := range toolorder.SortedTools(tools) {
 		properties := api.NewToolPropertiesMap()
 		var required []string
 

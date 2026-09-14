@@ -10,6 +10,7 @@
 package openai
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -341,6 +342,223 @@ func TestGenerateBatchJSONL(t *testing.T) {
 	}
 }
 
+func TestGenerateBatchJSONL_ReasoningContentBackfill(t *testing.T) {
+	const customID = "tool-call"
+	const toolCallID = "call-backfill"
+	const toolName = "calculator"
+	const toolArgs = `{"expression":"2+2"}`
+	const reasoningContent = "I should call the calculator."
+
+	requests := []*BatchRequestInput{
+		{
+			CustomID: customID,
+			Body: BatchRequest{
+				Request: model.Request{
+					Messages: []model.Message{
+						{
+							Role:    model.RoleAssistant,
+							Content: "Calling a tool.",
+							ToolCalls: []model.ToolCall{
+								{
+									ID:   toolCallID,
+									Type: "function",
+									Function: model.FunctionDefinitionParam{
+										Name:      toolName,
+										Arguments: []byte(toolArgs),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	t.Run("backfills empty reasoning_content when enabled",
+		func(t *testing.T) {
+			m := New("default-model",
+				WithReasoningContentBackfill(true))
+
+			jsonlData, err := m.generateBatchJSONL(requests)
+			require.NoError(t, err)
+
+			lines := strings.Split(strings.TrimSpace(string(jsonlData)), "\n")
+			require.Len(t, lines, 1)
+
+			var decoded map[string]any
+			err = json.Unmarshal([]byte(lines[0]), &decoded)
+			require.NoError(t, err)
+
+			body := decoded["body"].(map[string]any)
+			messages := body["messages"].([]any)
+			message := messages[0].(map[string]any)
+
+			reasoningValue, ok := message[model.ReasoningContentKey]
+			require.True(t, ok)
+			assert.Equal(t, "", reasoningValue)
+		})
+
+	t.Run("backfills assistant content message when enabled",
+		func(t *testing.T) {
+			requests := []*BatchRequestInput{
+				{
+					CustomID: customID,
+					Body: BatchRequest{
+						Request: model.Request{
+							Messages: []model.Message{
+								{
+									Role:    model.RoleAssistant,
+									Content: "Final answer without reasoning.",
+								},
+							},
+						},
+					},
+				},
+			}
+			m := New("default-model",
+				WithReasoningContentBackfill(true))
+
+			jsonlData, err := m.generateBatchJSONL(requests)
+			require.NoError(t, err)
+
+			lines := strings.Split(strings.TrimSpace(string(jsonlData)), "\n")
+			require.Len(t, lines, 1)
+
+			var decoded map[string]any
+			err = json.Unmarshal([]byte(lines[0]), &decoded)
+			require.NoError(t, err)
+
+			body := decoded["body"].(map[string]any)
+			messages := body["messages"].([]any)
+			message := messages[0].(map[string]any)
+
+			reasoningValue, ok := message[model.ReasoningContentKey]
+			require.True(t, ok)
+			assert.Equal(t, "", reasoningValue)
+		})
+
+	t.Run("keeps reasoning_content absent when disabled",
+		func(t *testing.T) {
+			m := New("default-model")
+
+			jsonlData, err := m.generateBatchJSONL(requests)
+			require.NoError(t, err)
+
+			lines := strings.Split(strings.TrimSpace(string(jsonlData)), "\n")
+			require.Len(t, lines, 1)
+
+			var decoded map[string]any
+			err = json.Unmarshal([]byte(lines[0]), &decoded)
+			require.NoError(t, err)
+
+			body := decoded["body"].(map[string]any)
+			messages := body["messages"].([]any)
+			message := messages[0].(map[string]any)
+
+			_, ok := message[model.ReasoningContentKey]
+			assert.False(t, ok)
+		})
+
+	t.Run("deepseek backfills empty reasoning_content by default",
+		func(t *testing.T) {
+			m := New("deepseek-v4-pro", WithVariant(VariantDeepSeek))
+
+			jsonlData, err := m.generateBatchJSONL(requests)
+			require.NoError(t, err)
+
+			lines := strings.Split(strings.TrimSpace(string(jsonlData)), "\n")
+			require.Len(t, lines, 1)
+
+			var decoded map[string]any
+			err = json.Unmarshal([]byte(lines[0]), &decoded)
+			require.NoError(t, err)
+
+			body := decoded["body"].(map[string]any)
+			messages := body["messages"].([]any)
+			message := messages[0].(map[string]any)
+
+			reasoningValue, ok := message[model.ReasoningContentKey]
+			require.True(t, ok)
+			assert.Equal(t, "", reasoningValue)
+		})
+
+	t.Run("deepseek backfill can be explicitly disabled",
+		func(t *testing.T) {
+			m := New(
+				"deepseek-v4-pro",
+				WithVariant(VariantDeepSeek),
+				WithReasoningContentBackfill(false),
+			)
+
+			jsonlData, err := m.generateBatchJSONL(requests)
+			require.NoError(t, err)
+
+			lines := strings.Split(strings.TrimSpace(string(jsonlData)), "\n")
+			require.Len(t, lines, 1)
+
+			var decoded map[string]any
+			err = json.Unmarshal([]byte(lines[0]), &decoded)
+			require.NoError(t, err)
+
+			body := decoded["body"].(map[string]any)
+			messages := body["messages"].([]any)
+			message := messages[0].(map[string]any)
+
+			_, ok := message[model.ReasoningContentKey]
+			assert.False(t, ok)
+		})
+
+	t.Run("preserves non-empty reasoning_content", func(t *testing.T) {
+		requests := []*BatchRequestInput{
+			{
+				CustomID: customID,
+				Body: BatchRequest{
+					Request: model.Request{
+						Messages: []model.Message{
+							{
+								Role:             model.RoleAssistant,
+								Content:          "Calling a tool.",
+								ReasoningContent: reasoningContent,
+								ToolCalls: []model.ToolCall{
+									{
+										ID:   toolCallID,
+										Type: "function",
+										Function: model.FunctionDefinitionParam{
+											Name:      toolName,
+											Arguments: []byte(toolArgs),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		m := New("default-model")
+
+		jsonlData, err := m.generateBatchJSONL(requests)
+		require.NoError(t, err)
+
+		lines := strings.Split(strings.TrimSpace(string(jsonlData)), "\n")
+		require.Len(t, lines, 1)
+
+		var decoded map[string]any
+		err = json.Unmarshal([]byte(lines[0]), &decoded)
+		require.NoError(t, err)
+
+		body := decoded["body"].(map[string]any)
+		messages := body["messages"].([]any)
+		message := messages[0].(map[string]any)
+
+		reasoningValue, ok := message[model.ReasoningContentKey]
+		require.True(t, ok)
+		assert.Equal(t, reasoningContent, reasoningValue)
+	})
+}
+
 func TestBatchRequestOutput_JSON(t *testing.T) {
 	t.Run("successful response", func(t *testing.T) {
 		in := &BatchRequestOutput{
@@ -526,6 +744,25 @@ func TestParseBatchOutput_EdgeCases(t *testing.T) {
 {"custom_id":"test2","response":{"status_code":400,"body":{"model":"gpt-4o-mini"}}}`)
 	require.NoError(t, err)
 	assert.Len(t, results, 2)
+}
+
+func TestParseBatchOutput_LongLine(t *testing.T) {
+	m := &Model{}
+	content := strings.Repeat("x", bufio.MaxScanTokenSize)
+	jsonl := fmt.Sprintf(
+		`{"custom_id":"long","response":{"status_code":200,"body":{"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"%s"}}]}}}`,
+		content,
+	)
+	require.Greater(t, len(jsonl), bufio.MaxScanTokenSize)
+
+	results, err := m.ParseBatchOutput(jsonl)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "long", results[0].CustomID)
+	assert.Equal(t, 200, results[0].Response.StatusCode)
+	require.NotEmpty(t, results[0].Response.Body.Choices)
+	assert.Equal(t, content, results[0].Response.Body.Choices[0].Message.Content)
+	assert.Greater(t, len(results[0].RawLine), bufio.MaxScanTokenSize)
 }
 
 // Helper functions to create pointers.

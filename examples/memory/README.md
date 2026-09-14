@@ -24,7 +24,7 @@ A simple example that demonstrates manual memory tool integration where LLM agen
   delete, clear)
 - Custom tool implementations
 - Streaming and non-streaming response modes
-- Multiple storage backends (in-memory, Redis, MySQL, PostgreSQL)
+- Multiple storage backends (in-memory, SQLite, Redis, MySQL, MySQL Vector, PostgreSQL, pgvector, ChromaDB)
 
 **Use Cases:**
 
@@ -72,9 +72,77 @@ go run main.go
 
 [Read full documentation →](./auto/README.md)
 
+### 📁 mem0/
+
+**Mem0 Integration - External Long-Term Memory Platform**
+
+Demonstrates ingest-first integration with [mem0.ai](https://mem0.ai). The
+runner sends session transcripts to mem0 after each turn; the agent accesses
+stored memories through read-only tools.
+
+**Key Features:**
+
+- Session ingestion via `runner.WithSessionIngestor(...)`
+- Read-only `memory_search` and optional `memory_load` tools
+- No local LLM extractor needed — mem0 handles extraction natively
+
+**Getting Started:**
+
+```bash
+cd examples/memory/mem0
+export MEM0_API_KEY="your-mem0-api-key"
+export OPENAI_API_KEY="your-api-key"
+go run .
+```
+
+[Read full documentation →](./mem0/README.md)
+
+### 📁 tencentdb/
+
+**TencentDB Agent Memory Integration - Sidecar Memory Engine**
+
+Demonstrates integration with TencentDB Agent Memory through its local gateway
+sidecar. The runner sends session transcripts after each turn, a plugin injects
+automatic recall before model calls, and the agent can use TencentDB-native
+read-only search tools.
+
+**Key Features:**
+
+- Session ingestion via `runner.WithSessionIngestor(...)`
+- Automatic recall via `runner.WithPlugins(memSvc.Plugin())`
+- Native `tdai_memory_search` and `tdai_conversation_search` tools
+
+**Getting Started:**
+
+```bash
+cd examples/memory/tencentdb
+export OPENAI_API_KEY="your-api-key"
+export TENCENTDB_AGENT_MEMORY_GATEWAY="http://127.0.0.1:8420"
+go run .
+```
+
+[Read full documentation →](./tencentdb/README.md)
+
+### 📁 compare/
+
+**Retrieval Comparison - SQLite vs SQLiteVec**
+
+A small example that compares keyword-based SQLite memory (`sqlite`) with
+semantic vector memory (`sqlitevec`) powered by `sqlite-vec`.
+
+**Getting Started:**
+
+```bash
+cd examples/memory/compare
+export OPENAI_API_KEY="your-api-key"
+go run .
+```
+
+[Read full documentation →](./compare/README.md)
+
 ## Common Features
 
-Both examples share the following capabilities:
+The chat examples (`simple/` and `auto/`) share the following capabilities:
 
 ### Memory Services
 
@@ -83,10 +151,14 @@ All examples support multiple storage backends:
 | Backend    | Description                                 | Usage              |
 | ---------- | ------------------------------------------- | ------------------ |
 | `inmemory` | In-memory storage (default)                 | `-memory=inmemory` |
+| `sqlite`   | SQLite file storage                         | `-memory=sqlite`   |
+| `sqlitevec` | SQLite + sqlite-vec vector search (embeddings) | `-memory=sqlitevec` |
 | `redis`    | Redis-based storage                         | `-memory=redis`    |
 | `mysql`    | MySQL-based storage                         | `-memory=mysql`    |
+| `mysqlvec` | MySQL + vector search (embeddings)          | `-memory=mysqlvec` |
 | `postgres` | PostgreSQL-based storage                    | `-memory=postgres` |
 | `pgvector` | pgvector PostgreSQL storage with embeddings | `-memory=pgvector` |
+| `chromadb` | ChromaDB storage with cosine and hybrid search | `-memory=chromadb` |
 
 ### Session Management
 
@@ -112,7 +184,7 @@ All examples support multiple storage backends:
 | ----------------- | ----------------------------------- | ------------------------------- |
 | Tool Registration | Manual (`WithTools`)                | Automatic (`WithExtractor`)     |
 | Memory Extraction | Agent calls tools directly          | Background extraction           |
-| Tools Available   | 6 tools (4 default, 2 configurable) | Limited (search, optional load) |
+| Tools Available   | 6 tools (4 default, 2 configurable) | `memory_search` by default; configurable `memory_load`; enabled write tools exposable |
 | Control Level     | High (explicit)                     | Medium (background)             |
 | Setup Complexity  | Simple                              | Complex                         |
 | Best For          | Fine-grained control needs          | Transparent memory needs        |
@@ -123,12 +195,12 @@ Memory provides 6 tools with different availability in each mode:
 
 | Tool            | Function       | Agentic Mode (Simple) | Auto Extraction Mode (Auto) | Description             |
 | --------------- | -------------- | --------------------- | --------------------------- | ----------------------- |
-| `memory_add`    | Add new memory | ✅ Default            | ❌ Unavailable              | Create new memory entry |
-| `memory_update` | Update memory  | ✅ Default            | ❌ Unavailable              | Modify existing memory  |
-| `memory_search` | Search memory  | ✅ Default            | ✅ Default                  | Find by keywords        |
+| `memory_add`    | Add new memory | ✅ Default            | ⚙️ Hidden by default        | Create new memory entry |
+| `memory_update` | Update memory  | ✅ Default            | ⚙️ Hidden by default        | Modify existing memory  |
+| `memory_search` | Search memory  | ✅ Default            | ✅ Default                  | Search relevant memories |
 | `memory_load`   | Load memories  | ✅ Default            | ⚙️ Configurable             | Load recent memories    |
-| `memory_delete` | Delete memory  | ⚙️ Configurable       | ❌ Unavailable              | Delete single memory    |
-| `memory_clear`  | Clear memories | ⚙️ Configurable       | ❌ Unavailable              | Delete all memories     |
+| `memory_delete` | Delete memory  | ⚙️ Configurable       | ⚙️ Hidden by default        | Delete single memory    |
+| `memory_clear`  | Clear memories | ⚙️ Configurable       | ⚙️ Disabled by default      | Delete all memories     |
 
 **Notes:**
 
@@ -136,11 +208,11 @@ Memory provides 6 tools with different availability in each mode:
   - Default enabled: `memory_add`, `memory_update`, `memory_search`, `memory_load`
   - Default disabled: `memory_delete`, `memory_clear`
   - Can be enabled/disabled via `WithToolEnabled()`
-- **Auto Mode**: LLM extractor handles write operations in background, only read tools are available
-  - Default enabled: `memory_search`
-  - Default disabled: `memory_load`
-  - Not exposed: `memory_add`, `memory_update`, `memory_delete`, `memory_clear` (extractor handles writes)
-  - `WithToolEnabled()` only affects `memory_search` and `memory_load` availability
+- **Auto Mode**: LLM extractor handles write operations in background; `memory_search` is exposed by default, `memory_load` is configurable, and enabled write tools can be exposed with `WithAutoMemoryExposedTools()`
+  - Default enabled: `memory_add`, `memory_update`, `memory_delete`, `memory_search`
+  - Default disabled: `memory_load`, `memory_clear`
+  - Hidden by default: `memory_add`, `memory_update`, `memory_delete`
+  - Use `WithAutoMemoryExposedTools()` to selectively expose enabled write tools such as `memory_add`
 
 ## Prerequisites
 
@@ -160,6 +232,12 @@ Memory provides 6 tools with different availability in each mode:
 | Variable                  | Description                  | Default                     |
 | ------------------------- | ---------------------------- | --------------------------- |
 | `OPENAI_BASE_URL`         | Base URL for model API       | `https://api.openai.com/v1` |
+| `SQLITE_MEMORY_DSN`       | SQLite DSN for memory store  | `file:memories.db?_busy_timeout=5000` |
+| `SQLITEVEC_MEMORY_DSN`    | SQLiteVec DSN for memory store | `file:memories_vec.db?_busy_timeout=5000` |
+| `SQLITEVEC_EMBEDDER_MODEL` | Embedder model for SQLiteVec | `text-embedding-3-small` |
+| `OPENAI_EMBEDDING_API_KEY` | API key for embedding model (optional) | (empty) |
+| `OPENAI_EMBEDDING_BASE_URL` | Base URL for embedding API (optional) | (empty) |
+| `OPENAI_EMBEDDING_MODEL`  | Override embedding model name (optional) | (empty) |
 | `REDIS_ADDR`              | Redis server address         | `localhost:6379`            |
 | `PG_HOST`                 | PostgreSQL host              | `localhost`                 |
 | `PG_PORT`                 | PostgreSQL port              | `5432`                      |
@@ -172,11 +250,24 @@ Memory provides 6 tools with different availability in each mode:
 | `PGVECTOR_PASSWORD`       | pgvector PostgreSQL password | (empty)                     |
 | `PGVECTOR_DATABASE`       | pgvector PostgreSQL database | `trpc-agent-go-pgmemory`    |
 | `PGVECTOR_EMBEDDER_MODEL` | pgvector embedder model      | `text-embedding-3-small`    |
+| `CHROMA_BASE_URL`         | ChromaDB REST base URL       | `http://localhost:8000`     |
+| `CHROMA_API_KEY`          | ChromaDB API key             | (empty)                     |
+| `CHROMA_BEARER_TOKEN`     | ChromaDB bearer token        | (empty)                     |
+| `CHROMA_TENANT`           | ChromaDB tenant              | `default_tenant`            |
+| `CHROMA_DATABASE`         | ChromaDB database            | `default_database`          |
+| `CHROMA_COLLECTION`       | ChromaDB collection          | `memories`                  |
+| `CHROMA_EMBEDDER_MODEL`   | ChromaDB embedder model      | `text-embedding-3-small`    |
 | `MYSQL_HOST`              | MySQL host                   | `localhost`                 |
 | `MYSQL_PORT`              | MySQL port                   | `3306`                      |
 | `MYSQL_USER`              | MySQL user                   | `root`                      |
 | `MYSQL_PASSWORD`          | MySQL password               | (empty)                     |
 | `MYSQL_DATABASE`          | MySQL database               | `trpc_agent_go`             |
+| `MYSQLVEC_HOST`           | MySQL Vector host            | `localhost`                 |
+| `MYSQLVEC_PORT`           | MySQL Vector port            | `3306`                      |
+| `MYSQLVEC_USER`           | MySQL Vector user            | `root`                      |
+| `MYSQLVEC_PASSWORD`       | MySQL Vector password        | (empty)                     |
+| `MYSQLVEC_DATABASE`       | MySQL Vector database        | `trpc_agent_go`             |
+| `MYSQLVEC_EMBEDDER_MODEL` | MySQL Vector embedder model  | `text-embedding-3-small`    |
 
 ## Quick Start
 
@@ -230,6 +321,15 @@ export MYSQL_PASSWORD=password
 export MYSQL_DATABASE=trpc_agent_go
 go run main.go -memory mysql
 
+# MySQL Vector memory service (with embeddings)
+export MYSQLVEC_HOST=localhost
+export MYSQLVEC_PORT=3306
+export MYSQLVEC_USER=root
+export MYSQLVEC_PASSWORD=password
+export MYSQLVEC_DATABASE=trpc_agent_go
+export MYSQLVEC_EMBEDDER_MODEL=text-embedding-3-small
+go run main.go -memory mysqlvec
+
 # PostgreSQL memory service (using environment variables)
 export PG_HOST=localhost
 export PG_PORT=5432
@@ -246,7 +346,18 @@ export PGVECTOR_PASSWORD=""
 export PGVECTOR_DATABASE=trpc-agent-go-pgmemory
 export PGVECTOR_EMBEDDER_MODEL=text-embedding-3-small
 go run main.go -memory pgvector
+
+# ChromaDB memory service
+export CHROMA_BASE_URL=http://localhost:8000
+export CHROMA_COLLECTION=memories
+export CHROMA_EMBEDDER_MODEL=text-embedding-3-small
+go run main.go -memory chromadb
 ```
+
+The ChromaDB backend is a REST client-server adapter: run Chroma separately or
+connect to a remote/Cloud endpoint. Remote credentials require HTTPS. Embeddings
+come from the configured tRPC-Agent-Go embedder; after changing its model, use a
+new collection or re-embed every existing record.
 
 ### Custom Models
 
@@ -266,19 +377,24 @@ go run main.go -streaming=false
 
 ### Memory Integration Pattern
 
-Both examples follow a two-step memory integration pattern:
+Both examples follow a three-step memory integration pattern:
 
 ```go
-// Step 1: Register memory tools (agentic) or setup extractor (auto)
+// Step 1: Create the memory service.
+// Auto mode must be enabled here with an extractor.
+memoryService := memoryinmemory.NewMemoryService(
+    // memoryinmemory.WithExtractor(memExtractor), // Enable auto mode.
+)
+
+// Step 2: Wire memory into the agent and runner.
 llmAgent := llmagent.New(
     agentName,
     llmagent.WithModel(modelInstance),
-    llmagent.WithTools(memoryService.Tools()), // Agentic mode
-    // OR
-    llmagent.WithPreloadMemory(-1), // Auto mode
+    llmagent.WithTools(memoryService.Tools()), // Optional for agentic or hybrid mode.
+    llmagent.WithPreloadMemory(-1),            // Optional preload enhancement.
 )
 
-// Step 2: Set memory service in runner
+// Step 3: Set memory service in runner.
 runner := runner.NewRunner(
     appName,
     llmAgent,

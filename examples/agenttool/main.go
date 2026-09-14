@@ -1,5 +1,6 @@
 //
-// Tencent is pleased to support the open source community by making trpc-agent-go available.
+// Tencent is pleased to support the open source community by making
+// trpc-agent-go available.
 //
 // Copyright (C) 2025 Tencent.  All rights reserved.
 //
@@ -31,28 +32,94 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
+const (
+	defaultModelName     = "deepseek-v4-flash"
+	defaultInnerTextMode = string(agenttool.InnerTextModeInclude)
+	responseModeDefault  = "default"
+	responseModeFinal    = "final-only"
+)
+
 var (
-	modelName    = flag.String("model", "deepseek-chat", "Name of the model to use")
-	debugAuthors = flag.Bool("debug", false, "Print event author names with streamed text")
-	showTool     = flag.Bool("show-tool", false, "Show tool outputs (tool.response) in the transcript")
-	showInner    = flag.Bool("show-inner", true, "Show inner agent transcript forwarded by agent tool")
+	modelName = flag.String(
+		"model",
+		defaultModelName,
+		"Name of the model to use",
+	)
+	debugAuthors = flag.Bool(
+		"debug",
+		false,
+		"Print event author names with streamed text",
+	)
+	showTool = flag.Bool(
+		"show-tool",
+		false,
+		"Show tool outputs (tool.response) in the transcript",
+	)
+	showInner = flag.Bool(
+		"show-inner",
+		true,
+		"Show inner agent transcript forwarded by agent tool",
+	)
+	innerTextMode = flag.String(
+		"inner-text",
+		defaultInnerTextMode,
+		"Inner text mode: include or exclude",
+	)
+	toolResponseMode = flag.String(
+		"response-mode",
+		responseModeDefault,
+		"AgentTool response mode: default or final-only",
+	)
+	persistentChildHistory = flag.Bool(
+		"persistent-child-history",
+		false,
+		"Enable stable child event-filter key for the math-specialist AgentTool",
+	)
+	persistentChildKey = flag.String(
+		"persistent-child-key",
+		"",
+		"Stable child event-filter key (advanced)",
+	)
 )
 
 func main() {
 	// Parse command line flags.
 	flag.Parse()
 
+	mode, err := parseInnerTextMode(*innerTextMode)
+	if err != nil {
+		log.Fatalf("invalid -inner-text: %v", err)
+	}
+	responseMode, err := parseResponseMode(*toolResponseMode)
+	if err != nil {
+		log.Fatalf("invalid -response-mode: %v", err)
+	}
+
 	fmt.Printf("🚀 Agent Tool Example\n")
 	fmt.Printf("Model: %s\n", *modelName)
+	fmt.Printf("Show inner: %t\n", *showInner)
+	fmt.Printf("Inner text mode: %s\n", mode)
+	fmt.Printf("Response mode: %s\n", responseModeName(responseMode))
+	fmt.Printf("Show tool: %t\n", *showTool)
+	fmt.Printf("Persistent child history: %t\n",
+		*persistentChildHistory || strings.TrimSpace(*persistentChildKey) != "",
+	)
+	if strings.TrimSpace(*persistentChildKey) != "" {
+		fmt.Printf("Persistent child key: %s\n", strings.TrimSpace(*persistentChildKey))
+	}
 	fmt.Printf("Available tools: current_time, math-specialist(agent_tool)\n")
 	fmt.Println(strings.Repeat("=", 50))
 
 	// Create and run the chat.
 	chat := &agentToolChat{
-		modelName:    *modelName,
-		debugAuthors: *debugAuthors,
-		showTool:     *showTool,
-		showInner:    *showInner,
+		modelName:     *modelName,
+		debugAuthors:  *debugAuthors,
+		showTool:      *showTool,
+		showInner:     *showInner,
+		innerTextMode: mode,
+		responseMode:  responseMode,
+		persistent:    *persistentChildHistory,
+		persistentKey: *persistentChildKey,
 	}
 
 	if err := chat.run(); err != nil {
@@ -62,15 +129,20 @@ func main() {
 
 // agentToolChat manages the conversation with agent tools.
 type agentToolChat struct {
-	modelName    string
-	runner       runner.Runner
-	userID       string
-	sessionID    string
-	debugAuthors bool
-	agentName    string
-	streaming    bool
-	showTool     bool
-	showInner    bool
+	modelName     string
+	runner        runner.Runner
+	userID        string
+	sessionID     string
+	debugAuthors  bool
+	agentName     string
+	streaming     bool
+	showTool      bool
+	showInner     bool
+	innerTextMode agenttool.InnerTextMode
+	responseMode  agenttool.ResponseMode
+
+	persistent    bool
+	persistentKey string
 }
 
 // run starts the interactive chat session.
@@ -98,22 +170,28 @@ func (c *agentToolChat) setup(_ context.Context) error {
 	calculatorTool := function.NewFunctionTool(
 		c.calculate,
 		function.WithName("calculator"),
-		function.WithDescription("Perform basic mathematical calculations (add, subtract, multiply, divide)"),
+		function.WithDescription(
+			"Perform basic mathematical calculations",
+		),
 	)
 
 	// Create a specialized agent for math operations.
 	mathAgent := llmagent.New(
 		"math-specialist",
 		llmagent.WithModel(modelInstance),
-		llmagent.WithDescription("A specialized agent for mathematical operations and calculations"),
-		llmagent.WithInstruction("You are a math specialist. Focus on mathematical operations, "+
-			"calculations, and numerical reasoning. When you receive a calculation request, "+
-			"use your calculator tool to compute the result, then provide a clear, natural language response "+
-			"explaining the calculation and result. Always explain what you calculated and present the answer clearly."),
+		llmagent.WithDescription(
+			"A specialized agent for mathematical operations",
+		),
+		llmagent.WithInstruction(
+			"You are a math specialist. Focus on mathematical "+
+				"operations, calculations, and numerical reasoning. "+
+				"When you receive a calculation request, use your "+
+				"calculator tool to compute the result, then provide "+
+				"a clear, natural language response explaining the "+
+				"calculation and result.",
+		),
 		llmagent.WithGenerationConfig(model.GenerationConfig{
-			MaxTokens:   intPtr(1000),
-			Temperature: floatPtr(0.3),
-			Stream:      true,
+			Stream: true,
 		}),
 		llmagent.WithTools([]tool.Tool{calculatorTool}),
 		llmagent.WithInputSchema(map[string]any{
@@ -132,32 +210,50 @@ func (c *agentToolChat) setup(_ context.Context) error {
 	timeTool := function.NewFunctionTool(
 		c.getCurrentTime,
 		function.WithName("current_time"),
-		function.WithDescription("Get the current time and date for a specific timezone"),
+		function.WithDescription(
+			"Get the current time and date for a specific timezone",
+		),
 	)
 
 	// Create agent tool that wraps the math specialist agent.
-	agentTool := agenttool.NewTool(
-		mathAgent,
-		agenttool.WithSkipSummarization(true),  // Skip summarization to get raw response
-		agenttool.WithStreamInner(c.showInner), // Stream inner agent deltas when requested
-	)
+	// SkipSummarization surfaces the child tool result directly.
+	// The run still finishes on runner.completion.
+	agentToolOpts := []agenttool.Option{
+		agenttool.WithSkipSummarization(true),
+		agenttool.WithStreamInner(c.showInner),
+		agenttool.WithInnerTextMode(c.innerTextMode),
+		agenttool.WithResponseMode(c.responseMode),
+	}
+	if strings.TrimSpace(c.persistentKey) != "" {
+		agentToolOpts = append(
+			agentToolOpts,
+			agenttool.WithPersistentHistoryKey(c.persistentKey),
+		)
+	} else if c.persistent {
+		agentToolOpts = append(agentToolOpts, agenttool.WithPersistentHistory())
+	}
+	agentTool := agenttool.NewTool(mathAgent, agentToolOpts...)
 
 	// Create LLM agent with tools including the agent tool.
 	genConfig := model.GenerationConfig{
-		MaxTokens:   intPtr(2000),
-		Temperature: floatPtr(0.7),
-		Stream:      true, // Enable streaming
+		Stream: true, // Enable streaming
 	}
 
 	c.agentName = "chat-assistant"
 	llmAgent := llmagent.New(
 		c.agentName,
 		llmagent.WithModel(modelInstance),
-		llmagent.WithDescription("A helpful AI assistant with time tools and agent tools"),
-		llmagent.WithInstruction("Use tools when appropriate for time queries or "+
-			"mathematical operations. For any math calculations, always use the math-specialist agent tool. "+
-			"After receiving the math-specialist's response, present the result clearly to the user. "+
-			"Be helpful and conversational."),
+		llmagent.WithDescription(
+			"A helpful AI assistant with time tools and agent tools",
+		),
+		llmagent.WithInstruction(
+			"Use tools when appropriate for time queries or "+
+				"mathematical operations. For any math calculations, "+
+				"always use the math-specialist agent tool. After "+
+				"receiving the math-specialist's response, present "+
+				"the result clearly to the user. Be helpful and "+
+				"conversational.",
+		),
 		llmagent.WithGenerationConfig(genConfig),
 		llmagent.WithTools([]tool.Tool{timeTool, agentTool}),
 	)
@@ -230,7 +326,10 @@ func (c *agentToolChat) startChat(ctx context.Context) error {
 }
 
 // processMessage handles a single message exchange.
-func (c *agentToolChat) processMessage(ctx context.Context, userMessage string) error {
+func (c *agentToolChat) processMessage(
+	ctx context.Context,
+	userMessage string,
+) error {
 	message := model.NewUserMessage(userMessage)
 
 	// Run the agent through the runner.
@@ -243,8 +342,10 @@ func (c *agentToolChat) processMessage(ctx context.Context, userMessage string) 
 	return c.processStreamingResponse(eventChan)
 }
 
-// processStreamingResponse handles the streaming response with tool call visualization.
-func (c *agentToolChat) processStreamingResponse(eventChan <-chan *event.Event) error {
+// processStreamingResponse handles streaming with tool call visualization.
+func (c *agentToolChat) processStreamingResponse(
+	eventChan <-chan *event.Event,
+) error {
 	fmt.Print("🤖 Assistant: ")
 
 	var (
@@ -262,8 +363,12 @@ func (c *agentToolChat) processStreamingResponse(eventChan <-chan *event.Event) 
 	return nil
 }
 
-// handleEvent processes a single event and returns true if the event was handled.
-func (c *agentToolChat) handleEvent(ev *event.Event, assistantStarted *bool, fullContent *strings.Builder) bool {
+// handleEvent processes one event and returns true when it was handled.
+func (c *agentToolChat) handleEvent(
+	ev *event.Event,
+	assistantStarted *bool,
+	fullContent *strings.Builder,
+) bool {
 	// Handle errors
 	if ev.Error != nil {
 		fmt.Printf("\n❌ Error: %s\n", ev.Error.Message)
@@ -294,7 +399,10 @@ func (c *agentToolChat) handleEvent(ev *event.Event, assistantStarted *bool, ful
 }
 
 // handleToolCalls processes tool call events.
-func (c *agentToolChat) handleToolCalls(ev *event.Event, assistantStarted *bool) bool {
+func (c *agentToolChat) handleToolCalls(
+	ev *event.Event,
+	assistantStarted *bool,
+) bool {
 	if ev.Response == nil || len(ev.Response.Choices) == 0 {
 		return false
 	}
@@ -320,7 +428,10 @@ func (c *agentToolChat) handleToolCalls(ev *event.Event, assistantStarted *bool)
 
 // handleInnerAgentStreaming processes inner agent streaming events.
 func (c *agentToolChat) handleInnerAgentStreaming(ev *event.Event) bool {
-	if !c.showInner || ev.Author == c.agentName || ev.Response == nil || len(ev.Response.Choices) == 0 {
+	if !c.showInner ||
+		ev.Author == c.agentName ||
+		ev.Response == nil ||
+		len(ev.Response.Choices) == 0 {
 		return false
 	}
 
@@ -337,8 +448,14 @@ func (c *agentToolChat) handleInnerAgentStreaming(ev *event.Event) bool {
 }
 
 // handleAssistantStreaming processes outer assistant streaming events.
-func (c *agentToolChat) handleAssistantStreaming(ev *event.Event, assistantStarted *bool, fullContent *strings.Builder) bool {
-	if ev.Author != c.agentName || ev.Response == nil || len(ev.Response.Choices) == 0 {
+func (c *agentToolChat) handleAssistantStreaming(
+	ev *event.Event,
+	assistantStarted *bool,
+	fullContent *strings.Builder,
+) bool {
+	if ev.Author != c.agentName ||
+		ev.Response == nil ||
+		len(ev.Response.Choices) == 0 {
 		return false
 	}
 
@@ -358,13 +475,15 @@ func (c *agentToolChat) handleAssistantStreaming(ev *event.Event, assistantStart
 
 // handleToolResponses processes tool response events.
 func (c *agentToolChat) handleToolResponses(ev *event.Event) bool {
-	if ev.Response == nil || ev.Object != model.ObjectTypeToolResponse || len(ev.Response.Choices) == 0 {
+	if ev.Response == nil ||
+		ev.Object != model.ObjectTypeToolResponse ||
+		len(ev.Response.Choices) == 0 {
 		return false
 	}
 
 	ch := ev.Response.Choices[0]
 	if ch.Delta.Content != "" {
-		// Partial tool delta - only show if not already shown via inner streaming
+		// Partial tool delta; only show if inner streaming is hidden.
 		if c.showTool && !c.showInner {
 			fmt.Printf("\n🛠️  tool> %s", ch.Delta.Content)
 		}
@@ -374,7 +493,11 @@ func (c *agentToolChat) handleToolResponses(ev *event.Event) bool {
 	if ch.Message.Content != "" {
 		// Final tool message - show detailed response
 		if c.showTool {
-			fmt.Printf("\n✅ Tool response (ID: %s): %s\n", ch.Message.ToolID, strings.TrimSpace(ch.Message.Content))
+			fmt.Printf(
+				"\n✅ Tool response (ID: %s): %s\n",
+				ch.Message.ToolID,
+				strings.TrimSpace(ch.Message.Content),
+			)
 		} else {
 			fmt.Printf("\n✅ Tool execution completed.\n")
 		}
@@ -390,4 +513,36 @@ func (c *agentToolChat) handleToolResponses(ev *event.Event) bool {
 func (c *agentToolChat) startNewSession() {
 	c.sessionID = fmt.Sprintf("chat-session-%d", time.Now().Unix())
 	fmt.Printf("🔄 New session started: %s\n\n", c.sessionID)
+}
+
+func parseInnerTextMode(mode string) (agenttool.InnerTextMode, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", string(agenttool.InnerTextModeInclude):
+		return agenttool.InnerTextModeInclude, nil
+	case string(agenttool.InnerTextModeExclude):
+		return agenttool.InnerTextModeExclude, nil
+	default:
+		return "", fmt.Errorf("unsupported mode %q", mode)
+	}
+}
+
+func parseResponseMode(mode string) (agenttool.ResponseMode, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", responseModeDefault:
+		return agenttool.ResponseModeDefault, nil
+	case responseModeFinal:
+		return agenttool.ResponseModeFinalOnly, nil
+	default:
+		return agenttool.ResponseModeDefault,
+			fmt.Errorf("unsupported response mode %q", mode)
+	}
+}
+
+func responseModeName(mode agenttool.ResponseMode) string {
+	switch mode {
+	case agenttool.ResponseModeFinalOnly:
+		return responseModeFinal
+	default:
+		return responseModeDefault
+	}
 }

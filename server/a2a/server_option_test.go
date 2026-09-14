@@ -11,15 +11,20 @@ package a2a
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-a2a-go/auth"
 	"trpc.group/trpc-go/trpc-a2a-go/protocol"
 	a2a "trpc.group/trpc-go/trpc-a2a-go/server"
 	"trpc.group/trpc-go/trpc-a2a-go/taskmanager"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
@@ -121,6 +126,12 @@ func TestNewContextWithUserID(t *testing.T) {
 	}
 }
 
+func TestWithEventToA2APartMapper_Nil(t *testing.T) {
+	opts := &options{}
+	WithEventToA2APartMapper(nil)(opts)
+	assert.Len(t, opts.eventPartMappers, 0)
+}
+
 func TestDefaultAuthProvider_Authenticate(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -150,7 +161,7 @@ func TestDefaultAuthProvider_Authenticate(t *testing.T) {
 				return req
 			}(),
 			expectError: false,
-			checkUserID: false, // Will be empty, generated from context ID in ProcessMessage
+			checkUserID: false,
 		},
 		{
 			name: "request with empty user ID header",
@@ -160,7 +171,7 @@ func TestDefaultAuthProvider_Authenticate(t *testing.T) {
 				return req
 			}(),
 			expectError: false,
-			checkUserID: false, // Will be empty, generated from context ID in ProcessMessage
+			checkUserID: false,
 		},
 	}
 
@@ -193,13 +204,29 @@ func TestDefaultAuthProvider_Authenticate(t *testing.T) {
 					t.Errorf("Authenticate() userID = %v, want %v", user.ID, expectedUserID)
 				}
 			} else {
-				// Should be empty when no user ID provided - will be generated from context ID in ProcessMessage
-				if user.ID != "" {
-					t.Errorf("Authenticate() userID should be empty when not provided, got: %v", user.ID)
+				if !isAnonymousUserID(user.ID) {
+					t.Errorf("Authenticate() userID should be anonymous when not provided, got: %v", user.ID)
 				}
 			}
 		})
 	}
+}
+
+func TestDefaultAuthProvider_PreservesAuthenticatedContext(t *testing.T) {
+	provider := &defaultAuthProvider{userIDHeader: serverUserIDHeader}
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set(serverUserIDHeader, "header-user")
+	req = req.WithContext(context.WithValue(
+		req.Context(),
+		auth.AuthUserKey,
+		&auth.User{ID: "custom-auth-user"},
+	))
+
+	user, err := provider.Authenticate(req)
+
+	require.NoError(t, err)
+	require.NotNil(t, user)
+	assert.Equal(t, "custom-auth-user", user.ID)
 }
 
 func TestDefaultErrorHandler(t *testing.T) {
@@ -285,53 +312,53 @@ func TestDefaultErrorHandler(t *testing.T) {
 	}
 }
 
-func TestSingleMsgSubscriber(t *testing.T) {
+func TestSingleResultSubscriber(t *testing.T) {
 	testMsg := &protocol.Message{
 		Role:  protocol.MessageRoleAgent,
 		Parts: []protocol.Part{protocol.NewTextPart("test message")},
 	}
 
-	subscriber := newSingleMsgSubscriber(testMsg)
+	subscriber := newSingleResultSubscriber(testMsg)
 
 	// Test initial state - singleMsgSubscriber is always closed
 	if !subscriber.Closed() {
-		t.Error("newSingleMsgSubscriber() should be closed (always returns true)")
+		t.Error("newSingleResultSubscriber() should be closed (always returns true)")
 	}
 
 	// Test channel
 	ch := subscriber.Channel()
 	if ch == nil {
-		t.Error("newSingleMsgSubscriber() channel should not be nil")
+		t.Error("newSingleResultSubscriber() channel should not be nil")
 	}
 
 	// Test receiving the message
 	select {
 	case event := <-ch:
 		if event.Result != testMsg {
-			t.Errorf("newSingleMsgSubscriber() received message = %v, want %v", event.Result, testMsg)
+			t.Errorf("newSingleResultSubscriber() received message = %v, want %v", event.Result, testMsg)
 		}
 	default:
-		t.Error("newSingleMsgSubscriber() should have message available immediately")
+		t.Error("newSingleResultSubscriber() should have message available immediately")
 	}
 
 	// Test that channel is closed after receiving message
 	select {
 	case _, ok := <-ch:
 		if ok {
-			t.Error("newSingleMsgSubscriber() channel should be closed after message")
+			t.Error("newSingleResultSubscriber() channel should be closed after message")
 		}
 	default:
-		t.Error("newSingleMsgSubscriber() channel should be closed")
+		t.Error("newSingleResultSubscriber() channel should be closed")
 	}
 
 	// Test Send method (should return error for single message subscriber)
 	err := subscriber.Send(protocol.StreamingMessageEvent{Result: testMsg})
 	if err == nil {
-		t.Error("newSingleMsgSubscriber() Send() should return error")
+		t.Error("newSingleResultSubscriber() Send() should return error")
 	}
 	expectedErrMsg := "send msg is not allowed for singleMsgSubscriber"
 	if err.Error() != expectedErrMsg {
-		t.Errorf("newSingleMsgSubscriber() Send() error = %v, want %v", err.Error(), expectedErrMsg)
+		t.Errorf("newSingleResultSubscriber() Send() error = %v, want %v", err.Error(), expectedErrMsg)
 	}
 
 	// Test Close method (should be safe to call multiple times)
@@ -339,16 +366,89 @@ func TestSingleMsgSubscriber(t *testing.T) {
 	subscriber.Close() // Should not panic
 }
 
+func TestSingleResultSubscriber_NilResult(t *testing.T) {
+	subscriber := newSingleResultSubscriber(nil)
+
+	ch := subscriber.Channel()
+	if ch == nil {
+		t.Fatal("newSingleResultSubscriber(nil) channel should not be nil")
+	}
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("newSingleResultSubscriber(nil) channel should be closed without events")
+		}
+	default:
+		t.Fatal("newSingleResultSubscriber(nil) should close channel immediately")
+	}
+}
+
+func TestResponseRewriterFuncs_Defaults(t *testing.T) {
+	rewriter := ResponseRewriterFuncs{}
+	unary := &protocol.Message{
+		Role:  protocol.MessageRoleAgent,
+		Parts: []protocol.Part{protocol.NewTextPart("unary")},
+	}
+	streaming := &protocol.TaskStatusUpdateEvent{
+		TaskID:    "task",
+		ContextID: "ctx",
+		Status: protocol.TaskStatus{
+			State: protocol.TaskStateCompleted,
+		},
+	}
+
+	assert.Same(t, unary, rewriter.RewriteUnary(context.Background(), unary))
+	assert.Same(t, streaming, rewriter.RewriteStreaming(context.Background(), streaming))
+}
+
+func TestResponseRewriterFuncs_Context(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "trace-1")
+	unary := &protocol.Message{
+		Role:  protocol.MessageRoleAgent,
+		Parts: []protocol.Part{protocol.NewTextPart("unary")},
+	}
+	streaming := &protocol.TaskStatusUpdateEvent{
+		TaskID:    "task",
+		ContextID: "ctx",
+		Status: protocol.TaskStatus{
+			State: protocol.TaskStateCompleted,
+		},
+	}
+
+	rewriter := ResponseRewriterFuncs{
+		Unary: func(ctx context.Context, result protocol.UnaryMessageResult) protocol.UnaryMessageResult {
+			assert.Equal(t, "trace-1", ctx.Value(contextKey{}))
+			return result
+		},
+		Streaming: func(ctx context.Context, result protocol.StreamingMessageResult) protocol.StreamingMessageResult {
+			assert.Equal(t, "trace-1", ctx.Value(contextKey{}))
+			return result
+		},
+	}
+
+	assert.Same(t, unary, rewriter.RewriteUnary(ctx, unary))
+	assert.Same(t, streaming, rewriter.RewriteStreaming(ctx, streaming))
+}
+
 func TestWithOptions(t *testing.T) {
+	expectedRunner := runner.Runner(&mockRunner{})
+
 	tests := []struct {
-		name     string
-		option   Option
-		validate func(*testing.T, *options)
+		name           string
+		option         Option
+		expectedRunner runner.Runner
+		validate       func(*testing.T, *options, runner.Runner)
 	}{
 		{
 			name:   "WithSessionService",
 			option: WithSessionService(&mockSessionService{}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.sessionService == nil {
 					t.Error("WithSessionService() should set sessionService")
 				}
@@ -357,7 +457,11 @@ func TestWithOptions(t *testing.T) {
 		{
 			name:   "WithHost",
 			option: WithHost("localhost:9999"),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.host != "localhost:9999" {
 					t.Errorf("WithHost() host = %v, want %v", opts.host, "localhost:9999")
 				}
@@ -366,9 +470,27 @@ func TestWithOptions(t *testing.T) {
 		{
 			name:   "WithAgentCard",
 			option: WithAgentCard(a2a.AgentCard{Name: "test-card"}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.agentCard == nil || opts.agentCard.Name != "test-card" {
 					t.Error("WithAgentCard() should set agentCard")
+				}
+			},
+		},
+		{
+			name:           "WithRunner",
+			option:         WithRunner(expectedRunner),
+			expectedRunner: expectedRunner,
+			validate: func(
+				t *testing.T,
+				opts *options,
+				expected runner.Runner,
+			) {
+				if opts.runner != expected {
+					t.Error("WithRunner() should set the provided runner")
 				}
 			},
 		},
@@ -377,7 +499,11 @@ func TestWithOptions(t *testing.T) {
 			option: WithProcessorBuilder(func(agent agent.Agent, sessionService session.Service) taskmanager.MessageProcessor {
 				return &mockTaskManager{}
 			}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.processorBuilder == nil {
 					t.Error("WithProcessorBuilder() should set processorBuilder")
 				}
@@ -388,7 +514,11 @@ func TestWithOptions(t *testing.T) {
 			option: WithProcessMessageHook(func(next taskmanager.MessageProcessor) taskmanager.MessageProcessor {
 				return next
 			}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.processorHook == nil {
 					t.Error("WithProcessMessageHook() should set processorHook")
 				}
@@ -400,7 +530,11 @@ func TestWithOptions(t *testing.T) {
 				// Return nil for testing purposes - we just want to test the option is set
 				return nil
 			}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.taskManagerBuilder == nil {
 					t.Error("WithTaskManagerBuilder() should set taskManagerBuilder")
 				}
@@ -409,7 +543,11 @@ func TestWithOptions(t *testing.T) {
 		{
 			name:   "WithA2AToAgentConverter",
 			option: WithA2AToAgentConverter(&mockA2AToAgentConverter{}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.a2aToAgentConverter == nil {
 					t.Error("WithA2AToAgentConverter() should set a2aToAgentConverter")
 				}
@@ -418,19 +556,69 @@ func TestWithOptions(t *testing.T) {
 		{
 			name:   "WithEventToA2AConverter",
 			option: WithEventToA2AConverter(&mockEventToA2AConverter{}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.eventToA2AConverter == nil {
 					t.Error("WithEventToA2AConverter() should set eventToA2AConverter")
 				}
 			},
 		},
 		{
+			name: "WithEventToA2APartMapper",
+			option: WithEventToA2APartMapper(func(ctx context.Context, event *event.Event) ([]protocol.Part, error) {
+				return nil, nil
+			}),
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
+				if len(opts.eventPartMappers) != 1 {
+					t.Error("WithEventToA2APartMapper() should append eventPartMappers")
+				}
+			},
+		},
+		{
 			name:   "WithDebugLogging",
 			option: WithDebugLogging(true),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if !opts.debugLogging {
 					t.Error("WithDebugLogging() should set debugLogging to true")
 				}
+			},
+		},
+		{
+			name:   "WithGraphEventObjectAllowlist",
+			option: WithGraphEventObjectAllowlist("graph.execution", "graph.node.*"),
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
+				if len(opts.graphEventObjectAllowlist) != 2 {
+					t.Error(
+						"WithGraphEventObjectAllowlist() should set " +
+							"graphEventObjectAllowlist",
+					)
+				}
+			},
+		},
+		{
+			name:   "WithResponseRewriter",
+			option: WithResponseRewriter(ResponseRewriterFuncs{}),
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
+				assert.NotNil(t, opts.responseRewriter)
 			},
 		},
 		{
@@ -438,21 +626,55 @@ func TestWithOptions(t *testing.T) {
 			option: WithErrorHandler(func(ctx context.Context, msg *protocol.Message, err error) (*protocol.Message, error) {
 				return nil, nil
 			}),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				if opts.errorHandler == nil {
 					t.Error("WithErrorHandler() should set errorHandler")
 				}
 			},
 		},
 		{
+			name:   "WithStructuredTaskErrors",
+			option: WithStructuredTaskErrors(true),
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
+				if !opts.structuredTaskErrors {
+					t.Error(
+						"WithStructuredTaskErrors() should enable structuredTaskErrors",
+					)
+				}
+			},
+		},
+		{
 			name:   "WithExtraA2AOptions",
 			option: WithExtraA2AOptions(),
-			validate: func(t *testing.T, opts *options) {
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
 				// Just validate the function doesn't panic
 				// extraOptions slice should be initialized
 				if opts.extraOptions == nil {
 					opts.extraOptions = []a2a.Option{}
 				}
+			},
+		},
+		{
+			name:   "WithPreAuthA2AMiddleware",
+			option: WithPreAuthA2AMiddleware(&traceContextMiddleware{}),
+			validate: func(
+				t *testing.T,
+				opts *options,
+				_ runner.Runner,
+			) {
+				require.Len(t, opts.preAuthMiddlewares, 1)
 			},
 		},
 	}
@@ -463,7 +685,7 @@ func TestWithOptions(t *testing.T) {
 				errorHandler: defaultErrorHandler,
 			}
 			tt.option(opts)
-			tt.validate(t, opts)
+			tt.validate(t, opts, tt.expectedRunner)
 		})
 	}
 }
@@ -498,7 +720,7 @@ func TestDefaultAuthProvider_CustomUserIDHeader(t *testing.T) {
 				return req
 			}(),
 			expectError: false,
-			checkUserID: false, // Will be empty, generated from context ID in ProcessMessage
+			checkUserID: false,
 		},
 		{
 			name:     "default header still works",
@@ -540,12 +762,353 @@ func TestDefaultAuthProvider_CustomUserIDHeader(t *testing.T) {
 					t.Errorf("Authenticate() userID = %v, want %v", user.ID, tt.expectedID)
 				}
 			} else {
-				// Should be empty when no user ID provided - will be generated from context ID in ProcessMessage
-				if user.ID != "" {
-					t.Errorf("Authenticate() userID should be empty when not provided, got: %v", user.ID)
+				if !isAnonymousUserID(user.ID) {
+					t.Errorf("Authenticate() userID should be anonymous when not provided, got: %v", user.ID)
 				}
 			}
 		})
+	}
+}
+
+func TestDefaultAuthProvider_AnonymousUserCookie(t *testing.T) {
+	userID, err := newAnonymousUserID()
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		header     string
+		cookie     string
+		validate   func(t *testing.T, userID string)
+		expectedID string
+	}{
+		{
+			name:   "valid anonymous cookie",
+			cookie: userID,
+			validate: func(t *testing.T, got string) {
+				assert.Equal(t, userID, got)
+			},
+		},
+		{
+			name:   "malformed anonymous cookie is not accepted",
+			cookie: "A2A_ANONYMOUS_not-hex",
+			validate: func(t *testing.T, got string) {
+				assert.True(t, isAnonymousUserID(got))
+				assert.NotEqual(t, "A2A_ANONYMOUS_not-hex", got)
+			},
+		},
+		{
+			name:       "trusted header takes precedence over anonymous cookie",
+			header:     "trusted-user",
+			cookie:     userID,
+			expectedID: "trusted-user",
+		},
+		{
+			name:       "trusted header takes precedence over malformed cookie",
+			header:     "trusted-user",
+			cookie:     "A2A_ANONYMOUS_not-hex",
+			expectedID: "trusted-user",
+		},
+	}
+
+	provider := &defaultAuthProvider{userIDHeader: serverUserIDHeader}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "/test", nil)
+			if tt.header != "" {
+				req.Header.Set(serverUserIDHeader, tt.header)
+			}
+			if tt.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: anonymousUserIDCookie, Value: tt.cookie})
+			}
+
+			user, err := provider.Authenticate(req)
+			assert.NoError(t, err)
+			if tt.expectedID != "" {
+				assert.Equal(t, tt.expectedID, user.ID)
+				return
+			}
+			tt.validate(t, user.ID)
+		})
+	}
+}
+
+func TestDefaultAuthProvider_AnonymousUserGenerationError(t *testing.T) {
+	origRandRead := anonymousRandRead
+	defer func() { anonymousRandRead = origRandRead }()
+	anonymousRandRead = func(_ []byte) (int, error) {
+		return 0, errors.New("entropy unavailable")
+	}
+
+	req, _ := http.NewRequest("GET", "/test", nil)
+	user, err := (&defaultAuthProvider{userIDHeader: serverUserIDHeader}).Authenticate(req)
+	assert.Error(t, err)
+	assert.Nil(t, user)
+}
+
+func TestAnonymousUserCookieMiddleware_CookieAttributes(t *testing.T) {
+	tests := []struct {
+		name         string
+		target       string
+		secureCookie bool
+		wantSecure   bool
+	}{
+		{
+			name:       "secure for TLS request",
+			target:     "https://example.com/test",
+			wantSecure: true,
+		},
+		{
+			name:       "not secure for non TLS request",
+			target:     "http://example.com/test",
+			wantSecure: false,
+		},
+		{
+			name:         "secure for proxy terminated HTTPS endpoint",
+			target:       "http://example.com/test",
+			secureCookie: true,
+			wantSecure:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			middleware := anonymousUserCookieMiddleware{
+				userIDHeader: serverUserIDHeader,
+			}
+			terminal := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				cookie, err := r.Cookie(anonymousUserIDCookie)
+				assert.NoError(t, err)
+				assert.True(t, isAnonymousUserID(cookie.Value))
+			})
+			responseFinalizer := anonymousUserCookieResponseMiddleware{
+				secureCookie: tt.secureCookie,
+				cookiePath:   "/test",
+			}
+			handler := middleware.Wrap(
+				auth.NewMiddleware(
+					&defaultAuthProvider{userIDHeader: serverUserIDHeader},
+				).Wrap(anonymousAuthUserMiddleware{}.Wrap(responseFinalizer.Wrap(terminal))),
+			)
+			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			rr := httptest.NewRecorder()
+
+			handler.ServeHTTP(rr, req)
+
+			var anonymousCookie *http.Cookie
+			for _, cookie := range rr.Result().Cookies() {
+				if cookie.Name == anonymousUserIDCookie {
+					anonymousCookie = cookie
+					break
+				}
+			}
+			if assert.NotNil(t, anonymousCookie) {
+				assert.True(t, anonymousCookie.HttpOnly)
+				assert.Equal(t, "/test", anonymousCookie.Path)
+				assert.Equal(t, tt.wantSecure, anonymousCookie.Secure)
+				assert.Equal(t, http.SameSiteLaxMode, anonymousCookie.SameSite)
+			}
+		})
+	}
+}
+
+func TestAnonymousUserCookieMiddleware_AuthenticatedContextBypassesCookie(t *testing.T) {
+	handler := (anonymousUserCookieMiddleware{userIDHeader: serverUserIDHeader}).Wrap(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, err := r.Cookie(anonymousUserIDCookie)
+			assert.Error(t, err)
+		}),
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	req = req.WithContext(context.WithValue(
+		req.Context(),
+		auth.AuthUserKey,
+		&auth.User{ID: "custom-auth-user"},
+	))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	for _, cookie := range rr.Result().Cookies() {
+		require.NotEqual(t, anonymousUserIDCookie, cookie.Name)
+	}
+}
+
+func TestPreAuthIdentityMiddleware_PreservesExistingAuthenticatedUser(t *testing.T) {
+	user := &auth.User{ID: "already-authenticated"}
+	called := false
+	handler := (preAuthIdentityMiddleware{userIDHeader: serverUserIDHeader}).Wrap(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			got, ok := r.Context().Value(auth.AuthUserKey).(*auth.User)
+			require.True(t, ok)
+			require.Same(t, user, got)
+			_, hasPreAuth := r.Context().Value(preAuthIdentityKey{}).(*auth.User)
+			require.False(t, hasPreAuth)
+		}),
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	req = req.WithContext(context.WithValue(req.Context(), auth.AuthUserKey, user))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	require.True(t, called)
+}
+
+func TestAnonymousCookieSecureForAgentURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		agentURL string
+		want     bool
+	}{
+		{
+			name:     "https public URL",
+			agentURL: "https://example.com/a2a",
+			want:     true,
+		},
+		{
+			name:     "http public URL",
+			agentURL: "http://example.com/a2a",
+			want:     false,
+		},
+		{
+			name:     "host without scheme",
+			agentURL: "example.com/a2a",
+			want:     false,
+		},
+		{
+			name:     "invalid URL",
+			agentURL: "%",
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, anonymousCookieSecureForAgentURL(tt.agentURL))
+		})
+	}
+}
+
+func TestAnonymousCookiePathForBasePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		basePath string
+		want     string
+	}{
+		{name: "empty path", basePath: "", want: "/"},
+		{name: "root path", basePath: "/", want: "/"},
+		{name: "plain path", basePath: "agents/math", want: "/agents/math"},
+		{name: "prefixed path", basePath: "/agents/math", want: "/agents/math"},
+		{name: "trailing slash", basePath: "/agents/math/", want: "/agents/math"},
+		{name: "surrounding space", basePath: " /agents/math/ ", want: "/agents/math"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, anonymousCookiePathForBasePath(tt.basePath))
+		})
+	}
+}
+
+func TestAnonymousUserCookieMiddleware_GenerationError(t *testing.T) {
+	origRandRead := anonymousRandRead
+	defer func() { anonymousRandRead = origRandRead }()
+	anonymousRandRead = func(_ []byte) (int, error) {
+		return 0, errors.New("entropy unavailable")
+	}
+
+	calledNext := false
+	handler := (anonymousUserCookieMiddleware{userIDHeader: serverUserIDHeader}).Wrap(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calledNext = true
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.False(t, calledNext)
+}
+
+func TestIsAnonymousUserID(t *testing.T) {
+	validID, err := newAnonymousUserID()
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		{
+			name: "valid",
+			id:   validID,
+			want: true,
+		},
+		{
+			name: "missing prefix",
+			id:   "user",
+			want: false,
+		},
+		{
+			name: "invalid hex",
+			id:   anonymousUserIDPrefix + "not-hex",
+			want: false,
+		},
+		{
+			name: "wrong byte length",
+			id:   anonymousUserIDPrefix + "0123456789abcdef",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isAnonymousUserID(tt.id))
+		})
+	}
+}
+
+func TestNewAnonymousUserID_Error(t *testing.T) {
+	origRandRead := anonymousRandRead
+	defer func() { anonymousRandRead = origRandRead }()
+	anonymousRandRead = func(_ []byte) (int, error) {
+		return 0, errors.New("entropy unavailable")
+	}
+
+	userID, err := newAnonymousUserID()
+	assert.Error(t, err)
+	assert.Empty(t, userID)
+}
+
+func TestAnonymousUserIDFromRequest_IgnoresOtherCookies(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	req.AddCookie(&http.Cookie{Name: "other", Value: "value"})
+
+	userID, err := anonymousUserIDFromRequest(req)
+	assert.NoError(t, err)
+	assert.True(t, isAnonymousUserID(userID))
+}
+
+func TestAnonymousUserCookieMiddleware_HeaderBypassesCookie(t *testing.T) {
+	calledNext := false
+	handler := (anonymousUserCookieMiddleware{userIDHeader: serverUserIDHeader}).Wrap(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calledNext = true
+			_, err := r.Cookie(anonymousUserIDCookie)
+			assert.Error(t, err)
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	req.Header.Set(serverUserIDHeader, "trusted-user")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.True(t, calledNext)
+	for _, cookie := range rr.Result().Cookies() {
+		if cookie.Name == anonymousUserIDCookie {
+			t.Fatalf("anonymous cookie should not be set when trusted header is present")
+		}
 	}
 }
 
@@ -621,4 +1184,32 @@ func TestWithADKCompatibility(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWithStreamingEventType(t *testing.T) {
+	opts := &options{}
+	WithStreamingEventType(StreamingEventTypeMessage)(opts)
+	assert.Equal(t, StreamingEventTypeMessage, opts.streamingEventType)
+}
+
+func TestWithGraphEventObjectAllowlist_Normalize(t *testing.T) {
+	opts := &options{}
+	WithGraphEventObjectAllowlist(
+		" graph.execution ",
+		"graph.node.*",
+		"graph.node.*",
+		"",
+	)(opts)
+	assert.Equal(
+		t,
+		[]string{"graph.execution", "graph.node.*"},
+		opts.graphEventObjectAllowlist,
+	)
+}
+
+func TestWithGraphEventObjectAllowlist_Empty(t *testing.T) {
+	opts := &options{}
+	WithGraphEventObjectAllowlist()(opts)
+	assert.NotNil(t, opts.graphEventObjectAllowlist)
+	assert.Empty(t, opts.graphEventObjectAllowlist)
 }

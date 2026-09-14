@@ -11,11 +11,16 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"mime"
+	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,13 +28,32 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"github.com/anthropics/anthropic-sdk-go/shared/constant"
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
+	"trpc.group/trpc-go/trpc-agent-go/internal/toolorder"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
+	"trpc.group/trpc-go/trpc-agent-go/model/internal/modeltailoring"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-const functionToolType = "function"
+const (
+	functionToolType       = "function"
+	claudeMythosPreview    = "claude-mythos-preview"
+	claudeFable5           = "claude-fable-5"
+	claudeMythos5          = "claude-mythos-5"
+	claudeOpus5            = "claude-opus-5"
+	claudeSonnet5          = "claude-sonnet-5"
+	claudeOpus48           = "claude-opus-4-8"
+	claudeOpus48Alias      = "claude-4.8-opus"
+	claudeOpus47           = "claude-opus-4-7"
+	claudeOpus47Alias      = "claude-4.7-opus"
+	claudeOpus46           = "claude-opus-4-6"
+	claudeOpus46Alias      = "claude-4.6-opus"
+	claudeSonnet46         = "claude-sonnet-4-6"
+	claudeSonnet46Alias    = "claude-4.6-sonnet"
+	defaultThinkingDisplay = anthropic.ThinkingConfigAdaptiveDisplaySummarized
+)
 
 // Model implements the model.Model interface for Anthropic API.
 type Model struct {
@@ -45,6 +69,7 @@ type Model struct {
 	chatStreamCompleteCallback ChatStreamCompleteCallbackFunc
 	enableTokenTailoring       bool                    // Enable automatic token tailoring.
 	maxInputTokens             int                     // Max input tokens for token tailoring.
+	contextWindow              int                     // Context window for this model instance.
 	tokenCounter               model.TokenCounter      // Token counter for token tailoring.
 	tailoringStrategy          model.TailoringStrategy // Tailoring strategy for token tailoring.
 	// Token tailoring budget parameters (instance-level overrides).
@@ -55,11 +80,10 @@ type Model struct {
 	safetyMarginRatio      float64
 	maxInputTokensRatio    float64
 	// Prompt cache configuration
-	enablePromptCache  bool
-	minCacheableTokens int
-	cacheSystemPrompt  bool
-	cacheTools         bool
-	cacheMessages      bool
+	cacheSystemPrompt bool
+	cacheTools        bool
+	cacheMessages     bool
+	showToolCallDelta bool
 }
 
 // New creates a new Anthropic model adapter.
@@ -96,6 +120,7 @@ func New(name string, opts ...Option) *Model {
 		chatChunkCallback:          o.chatChunkCallback,
 		chatStreamCompleteCallback: o.chatStreamCompleteCallback,
 		enableTokenTailoring:       o.enableTokenTailoring,
+		contextWindow:              o.contextWindow,
 		tokenCounter:               o.tokenCounter,
 		tailoringStrategy:          o.tailoringStrategy,
 		maxInputTokens:             o.maxInputTokens,
@@ -105,19 +130,98 @@ func New(name string, opts ...Option) *Model {
 		outputTokensFloor:          o.tokenTailoringConfig.OutputTokensFloor,
 		safetyMarginRatio:          o.tokenTailoringConfig.SafetyMarginRatio,
 		maxInputTokensRatio:        o.tokenTailoringConfig.MaxInputTokensRatio,
-		enablePromptCache:          o.enablePromptCache,
-		minCacheableTokens:         o.minCacheableTokens,
 		cacheSystemPrompt:          o.cacheSystemPrompt,
 		cacheTools:                 o.cacheTools,
 		cacheMessages:              o.cacheMessages,
+		showToolCallDelta:          o.showToolCallDelta,
 	}
 }
 
 // Info returns the model information.
 func (m *Model) Info() model.Info {
 	return model.Info{
-		Name: m.name,
+		Name:          m.name,
+		ContextWindow: m.contextWindow,
 	}
+}
+
+func (m *Model) runChatRequestCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+) {
+	if m.chatRequestCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat request callback")
+	m.chatRequestCallback(ctx, chatRequest)
+}
+
+func disableChatRequestTools(request *anthropic.MessageNewParams) {
+	if request == nil {
+		return
+	}
+	request.Tools = nil
+	request.ToolChoice = anthropic.ToolChoiceUnionParam{}
+	if override, ok := request.Overrides(); ok {
+		if filtered, ok := imodelrequest.FilterToolControlObject(override); ok {
+			request.SetExtraFields(filtered)
+		}
+		return
+	}
+	if fields := request.ExtraFields(); len(fields) > 0 {
+		request.SetExtraFields(
+			imodelrequest.FilterToolControlFields(fields, true),
+		)
+	}
+}
+
+func (m *Model) requestOptions(ctx context.Context) []option.RequestOption {
+	if !imodelrequest.ToolsDisabled(ctx) {
+		return m.anthropicRequestOptions
+	}
+	opts := append([]option.RequestOption(nil), m.anthropicRequestOptions...)
+	return append(
+		opts,
+		option.WithJSONDel("tools"),
+		option.WithJSONDel("tool_choice"),
+	)
+}
+
+func (m *Model) runChatResponseCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+	chatResponse *anthropic.Message,
+) {
+	if m.chatResponseCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat response callback")
+	m.chatResponseCallback(ctx, chatRequest, chatResponse)
+}
+
+func (m *Model) runChatChunkCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+	chatChunk *anthropic.MessageStreamEventUnion,
+) {
+	if m.chatChunkCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat chunk callback")
+	m.chatChunkCallback(ctx, chatRequest, chatChunk)
+}
+
+func (m *Model) runChatStreamCompleteCallback(
+	ctx context.Context,
+	chatRequest *anthropic.MessageNewParams,
+	chatResponse *anthropic.Message,
+	streamErr error,
+) {
+	if m.chatStreamCompleteCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat stream complete callback")
+	m.chatStreamCompleteCallback(ctx, chatRequest, chatResponse, streamErr)
 }
 
 // GenerateContent generates content from the model.
@@ -136,13 +240,17 @@ func (m *Model) GenerateContent(
 	if err != nil {
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
+	// Execute callback synchronously before starting the goroutine
+	// to avoid a race where the runner and HTTP handler finish
+	// (closing the SSE writer) while the callback is still running.
+	m.runChatRequestCallback(ctx, chatRequest)
+	if imodelrequest.ToolsDisabled(ctx) {
+		disableChatRequestTools(chatRequest)
+	}
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
 	go func() {
 		defer close(responseChan)
-		if m.chatRequestCallback != nil {
-			m.chatRequestCallback(ctx, chatRequest)
-		}
 		if request.Stream {
 			m.handleStreamingResponse(ctx, *chatRequest, responseChan)
 			return
@@ -160,38 +268,35 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	// Determine max input tokens using priority: user config > auto calculation > default.
-	maxInputTokens := m.maxInputTokens
-	if maxInputTokens <= 0 {
-		// Auto-calculate based on model context window with custom or default parameters.
-		contextWindow := imodel.ResolveContextWindow(m.name)
-		if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
-			// Use custom parameters if any are set.
-			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
-				contextWindow,
-				m.protocolOverheadTokens,
-				m.reserveOutputTokens,
-				m.inputTokensFloor,
-				m.safetyMarginRatio,
-				m.maxInputTokensRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
-		}
+	maxInputTokens := m.InputTokenBudget(ctx, request)
+	if m.maxInputTokens <= 0 {
 		log.DebugfContext(
 			ctx,
 			"auto-calculated max input tokens: model=%s, "+
-				"contextWindow=%d, maxInputTokens=%d",
+				"maxInputTokens=%d",
 			m.name,
-			contextWindow,
 			maxInputTokens,
 		)
 	}
+	finishObservation := modeltailoring.ObserveChanges(
+		ctx, "anthropic.Model", request, maxInputTokens,
+	)
+	defer finishObservation()
 
 	// Apply token tailoring.
 	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
 	if err != nil {
+		if len(tailored) > 0 {
+			log.WarnContext(
+				ctx,
+				"token tailoring returned best-effort messages in anthropic.Model",
+				err,
+			)
+			modeltailoring.ApplyResult(
+				ctx, "anthropic.Model", request, tailored,
+			)
+			return
+		}
 		log.WarnContext(
 			ctx,
 			"token tailoring failed in anthropic.Model",
@@ -200,49 +305,31 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	request.Messages = tailored
+	modeltailoring.ApplyResult(
+		ctx, "anthropic.Model", request, tailored,
+	)
+}
 
-	// Calculate remaining tokens for output based on context window.
-	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
-	if err != nil {
-		log.WarnContext(
-			ctx,
-			"failed to count tokens after tailoring",
-			err,
+// InputTokenBudget returns the same input budget used by token tailoring.
+func (m *Model) InputTokenBudget(_ context.Context, _ *model.Request) int {
+	if m.maxInputTokens > 0 {
+		return m.maxInputTokens
+	}
+	contextWindow := m.contextWindow
+	if contextWindow <= 0 {
+		contextWindow = imodel.ResolveContextWindow(m.name)
+	}
+	if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
+		return imodel.CalculateMaxInputTokensWithParams(
+			contextWindow,
+			m.protocolOverheadTokens,
+			m.reserveOutputTokens,
+			m.inputTokensFloor,
+			m.safetyMarginRatio,
+			m.maxInputTokensRatio,
 		)
-		return
 	}
-
-	// Set max output tokens only if user hasn't specified it.
-	// This respects user's explicit configuration while providing a safe default.
-	if request.GenerationConfig.MaxTokens == nil {
-		contextWindow := imodel.ResolveContextWindow(m.name)
-		var maxOutputTokens int
-		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
-			// Use custom parameters if any are set.
-			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
-				contextWindow,
-				usedTokens,
-				m.protocolOverheadTokens,
-				m.outputTokensFloor,
-				m.safetyMarginRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxOutputTokens = imodel.CalculateMaxOutputTokens(contextWindow, usedTokens)
-		}
-		if maxOutputTokens > 0 {
-			request.GenerationConfig.MaxTokens = &maxOutputTokens
-			log.DebugfContext(
-				ctx,
-				"token tailoring: contextWindow=%d, usedTokens=%d, "+
-					"maxOutputTokens=%d",
-				contextWindow,
-				usedTokens,
-				maxOutputTokens,
-			)
-		}
-	}
+	return imodel.CalculateMaxInputTokens(contextWindow)
 }
 
 // buildChatRequest builds the chat request for the Anthropic API.
@@ -259,14 +346,13 @@ func (m *Model) buildChatRequest(request *model.Request) (*anthropic.MessageNewP
 	// Convert tools
 	tools := convertTools(request.Tools)
 
-	// Apply automatic optimal cache control if enabled.
-	// Strategy: Use a single cache breakpoint at the optimal position for maximum efficiency.
-	// Priority order (only one breakpoint is used):
-	// 1. If messages caching enabled and has history: cache at last assistant message (covers everything)
-	// 2. If tools exist: cache at last tool (covers System+Tools)
-	// 3. If only system prompt: cache at last system block
-	if m.shouldEnableCache(request) {
-		messages, systemPrompts, tools = m.applyOptimalCacheControl(messages, systemPrompts, tools)
+	// Apply cache control breakpoints if any cache option is enabled.
+	// Uses multiple independent breakpoints (up to 4 allowed by Anthropic) for optimal caching:
+	// - System prompt breakpoint: caches stable system instructions
+	// - Tools breakpoint: caches stable tool definitions
+	// - Messages breakpoint: caches conversation history at last assistant message
+	if m.cacheSystemPrompt || m.cacheTools || m.cacheMessages {
+		systemPrompts, tools, messages = m.applyCacheControl(systemPrompts, tools, messages)
 	}
 
 	// Build chat request.
@@ -278,13 +364,10 @@ func (m *Model) buildChatRequest(request *model.Request) (*anthropic.MessageNewP
 	if len(systemPrompts) > 0 {
 		chatRequest.System = systemPrompts
 	}
-	if request.GenerationConfig.MaxTokens != nil {
-		chatRequest.MaxTokens = int64(*request.GenerationConfig.MaxTokens)
+	if mt := imodel.ClampMaxTokensForModel(m.name, request.MaxTokens); mt != nil {
+		chatRequest.MaxTokens = int64(*mt)
 	}
-	// Only apply default MaxTokens when token tailoring is disabled.
-	// When token tailoring is enabled, respect the value set by applyTokenTailoring
-	// (or leave it as 0 if token counting failed).
-	if chatRequest.MaxTokens == 0 && !m.enableTokenTailoring {
+	if chatRequest.MaxTokens < int64(imodel.MinValidCompletionTokens) {
 		chatRequest.MaxTokens = 4096
 	}
 	if request.Temperature != nil {
@@ -296,79 +379,115 @@ func (m *Model) buildChatRequest(request *model.Request) (*anthropic.MessageNewP
 	if len(request.Stop) > 0 {
 		chatRequest.StopSequences = append(chatRequest.StopSequences, request.Stop...)
 	}
-	if request.ThinkingEnabled != nil && *request.ThinkingEnabled && request.ThinkingTokens != nil {
-		chatRequest.Thinking = anthropic.ThinkingConfigParamOfEnabled(int64(*request.ThinkingTokens))
+	if err := m.applyThinkingConfig(chatRequest, request); err != nil {
+		return nil, err
 	}
 	return chatRequest, nil
 }
 
-// shouldEnableCache determines whether to enable prompt caching for this request.
-func (m *Model) shouldEnableCache(request *model.Request) bool {
-	if !m.enablePromptCache {
-		return false
+func (m *Model) applyThinkingConfig(
+	chatRequest *anthropic.MessageNewParams,
+	request *model.Request,
+) error {
+	if request.ThinkingEnabled == nil {
+		return nil
 	}
+	if !*request.ThinkingEnabled {
+		if isAlwaysThinking(m.name) {
+			return fmt.Errorf("anthropic: thinking cannot be disabled for model %s", m.name)
+		}
+		if !supportsAdaptiveThinking(m.name) {
+			return nil
+		}
+		disabled := anthropic.NewThinkingConfigDisabledParam()
+		chatRequest.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &disabled}
+		return nil
+	}
+	if supportsAdaptiveThinking(m.name) {
+		chatRequest.Thinking = newAdaptiveThinkingConfig()
+		if request.ReasoningEffort != nil {
+			chatRequest.OutputConfig.Effort = anthropic.OutputConfigEffort(*request.ReasoningEffort)
+		}
+		return nil
+	}
+	if request.ThinkingTokens == nil {
+		return nil
+	}
+	chatRequest.Thinking = anthropic.ThinkingConfigParamOfEnabled(int64(*request.ThinkingTokens))
+	return nil
+}
 
-	// Estimate total cacheable tokens
-	systemTokens := m.estimateSystemTokens(request.Messages)
-	toolTokens := m.estimateToolTokens(request.Tools)
-	messageTokens := m.estimateMessageTokens(request.Messages)
+func newAdaptiveThinkingConfig() anthropic.ThinkingConfigParamUnion {
+	return anthropic.ThinkingConfigParamUnion{
+		OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{
+			Display: defaultThinkingDisplay,
+		},
+	}
+}
 
-	// Check if any caching strategy would be beneficial
-	// Priority: messages > tools > system (based on what covers more content)
-	if m.cacheMessages && messageTokens > 0 {
-		// For multi-turn, we cache at the last assistant message
-		// which covers system + tools + all previous messages
-		totalTokens := systemTokens + toolTokens + messageTokens
-		if totalTokens >= m.minCacheableTokens {
+func supportsAdaptiveThinking(modelName string) bool {
+	return modelNameMatches(
+		modelName,
+		claudeMythosPreview,
+		claudeFable5,
+		claudeMythos5,
+		claudeOpus5,
+		claudeSonnet5,
+		claudeOpus48,
+		claudeOpus48Alias,
+		claudeOpus47,
+		claudeOpus47Alias,
+		claudeOpus46,
+		claudeOpus46Alias,
+		claudeSonnet46,
+		claudeSonnet46Alias,
+	)
+}
+
+// isAlwaysThinking reports whether a model thinks unconditionally, so that
+// `thinking.type=disabled` is not merely ignored but rejected by the API.
+// Sending it for one of these turns a caller's explicit ThinkingEnabled=false
+// into a 400, so the request is refused here with a message naming the model.
+func isAlwaysThinking(modelName string) bool {
+	return modelNameMatches(modelName, claudeMythosPreview, claudeFable5, claudeMythos5)
+}
+
+func modelNameMatches(modelName string, targets ...string) bool {
+	for _, target := range targets {
+		if modelName == target || strings.HasPrefix(modelName, target+"-") {
 			return true
 		}
 	}
-
-	if m.cacheTools && len(request.Tools) > 0 {
-		totalTokens := systemTokens + toolTokens
-		if totalTokens >= m.minCacheableTokens {
-			return true
-		}
-	}
-
-	if m.cacheSystemPrompt && systemTokens >= m.minCacheableTokens {
-		return true
-	}
-
 	return false
 }
 
-// applyOptimalCacheControl applies the optimal cache control strategy.
-// It uses a single cache breakpoint at the most efficient position.
-// The strategy follows Anthropic's prefix caching model where everything
-// before the cache breakpoint is cached together.
-func (m *Model) applyOptimalCacheControl(
-	messages []anthropic.MessageParam,
+// applyCacheControl applies independent cache control breakpoints.
+// Unlike the previous single-breakpoint strategy, this sets multiple breakpoints
+// independently (Anthropic supports up to 4). This ensures stable content like
+// system prompts and tools always benefit from caching, regardless of whether
+// message caching is also enabled.
+//
+// Breakpoints applied (each independent):
+//   - System prompt: always cached when cacheSystemPrompt is true (stable across turns)
+//   - Tools: always cached when cacheTools is true (stable across turns)
+//   - Last assistant message: cached when cacheMessages is true (opt-in, benefits multi-turn)
+func (m *Model) applyCacheControl(
 	systemPrompts []anthropic.TextBlockParam,
 	tools []anthropic.ToolUnionParam,
-) ([]anthropic.MessageParam, []anthropic.TextBlockParam, []anthropic.ToolUnionParam) {
-	// Strategy 1: Cache at last assistant message (covers System + Tools + Messages)
-	// This is the most efficient for multi-turn conversations
-	if m.cacheMessages && len(messages) > 1 {
-		lastAssistantIdx := m.findLastAssistantMessageIndex(messages)
-		if lastAssistantIdx >= 0 {
-			messages = m.applyCacheControlToMessages(messages, lastAssistantIdx)
-			return messages, systemPrompts, tools
-		}
-	}
-
-	// Strategy 2: Cache at last tool (covers System + Tools)
-	if m.cacheTools && len(tools) > 0 {
-		tools = m.applyCacheControlToTools(tools)
-		return messages, systemPrompts, tools
-	}
-
-	// Strategy 3: Cache at last system block (covers System only)
+	messages []anthropic.MessageParam,
+) ([]anthropic.TextBlockParam, []anthropic.ToolUnionParam, []anthropic.MessageParam) {
 	if m.cacheSystemPrompt && len(systemPrompts) > 0 {
 		systemPrompts = m.applyCacheControlToSystem(systemPrompts)
 	}
-
-	return messages, systemPrompts, tools
+	if m.cacheTools && len(tools) > 0 {
+		tools = m.applyCacheControlToTools(tools)
+	}
+	if m.cacheMessages && len(messages) > 1 {
+		if idx := m.findLastAssistantMessageIndex(messages); idx >= 0 {
+			messages = m.applyCacheControlToMessages(messages, idx)
+		}
+	}
+	return systemPrompts, tools, messages
 }
 
 // findLastAssistantMessageIndex finds the index of the last assistant message
@@ -431,91 +550,40 @@ func (m *Model) applyCacheControlToMessages(messages []anthropic.MessageParam, i
 	return result
 }
 
-// estimateMessageTokens estimates the token count of non-system messages.
-func (m *Model) estimateMessageTokens(messages []model.Message) int {
-	count := 0
-	for _, msg := range messages {
-		if msg.Role == model.RoleSystem {
-			continue
-		}
-		// Rough estimate: 1 token ~= 4 characters
-		count += len(msg.Content) / 4
-		for _, part := range msg.ContentParts {
-			if part.Type == model.ContentTypeText && part.Text != nil {
-				count += len(*part.Text) / 4
-			}
-		}
-	}
-	return count
-}
-
-// estimateSystemTokens estimates the token count of system messages.
-func (m *Model) estimateSystemTokens(messages []model.Message) int {
-	count := 0
-	for _, msg := range messages {
-		if msg.Role == model.RoleSystem {
-			// Rough estimate: 1 token ~= 4 characters
-			count += len(msg.Content) / 4
-			for _, part := range msg.ContentParts {
-				if part.Type == model.ContentTypeText && part.Text != nil {
-					count += len(*part.Text) / 4
-				}
-			}
-		}
-	}
-	return count
-}
-
-// estimateToolTokens estimates the token count of tool definitions.
-func (m *Model) estimateToolTokens(tools map[string]tool.Tool) int {
-	count := 0
-	for _, t := range tools {
-		decl := t.Declaration()
-		// Rough estimate based on JSON schema size
-		count += len(decl.Name) / 4
-		count += len(decl.Description) / 4
-		if decl.InputSchema != nil {
-			// Estimate JSON schema size
-			count += 100 // Base overhead for schema structure
-		}
-	}
-	return count
-}
-
-// applyCacheControlToSystem adds cache control to system prompts.
-// According to Anthropic's docs, we should add cache_control to the last
-// block in system prompts to create a cache breakpoint.
-// This enables prompt caching with up to 90% cost savings on cached tokens.
+// applyCacheControlToSystem adds cache control to the last system prompt block.
 func (m *Model) applyCacheControlToSystem(systemPrompts []anthropic.TextBlockParam) []anthropic.TextBlockParam {
 	if len(systemPrompts) == 0 {
 		return systemPrompts
 	}
 
-	// Add cache control to the last system block to create a cache breakpoint
-	// This tells Anthropic to cache everything up to and including this block
-	lastIdx := len(systemPrompts) - 1
-	systemPrompts[lastIdx].CacheControl = anthropic.NewCacheControlEphemeralParam()
+	// Create a copy to avoid modifying the original slice elements.
+	result := make([]anthropic.TextBlockParam, len(systemPrompts))
+	copy(result, systemPrompts)
 
-	return systemPrompts
+	lastIdx := len(result) - 1
+	result[lastIdx].CacheControl = anthropic.NewCacheControlEphemeralParam()
+
+	return result
 }
 
-// applyCacheControlToTools adds cache control to tool definitions.
-// According to Anthropic's docs, we should add cache_control to the last
-// tool to create a cache breakpoint for all tool definitions.
-// This is particularly useful when you have many tools with large schemas.
+// applyCacheControlToTools adds cache control to the last tool definition.
 func (m *Model) applyCacheControlToTools(tools []anthropic.ToolUnionParam) []anthropic.ToolUnionParam {
-	if len(tools) == 0 || !m.cacheTools {
+	if len(tools) == 0 {
 		return tools
 	}
 
-	// Add cache control to the last tool to create a cache breakpoint
-	// This caches all tool definitions up to and including this one
-	lastIdx := len(tools) - 1
-	if tools[lastIdx].OfTool != nil {
-		tools[lastIdx].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
+	// Create a copy to avoid modifying the original slice elements.
+	result := make([]anthropic.ToolUnionParam, len(tools))
+	copy(result, tools)
+
+	lastIdx := len(result) - 1
+	if result[lastIdx].OfTool != nil {
+		toolCopy := *result[lastIdx].OfTool
+		toolCopy.CacheControl = anthropic.NewCacheControlEphemeralParam()
+		result[lastIdx].OfTool = &toolCopy
 	}
 
-	return tools
+	return result
 }
 
 // handleNonStreamingResponse sends a non-streaming request to the Anthropic API and emits exactly one final response.
@@ -525,14 +593,12 @@ func (m *Model) handleNonStreamingResponse(
 	responseChan chan<- *model.Response,
 ) {
 	// Issue non-streaming request.
-	message, err := m.client.Messages.New(ctx, chatRequest, m.anthropicRequestOptions...)
+	message, err := m.client.Messages.New(ctx, chatRequest, m.requestOptions(ctx)...)
 	if err != nil {
 		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeAPIError, err)
 		return
 	}
-	if m.chatResponseCallback != nil {
-		m.chatResponseCallback(ctx, &chatRequest, message)
-	}
+	m.runChatResponseCallback(ctx, &chatRequest, message)
 	// Build final response payload.
 	now := time.Now()
 	response := &model.Response{
@@ -583,25 +649,29 @@ func (m *Model) handleStreamingResponse(
 	responseChan chan<- *model.Response,
 ) {
 	// Issue streaming request.
-	stream := m.client.Messages.NewStreaming(ctx, chatRequest, m.anthropicRequestOptions...)
+	stream := m.client.Messages.NewStreaming(ctx, chatRequest, m.requestOptions(ctx)...)
 	defer stream.Close()
 	// Accumulator to build final response.
-	acc := anthropic.Message{}
+	acc := newStreamingMessageAccumulator()
+	var (
+		finalResponse *model.Response
+		streamErr     error
+	)
+
+loop:
 	for stream.Next() {
 		chunk := stream.Current()
 		// Accumulate into accumulator.
 		if err := acc.Accumulate(chunk); err != nil {
-			m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
-			return
+			streamErr = err
+			break
 		}
-		if m.chatChunkCallback != nil {
-			m.chatChunkCallback(ctx, &chatRequest, &chunk)
-		}
+		m.runChatChunkCallback(ctx, &chatRequest, &chunk)
 		// Build partial response.
-		response, err := buildStreamingPartialResponse(acc, chunk)
+		response, err := buildStreamingPartialResponse(acc.Message(), chunk, m.showToolCallDelta)
 		if err != nil {
-			m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
-			return
+			streamErr = err
+			break
 		}
 		if response == nil {
 			continue
@@ -610,34 +680,208 @@ func (m *Model) handleStreamingResponse(
 		select {
 		case responseChan <- response:
 		case <-ctx.Done():
-			return
+			streamErr = ctx.Err()
+			break loop
 		}
 	}
+	if streamErr == nil {
+		streamErr = stream.Err()
+	}
+	if streamErr == nil {
+		if err := acc.Finalize(); err != nil {
+			streamErr = err
+		} else {
+			finalResponse = buildStreamingFinalResponse(acc.Message())
+		}
+	}
+	var callbackAcc *anthropic.Message
+	if streamErr == nil {
+		finalAcc := acc.Message()
+		callbackAcc = &finalAcc
+	}
+	m.runChatStreamCompleteCallback(ctx, &chatRequest, callbackAcc, streamErr)
 	// Propagate stream error.
-	if err := stream.Err(); err != nil {
-		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
+	if streamErr != nil {
+		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, streamErr)
 		return
 	}
-	// Emit final response built from the accumulator.
-	finalResponse := buildStreamingFinalResponse(acc)
 	select {
 	case responseChan <- finalResponse:
 	case <-ctx.Done():
 	}
-	// Call the stream complete callback after final response is sent.
-	if m.chatStreamCompleteCallback != nil {
-		var callbackAcc *anthropic.Message
-		if stream.Err() == nil {
-			callbackAcc = &acc
+}
+
+type streamingMessageAccumulator struct {
+	message             anthropic.Message
+	inputDeltaStartedAt []bool
+	finalized           bool
+}
+
+func newStreamingMessageAccumulator() *streamingMessageAccumulator {
+	return &streamingMessageAccumulator{}
+}
+
+func (a *streamingMessageAccumulator) Message() anthropic.Message {
+	if a == nil {
+		return anthropic.Message{}
+	}
+	return a.message
+}
+
+func (a *streamingMessageAccumulator) Accumulate(event anthropic.MessageStreamEventUnion) error {
+	if a == nil {
+		return errors.New("accumulate: cannot accumulate into nil accumulator")
+	}
+	switch event := event.AsAny().(type) {
+	case anthropic.MessageStartEvent:
+		a.message = event.Message
+		a.inputDeltaStartedAt = make([]bool, len(a.message.Content))
+		a.finalized = false
+	case anthropic.MessageDeltaEvent:
+		a.message.StopReason = event.Delta.StopReason
+		a.message.StopSequence = event.Delta.StopSequence
+		a.message.Usage.OutputTokens = event.Usage.OutputTokens
+	case anthropic.MessageStopEvent:
+		return a.finalize()
+	case anthropic.ContentBlockStartEvent:
+		var block anthropic.ContentBlockUnion
+		if err := block.UnmarshalJSON([]byte(event.ContentBlock.RawJSON())); err != nil {
+			return err
 		}
-		m.chatStreamCompleteCallback(ctx, &chatRequest, callbackAcc, stream.Err())
+		a.message.Content = append(a.message.Content, block)
+		a.inputDeltaStartedAt = append(a.inputDeltaStartedAt, false)
+	case anthropic.ContentBlockDeltaEvent:
+		block, started, err := a.lastContentBlock()
+		if err != nil {
+			return fmt.Errorf("received event of type %s but %w", event.Type, err)
+		}
+		switch delta := event.Delta.AsAny().(type) {
+		case anthropic.TextDelta:
+			block.Text += delta.Text
+		case anthropic.InputJSONDelta:
+			appendInputJSONDelta(block, started, delta.PartialJSON)
+		case anthropic.ThinkingDelta:
+			block.Thinking += delta.Thinking
+		case anthropic.SignatureDelta:
+			block.Signature += delta.Signature
+		case anthropic.CitationsDelta:
+			citation := anthropic.TextCitationUnion{}
+			if err := citation.UnmarshalJSON([]byte(delta.Citation.RawJSON())); err != nil {
+				return fmt.Errorf("could not unmarshal citation delta into citation type: %w", err)
+			}
+			block.Citations = append(block.Citations, citation)
+		}
+	case anthropic.ContentBlockStopEvent:
+		block, _, err := a.lastContentBlock()
+		if err != nil {
+			return fmt.Errorf("received event of type %s but %w", event.Type, err)
+		}
+		// Guard against invalid/partial JSON in tool-use Input fields.
+		// Certain Anthropic-compatible APIs send content_block_stop before
+		// all input_json_delta events, leaving accumulated Input as
+		// incomplete JSON.
+		ensureValidToolInput(block)
+		if err := refreshContentBlockRawJSON(block); err != nil {
+			return fmt.Errorf("error converting content block to JSON: %w", err)
+		}
+	}
+	return nil
+}
+
+func (a *streamingMessageAccumulator) Finalize() error {
+	if a == nil {
+		return nil
+	}
+	return a.finalize()
+}
+
+func (a *streamingMessageAccumulator) lastContentBlock() (*anthropic.ContentBlockUnion, *bool, error) {
+	if len(a.message.Content) == 0 {
+		return nil, nil, errors.New("no content block")
+	}
+	last := len(a.message.Content) - 1
+	return &a.message.Content[last], &a.inputDeltaStartedAt[last], nil
+}
+
+func (a *streamingMessageAccumulator) finalize() error {
+	if a == nil || a.finalized {
+		return nil
+	}
+	if err := finalizeStreamingMessage(&a.message); err != nil {
+		return err
+	}
+	a.finalized = true
+	return nil
+}
+
+func appendInputJSONDelta(block *anthropic.ContentBlockUnion, started *bool, partial string) {
+	if block == nil || started == nil || partial == "" {
+		return
+	}
+	if !*started {
+		// Treat the first streamed input delta as authoritative to avoid
+		// concatenating a complete start-event value with a second JSON value.
+		block.Input = bytes.Clone([]byte(partial))
+		*started = true
+		return
+	}
+	block.Input = append(block.Input, partial...)
+}
+
+func finalizeStreamingMessage(message *anthropic.Message) error {
+	if message == nil {
+		return nil
+	}
+	for i := range message.Content {
+		if err := refreshContentBlockRawJSON(&message.Content[i]); err != nil {
+			return err
+		}
+	}
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	return message.UnmarshalJSON(raw)
+}
+
+func refreshContentBlockRawJSON(block *anthropic.ContentBlockUnion) error {
+	if block == nil {
+		return nil
+	}
+	raw, err := json.Marshal(block)
+	if err != nil {
+		return err
+	}
+	return block.UnmarshalJSON(raw)
+}
+
+// ensureValidToolInput resets a ContentBlockUnion's Input to an empty JSON
+// object if it is empty, nil, or contains invalid/partial JSON. This handles
+// three cases with Anthropic-compatible proxies:
+//  1. "input": null decodes to nil bytes — normalize to {} so the tool call
+//     arguments stay valid JSON.
+//  2. "input":"null" (the literal JSON null) — json.Valid returns true but
+//     null is not a valid tool arguments object, so normalize to {}.
+//  3. The stream ends before all input_json_delta events are received, leaving
+//     accumulated Input as incomplete JSON.
+func ensureValidToolInput(cb *anthropic.ContentBlockUnion) {
+	if cb == nil {
+		return
+	}
+	if cb.Type != "tool_use" {
+		return
+	}
+	input := bytes.TrimSpace(cb.Input)
+	if len(input) == 0 || string(input) == "null" || !json.Valid(input) {
+		cb.Input = json.RawMessage("{}")
 	}
 }
 
 // buildStreamingPartialResponse builds a partial streaming response for a chunk.
 // Returns nil if the chunk should be skipped.
 func buildStreamingPartialResponse(acc anthropic.Message,
-	chunk anthropic.MessageStreamEventUnion) (*model.Response, error) {
+	chunk anthropic.MessageStreamEventUnion,
+	showToolCallDelta bool) (*model.Response, error) {
 	now := time.Now()
 	response := &model.Response{
 		ID:        acc.ID,
@@ -667,6 +911,17 @@ func buildStreamingPartialResponse(acc anthropic.Message,
 				return nil, nil
 			}
 			response.Choices[0].Delta.ReasoningContent = delta.Thinking
+		case anthropic.InputJSONDelta:
+			if !showToolCallDelta || delta.PartialJSON == "" {
+				return nil, nil
+			}
+			block, index, ok := streamingToolCallTarget(acc, event.Index)
+			if !ok {
+				return nil, nil
+			}
+			response.Choices[0].Delta.ToolCalls = []model.ToolCall{
+				buildStreamingToolCallDelta(block, index, delta.PartialJSON),
+			}
 		default:
 			return nil, nil
 		}
@@ -680,6 +935,41 @@ func buildStreamingPartialResponse(acc anthropic.Message,
 		return nil, nil
 	}
 	return response, nil
+}
+
+func buildStreamingToolCallDelta(
+	block anthropic.ToolUseBlock,
+	index int,
+	partialJSON string,
+) model.ToolCall {
+	return model.ToolCall{
+		Index: &index,
+		ID:    block.ID,
+		Type:  functionToolType,
+		Function: model.FunctionDefinitionParam{
+			Name:      block.Name,
+			Arguments: []byte(partialJSON),
+		},
+	}
+}
+
+func streamingToolCallTarget(acc anthropic.Message, contentBlockIndex int64) (anthropic.ToolUseBlock, int, bool) {
+	index := int(contentBlockIndex)
+	if index < 0 || index >= len(acc.Content) {
+		return anthropic.ToolUseBlock{}, 0, false
+	}
+	toolCallIndex := 0
+	for i := 0; i <= index; i++ {
+		block, ok := acc.Content[i].AsAny().(anthropic.ToolUseBlock)
+		if !ok {
+			continue
+		}
+		if i == index {
+			return block, toolCallIndex, true
+		}
+		toolCallIndex++
+	}
+	return anthropic.ToolUseBlock{}, 0, false
 }
 
 // buildStreamingFinalResponse builds a final streaming response from the accumulator.
@@ -794,25 +1084,28 @@ func convertContentBlock(contents []anthropic.ContentBlockUnion) model.Message {
 
 // convertTools maps our tool declarations to Anthropic tool parameters.
 func convertTools(tools map[string]tool.Tool) []anthropic.ToolUnionParam {
-	// Extract and sort tool names for stable ordering to improve cache hit rate
-	toolNames := make([]string, 0, len(tools))
-	for name := range tools {
-		toolNames = append(toolNames, name)
-	}
-	sort.Strings(toolNames)
-
-	// Build tools in sorted order
 	var result []anthropic.ToolUnionParam
-	for _, name := range toolNames {
-		tool := tools[name]
-		declaration := tool.Declaration()
+	for _, t := range toolorder.SortedTools(tools) {
+		declaration := t.Declaration()
+		effectiveSchemaType := declaration.InputSchema.Type
+		// The Anthropic SDK marshals an empty type as "object". Use that
+		// effective type when normalizing properties so a typed nil map does
+		// not become JSON null for an implicit object schema.
+		if effectiveSchemaType == "" {
+			effectiveSchemaType = "object"
+		}
+		properties := declaration.InputSchema.Properties
+		// Some Anthropic-compatible endpoints reject null properties for object schemas.
+		if effectiveSchemaType == "object" && properties == nil {
+			properties = map[string]*tool.Schema{}
+		}
 		result = append(result, anthropic.ToolUnionParam{
 			OfTool: &anthropic.ToolParam{
 				Name:        declaration.Name,
 				Description: anthropic.String(buildToolDescription(declaration)),
 				InputSchema: anthropic.ToolInputSchemaParam{
 					Type:       constant.Object(declaration.InputSchema.Type),
-					Properties: declaration.InputSchema.Properties,
+					Properties: properties,
 					Required:   declaration.InputSchema.Required,
 				},
 			},
@@ -846,15 +1139,31 @@ func convertMessages(messages []model.Message) ([]anthropic.MessageParam, []anth
 	for _, message := range messages {
 		switch message.Role {
 		case model.RoleSystem:
-			systemPrompts = append(systemPrompts, convertSystemMessageContent(message)...)
+			converted, err := convertSystemMessageContent(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			systemPrompts = append(systemPrompts, converted...)
 		case model.RoleAssistant:
-			conversation = append(conversation, convertAssistantMessageContent(message))
+			converted, err := convertAssistantMessageContent(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			conversation = append(conversation, converted)
 		case model.RoleTool:
 			conversation = append(conversation, convertToolResult(message))
 		case model.RoleUser:
-			conversation = append(conversation, convertUserMessage(message))
+			converted, err := convertUserMessage(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			conversation = append(conversation, converted)
 		default:
-			conversation = append(conversation, convertUserMessage(message))
+			converted, err := convertUserMessage(message)
+			if err != nil {
+				return nil, nil, err
+			}
+			conversation = append(conversation, converted)
 		}
 	}
 	// Merge consecutive tool result messages into a single user message to support parallel tool invocation.
@@ -892,30 +1201,260 @@ func convertMessages(messages []model.Message) ([]anthropic.MessageParam, []anth
 	return mergedConversation, systemPrompts, nil
 }
 
-// convertUserMessage converts a user message by keeping only supported text parts.
-func convertUserMessage(message model.Message) anthropic.MessageParam {
+// convertUserMessage converts a user message including supported multimodal parts.
+func convertUserMessage(message model.Message) (anthropic.MessageParam, error) {
 	blocks := make([]anthropic.ContentBlockParamUnion, 0, 1+len(message.ContentParts))
 	if message.Content != "" {
 		blocks = append(blocks, anthropic.NewTextBlock(message.Content))
 	}
-	for _, part := range message.ContentParts {
-		if part.Type == model.ContentTypeText && part.Text != nil {
-			blocks = append(blocks, anthropic.NewTextBlock(*part.Text))
+	for i, part := range message.ContentParts {
+		block, ok, err := convertUserContentPart(part)
+		if err != nil {
+			return anthropic.MessageParam{}, fmt.Errorf("anthropic: convert user content part %d: %w", i, err)
+		}
+		if ok {
+			blocks = append(blocks, block)
 		}
 	}
-	return anthropic.NewUserMessage(blocks...)
+	return anthropic.NewUserMessage(blocks...), nil
+}
+
+func convertUserContentPart(part model.ContentPart) (anthropic.ContentBlockParamUnion, bool, error) {
+	switch part.Type {
+	case model.ContentTypeText:
+		if part.Text == nil {
+			return anthropic.ContentBlockParamUnion{}, false, nil
+		}
+		return anthropic.NewTextBlock(*part.Text), true, nil
+	case model.ContentTypeImage:
+		block, err := convertImageContentPart(part.Image)
+		return block, true, err
+	case model.ContentTypeFile:
+		block, err := convertFileContentPart(part.File)
+		return block, true, err
+	case model.ContentTypeAudio:
+		return anthropic.ContentBlockParamUnion{}, false, fmt.Errorf("audio content is not supported")
+	default:
+		return anthropic.ContentBlockParamUnion{}, false, fmt.Errorf("unsupported content type %q", part.Type)
+	}
+}
+
+func convertImageContentPart(image *model.Image) (anthropic.ContentBlockParamUnion, error) {
+	if image == nil {
+		return anthropic.ContentBlockParamUnion{}, fmt.Errorf("image payload is nil")
+	}
+	if imageURL := strings.TrimSpace(image.URL); imageURL != "" {
+		if imageURLMediaTypeUnsupported(image) {
+			return anthropic.NewTextBlock(imageURLText(image)), nil
+		}
+		return anthropic.NewImageBlock(anthropic.URLImageSourceParam{URL: imageURL}), nil
+	}
+	if len(image.Data) == 0 {
+		return anthropic.ContentBlockParamUnion{}, fmt.Errorf("image data is empty")
+	}
+	mediaType, err := imageMediaType(image.Format, image.Data)
+	if err != nil {
+		return anthropic.ContentBlockParamUnion{}, err
+	}
+	return anthropic.NewImageBlockBase64(mediaType, base64.StdEncoding.EncodeToString(image.Data)), nil
+}
+
+func imageURLMediaTypeUnsupported(image *model.Image) bool {
+	mediaType := normalizeMediaType(image.Format)
+	if mediaType == "" {
+		mediaType = mediaTypeFromURL(image.URL)
+	}
+	if mediaType == "" {
+		return false
+	}
+	_, err := normalizeImageMediaType(mediaType)
+	return err != nil
+}
+
+func imageURLText(image *model.Image) string {
+	imageURL := strings.TrimSpace(image.URL)
+	format := strings.TrimSpace(image.Format)
+	if format == "" {
+		return "Image URL: " + imageURL
+	}
+	return fmt.Sprintf("Image URL (%s): %s", format, imageURL)
+}
+
+func convertFileContentPart(file *model.File) (anthropic.ContentBlockParamUnion, error) {
+	if file == nil {
+		return anthropic.ContentBlockParamUnion{}, fmt.Errorf("file payload is nil")
+	}
+	if file.FileID != "" {
+		return anthropic.ContentBlockParamUnion{}, fmt.Errorf("file_id content is not supported")
+	}
+	if len(file.Data) > 0 {
+		mediaType := fileMediaType(file)
+		if imageType, err := normalizeImageMediaType(mediaType); err == nil {
+			return anthropic.NewImageBlockBase64(imageType, base64.StdEncoding.EncodeToString(file.Data)), nil
+		}
+		switch mediaType {
+		case "application/pdf":
+			block := anthropic.NewDocumentBlock(anthropic.Base64PDFSourceParam{
+				Data: base64.StdEncoding.EncodeToString(file.Data),
+			})
+			return applyDocumentTitle(block, file.Name), nil
+		case "text/plain":
+			block := anthropic.NewDocumentBlock(anthropic.PlainTextSourceParam{
+				Data: string(file.Data),
+			})
+			return applyDocumentTitle(block, file.Name), nil
+		default:
+			if isTextLikeFileMediaType(mediaType) {
+				return anthropic.NewTextBlock(fileDataText(file, mediaType)), nil
+			}
+			return anthropic.ContentBlockParamUnion{}, fmt.Errorf("unsupported file media type %q", mediaType)
+		}
+	}
+	if fileURL := strings.TrimSpace(file.URL); fileURL != "" {
+		mediaType := fileURLMediaType(file)
+		if mediaType == "application/pdf" {
+			block := anthropic.NewDocumentBlock(anthropic.URLPDFSourceParam{
+				URL: fileURL,
+			})
+			return applyDocumentTitle(block, file.Name), nil
+		}
+		return anthropic.NewTextBlock(model.FileURLText(file)), nil
+	}
+	return anthropic.ContentBlockParamUnion{}, fmt.Errorf("file data is empty")
+}
+
+func isTextLikeFileMediaType(mediaType string) bool {
+	return mediaType != "" && strings.HasPrefix(mediaType, "text/")
+}
+
+func fileDataText(file *model.File, mediaType string) string {
+	data := string(file.Data)
+	name := strings.TrimSpace(file.Name)
+	if name != "" && mediaType != "" {
+		return fmt.Sprintf("File: %s (%s)\n\n%s", name, mediaType, data)
+	}
+	if name != "" {
+		return fmt.Sprintf("File: %s\n\n%s", name, data)
+	}
+	if mediaType != "" {
+		return fmt.Sprintf("File (%s)\n\n%s", mediaType, data)
+	}
+	return data
+}
+
+func applyDocumentTitle(block anthropic.ContentBlockParamUnion, name string) anthropic.ContentBlockParamUnion {
+	if block.OfDocument != nil && strings.TrimSpace(name) != "" {
+		block.OfDocument.Title = anthropic.String(name)
+	}
+	return block
+}
+
+func imageMediaType(format string, data []byte) (string, error) {
+	if mediaType, err := normalizeImageMediaType(format); err == nil {
+		return mediaType, nil
+	}
+	detected := ""
+	if len(data) > 0 {
+		detected = http.DetectContentType(data)
+	}
+	if mediaType, err := normalizeImageMediaType(detected); err == nil {
+		return mediaType, nil
+	}
+	return "", fmt.Errorf("unsupported image format %q", format)
+}
+
+func normalizeImageMediaType(value string) (string, error) {
+	switch normalizeMediaType(value) {
+	case "jpg", "jpeg", ".jpg", ".jpeg", "image/jpeg":
+		return "image/jpeg", nil
+	case "png", ".png", "image/png":
+		return "image/png", nil
+	case "gif", ".gif", "image/gif":
+		return "image/gif", nil
+	case "webp", ".webp", "image/webp":
+		return "image/webp", nil
+	default:
+		return "", fmt.Errorf("unsupported image media type %q", value)
+	}
+}
+
+func fileMediaType(file *model.File) string {
+	if mediaType := normalizeMediaType(file.MimeType); mediaType != "" {
+		return mediaType
+	}
+	if mediaType := mediaTypeFromName(file.Name); mediaType != "" {
+		return mediaType
+	}
+	if len(file.Data) > 0 {
+		return normalizeMediaType(http.DetectContentType(file.Data))
+	}
+	return ""
+}
+
+func fileURLMediaType(file *model.File) string {
+	if mediaType := normalizeMediaType(file.MimeType); mediaType != "" {
+		return mediaType
+	}
+	if mediaType := mediaTypeFromName(file.Name); mediaType != "" {
+		return mediaType
+	}
+	return mediaTypeFromURL(file.URL)
+}
+
+func mediaTypeFromURL(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	return mediaTypeFromName(u.Path)
+}
+
+func mediaTypeFromName(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".pdf":
+		return "application/pdf"
+	case ".txt":
+		return "text/plain"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	}
+	return normalizeMediaType(mime.TypeByExtension(filepath.Ext(name)))
+}
+
+func normalizeMediaType(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return ""
+	}
+	if mediaType, _, err := mime.ParseMediaType(value); err == nil {
+		return mediaType
+	}
+	mediaType, _, _ := strings.Cut(value, ";")
+	return strings.TrimSpace(mediaType)
 }
 
 // convertAssistantMessageContent converts an assistant message including tool calls into Anthropic format.
-func convertAssistantMessageContent(message model.Message) anthropic.MessageParam {
+func convertAssistantMessageContent(message model.Message) (anthropic.MessageParam, error) {
 	// Append text blocks.
 	blocks := make([]anthropic.ContentBlockParamUnion, 0, 1+len(message.ContentParts)+len(message.ToolCalls))
 	if message.Content != "" {
 		blocks = append(blocks, anthropic.NewTextBlock(message.Content))
 	}
-	for _, part := range message.ContentParts {
-		if part.Type == model.ContentTypeText && part.Text != nil {
+	for i, part := range message.ContentParts {
+		switch part.Type {
+		case model.ContentTypeText:
+			if part.Text == nil {
+				continue
+			}
 			blocks = append(blocks, anthropic.NewTextBlock(*part.Text))
+		default:
+			return anthropic.MessageParam{}, fmt.Errorf("anthropic: assistant content part %d: unsupported content type %q", i, part.Type)
 		}
 	}
 	// Append tool use blocks.
@@ -927,7 +1466,7 @@ func convertAssistantMessageContent(message model.Message) anthropic.MessagePara
 		)
 		blocks = append(blocks, toolUse)
 	}
-	return anthropic.NewAssistantMessage(blocks...)
+	return anthropic.NewAssistantMessage(blocks...), nil
 }
 
 // decodeToolArguments parses JSON bytes into any, returning an empty object on failure.
@@ -948,19 +1487,25 @@ func convertToolResult(message model.Message) anthropic.MessageParam {
 }
 
 // convertSystemMessageContent converts message content to system message content union.
-func convertSystemMessageContent(message model.Message) []anthropic.TextBlockParam {
+func convertSystemMessageContent(message model.Message) ([]anthropic.TextBlockParam, error) {
 	blocks := make([]anthropic.TextBlockParam, 0, 1+len(message.ContentParts))
 	if message.Content != "" {
 		blocks = append(blocks, anthropic.TextBlockParam{
 			Text: message.Content,
 		})
 	}
-	for _, part := range message.ContentParts {
-		if part.Type == model.ContentTypeText && part.Text != nil {
+	for i, part := range message.ContentParts {
+		switch part.Type {
+		case model.ContentTypeText:
+			if part.Text == nil {
+				continue
+			}
 			blocks = append(blocks, anthropic.TextBlockParam{
 				Text: *part.Text,
 			})
+		default:
+			return nil, fmt.Errorf("anthropic: system content part %d: unsupported content type %q", i, part.Type)
 		}
 	}
-	return blocks
+	return blocks, nil
 }

@@ -54,6 +54,14 @@ genConfig := model.GenerationConfig{
 }
 ```
 
+If you do not explicitly pass `llmagent.WithGenerationConfig(...)`,
+`LLMAgent` forwards the zero-value `model.GenerationConfig{}` by default,
+so the default behavior is non-streaming (`Stream=false`). If you need
+streaming output, set `Stream: true` explicitly, or override it per
+request with `agent.WithStream(true)`. Higher-level wrappers may choose
+their own explicit defaults. For example, OpenClaw enables streaming by
+default.
+
 ### Creating LLMAgent
 
 Use the model instance and configuration to create an LLMAgent, while setting the Agent's Description and Instruction.
@@ -88,19 +96,56 @@ llmAgent := llmagent.New(
 )
 ```
 
-### Placeholder Variables (Session State Injection)
+### Synthetic Error Content in Session History
 
-LLMAgent automatically injects session state into `Instruction` and the optional `SystemPrompt` via placeholder variables. Supported patterns:
+When an error event has no assistant content, Runner may add a generic message
+so the event remains displayable and can be persisted as a complete
+user/assistant turn. The ErrorMessage plugin can provide customized content
+for the same purpose. This content is presentation data synthesized by the
+framework, not model output.
+
+By default, LLMAgent leaves the emitted and persisted assistant content and
+structured error intact, but omits framework-synthesized error content when
+building later model requests. If omission leaves adjacent user messages, the
+request projection merges them locally to preserve a provider-valid sequence.
+Legacy sessions are handled with a best-effort signature: a structured error,
+Runner's exact generic fallback, its `"error"` finish reason, and no other
+message payload. Marker-free events have no definitive provenance, so a real
+response matching that complete legacy signature is indistinguishable; enable
+the compatibility option below if such responses must remain model-visible.
+
+Applications that intentionally relied on the previous context behavior can
+restore it explicitly:
+
+```go
+llmAgent := llmagent.New(
+    "demo-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithIncludeSyntheticErrorMessages(true),
+)
+```
+
+GraphAgent applies the same default while seeding graph message state from
+session history and exposes the matching
+`graphagent.WithIncludeSyntheticErrorMessages` compatibility option. See the
+[Graph guide](./graph.md#synthetic-error-content-in-session-history).
+
+### Placeholder Variables (State Injection)
+
+LLMAgent automatically injects state into `Instruction` and the optional `SystemPrompt` via placeholder variables. Supported patterns:
 
 - `{key}`: Replaced with the string value corresponding to the key `key` in the session state (write via `invocation.Session.SetState("key", ...)` or SessionService)
 - `{key?}`: Optional; if missing, replaced with an empty string
 - `{user:subkey}` / `{app:subkey}` / `{temp:subkey}`: Use user/app/temp scoped keys (session services merge app/user state into session with these prefixes)
 - `{invocation:subkey}`: Replaces with the value of fmt.Sprintf("%+v", `invocation.state["subkey"]`). (The state can be set via invocation.SetState(k, v))
+- `{runtime:subkey}`: Reads request-scoped data from `RunOptions.RuntimeState` (set via `agent.WithRuntimeState` or `agent.MergeRuntimeState`)
 
 Notes:
 
 - If a non-optional key is not found, the original `{key}` is preserved (helps the LLM notice missing context)
-- Values are read from session state (Runner + SessionService set/merge this automatically)
+- Add `?` before the closing brace to make any supported placeholder optional, for example `{runtime:document?}`
+- Bare and app/user/temp-prefixed keys read session state; `invocation:` and `runtime:` read only their respective state stores and do not fall back to session state
+- Runtime strings are injected as plain text; primitive values use their JSON text representation, and objects and arrays are injected as JSON
 
 Example:
 
@@ -110,12 +155,17 @@ llm := llmagent.New(
   llmagent.WithModel(modelInstance),
   llmagent.WithInstruction(
     "You are a research assistant. Focus: {research_topics}. " +
-    "User interests: {user:topics?}. App banner: {app:banner?}.",
+    "User interests: {user:topics?}. App banner: {app:banner?}. " +
+    "Draft: {runtime:document?}.",
   ),
 )
 
-inv := agent.NewInvoction()
+inv := agent.NewInvocation()
 inv.SetState("case", "case-1")
+
+runOptions := []agent.RunOption{
+  agent.WithRuntimeState(map[string]any{"document": "Current draft"}),
+}
 
 // Initialize session state (Runner + SessionService)
 _ = sessionService.UpdateUserState(ctx, session.UserKey{AppName: app, UserID: user}, session.StateMap{
@@ -133,7 +183,7 @@ _, _ = sessionService.CreateSession(ctx, session.Key{AppName: app, UserID: user,
 See also:
 
 - Examples: `examples/placeholder`, `examples/outputkey`
-- Session API: `docs/mkdocs/en/session.md`
+- Session API: `docs/mkdocs/en/session/index.md`
 
 ### Using Runner to Execute Agent
 
@@ -280,16 +330,23 @@ if err != nil {
 ```
 
 Advanced Usage Examples:
-You can independently control the visibility of historical messages and messages generated by other Agents for the current agent using WithMessageTimelineFilterModeand WithMessageBranchFilterMode.
-When the current agent interacts with the model, only messages satisfying both conditions are input to the model. (invocation.Messageis always visible in any scenario.)
+You can independently control the visibility of historical messages and messages
+generated by other Agents for the current agent using
+`WithMessageTimelineFilterMode` and `WithMessageBranchFilterMode`.
+When the current agent interacts with the model, only messages satisfying both
+conditions are input to the model (`invocation.Message` is always visible).
 - `WithMessageTimelineFilterMode`: Controls visibility from a temporal dimension
   - `TimelineFilterAll`: Includes historical messages and messages generated in the current request.
-  - `TimelineFilterCurrentRequest`: Only includes messages generated in the current request (one runner.Runcounts as one request).
+  - `TimelineFilterCurrentRequest`: Only includes messages generated in the current request (one runner.Run counts as one request).
   - `TimelineFilterCurrentInvocation`: Only includes messages generated in the current invocation context.
-- `WithMessageBranchFilterMode`: Controls visibility from a branch dimension (used to manage visibility of messages generated by other agents).
-  - `BranchFilterModePrefix`: Uses prefix matching between Event.FilterKeyand Invocation.eventFilterKey.
-  - `BranchFilterModeAll`: Includes messages from all agents.
-  - `BranchFilterModeExact`: Only includes messages generated by the current agent.
+- `WithMessageBranchFilterMode`: Controls visibility by FilterKey hierarchy.
+  - `BranchFilterModePrefix` (default): Hierarchical match between `Event.FilterKey`
+    and `Invocation.eventFilterKey` (ancestors/self/descendants all count).
+  - `BranchFilterModeSubtree`: Only include `Invocation.eventFilterKey` and its
+    descendants (no ancestors).
+  - `BranchFilterModeExact`: Only include events where
+    `Event.FilterKey == Invocation.eventFilterKey`.
+  - `BranchFilterModeAll`: Include all events regardless of FilterKey.
 
 ```go
 llmAgent := llmagent.New(
@@ -311,9 +368,13 @@ llmAgent := llmagent.New(
     // Default: llmagent.BranchFilterModePrefix
     // Options:
     //  - llmagent.BranchFilterModeAll: Includes messages from all agents. Use this when the current agent needs to sync valid content messages generated by all agents to the model during interaction.
-    //  - llmagent.BranchFilterModePrefix: Filters messages by prefix matching Event.FilterKey with Invocation.eventFilterKey. Use this when you want to pass messages generated by the current agent and related upstream/downstream agents to the model.
-    //  - llmagent.BranchFilterModeExact: Filters messages where Event.FilterKey exactly matches Invocation.eventFilterKey. Use this when the current agent only needs to use messages generated by itself during model interaction.
-    llmagent.WithMessageBranchFilterMode(llmagent.BranchFilterModeAll),
+    //  - llmagent.BranchFilterModePrefix: Hierarchical match between Event.FilterKey
+    //    and Invocation.eventFilterKey (ancestors/self/descendants all count).
+    //  - llmagent.BranchFilterModeSubtree: Only include Invocation.eventFilterKey
+    //    and its descendants (no ancestors).
+    //  - llmagent.BranchFilterModeExact: Only include events where
+    //    Event.FilterKey == Invocation.eventFilterKey.
+    llmagent.WithMessageBranchFilterMode(llmagent.BranchFilterModePrefix),
 )
 ```
 
@@ -352,6 +413,63 @@ agent := llmagent.New(
 
 **Note:** This option only affects how historical messages are processed before sending to the model. The current response's `reasoning_content` is always captured and stored in session events.
 
+### Tool Transcript History Mode
+
+By default, LLMAgent sends historical tool calls and their matching tool
+results back to the model on later requests. This is the most conservative
+behavior and preserves full compatibility, but long sessions with many completed
+tool rounds can spend unnecessary context on tool transcripts that the model no
+longer needs.
+
+LLMAgent provides `WithToolTranscriptMode` to control how completed historical
+tool-call/tool-result pairs are projected into model requests:
+
+| Mode | Constant | Description |
+|------|----------|-------------|
+| Keep All | `ToolTranscriptModeKeepAll` | Keep all historical tool-call/tool-result transcripts in model requests. **(Default)** |
+| Omit Previous Completed | `ToolTranscriptModeOmitPreviousCompleted` | Omit completed tool-call/tool-result pairs from previous requests while preserving active or incomplete tool rounds. |
+
+**Usage Example:**
+
+```go
+agent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithInstruction("You are a helpful assistant."),
+    // Reduce prompt size by omitting completed tool transcripts from previous requests.
+    llmagent.WithToolTranscriptMode(llmagent.ToolTranscriptModeOmitPreviousCompleted),
+)
+```
+
+**How It Works:**
+
+- **`keep_all`**: All historical tool calls and tool results are preserved in
+  model requests.
+- **`omit_previous_completed`**: When building the message list for a new
+  request, completed tool-call/tool-result pairs from previous requests are
+  omitted from the projected history.
+
+The omit mode is intentionally conservative:
+
+- Current-request tool loops are preserved, so the model can still see the tool
+  calls it is actively resolving.
+- Incomplete historical tool calls are preserved because dropping them could
+  produce an invalid tool-call transcript.
+- Assistant text attached to an omitted tool-call event is retained; only the
+  tool calls and matching tool results are removed.
+- Session events are not deleted. The mode only changes what is sent to the
+  model request.
+
+Use `ToolTranscriptModeOmitPreviousCompleted` when completed historical tool
+transcripts are no longer needed by the model and prompt size matters. Keep the
+default `ToolTranscriptModeKeepAll` if later answers must inspect previous raw
+tool calls or tool results exactly.
+
+This option is different from context compaction: tool transcript mode can omit
+whole completed historical tool-call/tool-result pairs from request projection,
+while context compaction keeps the tool result message shape and only shrinks
+large tool-result content.
+
 ### Delegation Visibility Options
 
 When building multi‑Agent systems (task delegation between Agents), LLMAgent provides a unified fallback option for delegation events. Transfer events always include announcement text and are tagged `transfer` so UIs (User Interfaces) can filter them if desired.
@@ -377,6 +495,119 @@ Notes:
 
 - These options do not change the actual handoff logic; they only affect user‑visible texts or whether a fallback `message` is injected.
 - Transfer announcements are emitted as Events with `Response.Object == "agent.transfer"`. If your UI should not display system‑level notices, filter this object type at the renderer/service layer.
+
+### Post-tool Prompt Injection
+
+When the model calls tools, the tool outputs are added to the conversation as
+`role=tool` messages. Some models may respond with meta commentary like “based
+on the tool result…”, or reveal internal process details.
+
+To make the assistant respond more naturally after tool calls, LLMAgent
+injects a short “post-tool” guidance block into the system message when the
+feature is enabled. The guidance is present from the first model request so
+later tool-call turns keep the same prompt prefix and can reuse provider-side
+prompt caches more effectively.
+
+- Default: enabled, using the built-in prompt.
+- Customize the injected text: `llmagent.WithPostToolPrompt("...")`.
+- Disable injection entirely: `llmagent.WithEnablePostToolPrompt(false)`.
+
+Example:
+
+```go
+agent := llmagent.New(
+  "assistant",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithTools([]tool.Tool{myTool}),
+  // Disable the framework's default post-tool prompt injection.
+  llmagent.WithEnablePostToolPrompt(false),
+)
+```
+
+### Call Count Limits (Safety Mechanism)
+
+To prevent Agents from entering infinite loops or consuming excessive resources, LLMAgent provides two optional call count limit configurations:
+
+**Available Configurations:**
+
+| Configuration | Description |
+|---------------|-------------|
+| `llmagent.WithMaxLLMCalls(n)` | Limits the maximum number of LLM calls per invocation. Takes effect when `n > 0`; no limit when `n <= 0` (default). |
+| `llmagent.WithMaxToolIterations(n)` | Limits the maximum number of tool-call iterations per invocation. Takes effect when `n > 0`; no limit when `n <= 0` (default). |
+| `llmagent.WithLLMCallLimitFinalization(instruction)` | Uses the last call allowed by `WithMaxLLMCalls` for a tool-free final response. |
+| `llmagent.WithToolIterationLimitFinalization(instruction)` | Requests a tool-free final response after the last fully framework-executed iteration allowed by `WithMaxToolIterations`, if the current invocation and LLM-call budget permit another call. |
+
+**Usage Example:**
+
+```go
+agent := llmagent.New(
+  "safe-agent",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithTools([]tool.Tool{myTool}),
+  // Limit to at most 10 LLM calls.
+  llmagent.WithMaxLLMCalls(10),
+  // Limit to at most 5 tool-call iterations.
+  llmagent.WithMaxToolIterations(5),
+  // Opt in to graceful, tool-free final responses at both limits.
+  // An empty string selects the framework's default instruction.
+  llmagent.WithLLMCallLimitFinalization(""),
+  llmagent.WithToolIterationLimitFinalization(""),
+)
+```
+
+**Behavior:**
+
+- Without a finalization option, the existing behavior is unchanged:
+  - **`WithMaxLLMCalls`** returns a `StopError` when the count exceeds the limit.
+  - **`WithMaxToolIterations`** emits a `flow_error` response event when the count exceeds the limit.
+- Each finalization option is independent and opt-in. Pass `""` to use the framework's default finalization instruction, or pass a non-empty string to provide a custom instruction.
+- LLM-limit finalization uses the final call inside `MaxLLMCalls`. Tool-limit finalization uses the next LLM call after the final allowed tool iteration.
+- Tool-limit finalization requires every tool call in the limit-reaching iteration to be framework-executed. If any call is external or deferred by `WithToolExecutionFilter`, the response still counts toward `MaxToolIterations`, but the current run follows the existing caller-executed lifecycle and ends without a finalization call. A later caller continuation is a new invocation with independent limits.
+- `MaxLLMCalls` remains a strict outer budget. Finalization calls count toward it, so reserve an LLM call when combining tool-limit finalization with `WithMaxLLMCalls`.
+- For the final model request, the instruction is appended as a transient tail user message without changing the existing system prompt. It is visible to before-model callbacks but is not emitted or persisted as a user event.
+- During finalization, tools and forced tool-choice fields are removed before before-model callbacks and scrubbed again after callbacks. If a tool call is still produced, the framework rejects it without executing the tool.
+- If both finalization policies become eligible on the same LLM call, the LLM-limit instruction takes precedence.
+- Both limits are independent and can be used separately or together.
+- These limits are per-invocation; different `runner.Run()` calls maintain independent counts.
+- `(*agent.Invocation).ToolIterationCount()` provides read-only access to the tool-iteration limit enforcement counter. It remains zero when `MaxToolIterations` is not positive, includes the over-limit tool-call response that is rejected without execution, starts from zero in `Clone()`, and is preserved by `View()`. It is not a general tool-usage metric.
+
+**Recommended Usage:**
+
+- In production environments, setting reasonable limits is recommended to prevent unexpected scenarios.
+- Set limit values based on task complexity and expected behavior.
+- See [examples/max_limits](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/max_limits) for a complete example.
+
+### Tool Call Retry
+
+If you want LLMAgent to retry a tool call automatically after a failure, configure `llmagent.WithToolCallRetryPolicy(...)`.
+
+```go
+policy := &tool.RetryPolicy{
+    MaxAttempts:     2,
+    InitialInterval: 200 * time.Millisecond,
+    BackoffFactor:   2.0,
+    MaxInterval:     time.Second,
+}
+
+agent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithTools([]tool.Tool{myTool}),
+    llmagent.WithToolCallRetryPolicy(policy),
+)
+```
+
+Notes:
+
+- The retry applies only to the current tool call. It does not rerun the whole Agent.
+- It is disabled by default, so existing behavior stays unchanged unless you opt in.
+- It currently applies only to `CallableTool`; `StreamableTool` is not retried yet.
+- The default retry rule covers common transient raw errors such as `io.EOF`, `io.ErrUnexpectedEOF`, and network timeouts.
+- If you also want to retry result-level failures, customize `tool.RetryPolicy.RetryOn`.
+
+Runnable example:
+
+- [examples/llmagent_tool_call_retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/llmagent_tool_call_retry)
 
 ### Handling Event Stream
 
@@ -416,13 +647,19 @@ for event := range eventChan {
         }
     }
 
-    // Check if completed (note: should not break on tool call completion)
+    // Check whether the current response is complete.
     if event.IsFinalResponse() {
         fmt.Println()
         break
     }
 }
 ```
+
+This example uses `event.IsFinalResponse()` because it only cares about when
+the current reply has been fully printed. If you need to wait until the whole
+`Runner.Run` is truly over, such as when `tool.response` may be followed by
+extra processing or when using GraphAgent, use
+`event.IsRunnerCompletion()` as the loop exit condition instead.
 
 The complete code for this example can be found at [examples/runner](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/runner)
 
@@ -717,13 +954,38 @@ Structured output ensures that agent responses conform to a predefined format, m
 | **Data Location** | Event.StructuredOutput | Event.StructuredOutput | Model response content | Session State |
 | **Primary Use Case** | Flexible schema with tools | Type-safe structured output | Simple structured responses | State storage & flow control |
 
+### Provider Compatibility
+
+The framework allows tools to be configured with
+`WithStructuredOutputJSONSchema` or `WithStructuredOutputJSON`, but the model
+service must also support combining tool calling with native structured output.
+Some OpenAI-compatible endpoints accept both `tools` and
+`response_format: json_schema` while applying the JSON constraint to the entire
+generation. In that case, constrained decoding can suppress the model-specific
+tool-call syntax and return schema-valid JSON without any tool call.
+
+An HTTP success response and valid JSON therefore do not prove that a required
+tool ran. When correctness depends on tool execution, verify the tool-call and
+tool-result events. If an endpoint does not reliably support the combination,
+split the operation into a tool-enabled call without native structured output,
+followed by a tool-disabled call that produces the structured final response.
+The second call must receive the first call's evidence by continuing the same
+session or message history, or by explicitly including its tool-call and
+tool-result messages.
+
+Related backend discussions include
+[vLLM #39929](https://github.com/vllm-project/vllm/issues/39929), which tracks
+`response_format` suppressing automatic tool calls, and
+[SGLang #21593](https://github.com/sgl-project/sglang/pull/21593), which fixes
+conflicts between constrained decoding and model-specific tool-call formats.
+
 ### WithStructuredOutputJSONSchema
 
 Provides a user-defined JSON schema for structured output while **allowing tool usage**. This is the most flexible option for agents that need both structured output and tool capabilities.
 
 **Notes:**
 - “Tools are allowed” means the agent can still make tool calls (including
-  Skills tools like `skill_load` / `skill_run`).
+  Skills tools like `skill_load` and `workspace_exec`).
 - When the model needs tools, it may emit tool call events first and only
   produce the final JSON later. Only the final answer must conform to the
   schema and must be a single JSON object.
@@ -923,8 +1185,47 @@ Memory Service is used to record user preference information, supporting persona
 **Recommended Reading Order:**
 
 1. [Runner](runner.md) - Learn the recommended usage
-2. [Session](session.md) - Understand session management
+2. [Session](session/index.md) - Understand session management
 3. [Multi-Agent](multiagent.md) - Learn multi-Agent systems
+
+## Prompt Scaffolding (“Rules” / Context Injection)
+
+Many agent products expose a “rules” feature (project memory, per‑turn constraints, etc.). In practice, “rules” is not a single stable framework‑level concept: different products choose different semantics (system vs user role, placement relative to history, persistence, file‑scoped selection, cache behavior).
+
+tRPC‑Agent‑Go intentionally keeps this generic and provides **prompt / context injection primitives** that you can combine to implement your product’s “rules” semantics.
+
+### Choose the right primitive
+
+- Always‑on stable guidance (recommended for “global rules”):
+  - Agent‑level: `llmagent.WithGlobalInstruction(...)` / `llmagent.WithInstruction(...)`
+  - Per‑run override (does not mutate the agent): `agent.WithGlobalInstruction(...)` / `agent.WithInstruction(...)`
+- Per‑run, non‑persistent context injected **before session history** (good for background seed context):
+  - `agent.WithInjectedContextMessages([]model.Message{...})`
+- Per‑run, non‑persistent context injected **near the latest user turn** (useful for per‑turn “rules” / dynamic constraints):
+  - `agent.WithLateContextMessages([]model.Message{...})`
+- Full control over the final request messages:
+  - Use a structured `BeforeModel` callback to rewrite `request.Messages` (see `docs/mkdocs/en/callbacks.md`).
+
+### Message placement (high level)
+
+The content request processor assembles the final model request roughly like this:
+
+1. System prompt / instructions (stable prefix)
+2. Few-shot examples (if configured, inserted after the leading system block)
+3. Injected context messages (`WithInjectedContextMessages`) — **before history**
+4. Session history (canonical transcript)
+5. Late context messages (`WithLateContextMessages`) — **inserted before the latest user message** (if there is no user message, they are inserted immediately after the leading system block)
+6. (If already present) tool / assistant tail belonging to the current turn
+
+This “late” placement is useful when your injected content is dynamic and you want it close to the current user request, while keeping the prefix stable for prompt caching.
+
+### Notes and best practices
+
+- Prefer `role=user` for late context messages. Injecting `role=system` in the middle of the message list is not universally supported across providers and may interact poorly with validators.
+- `WithInjectedContextMessages` and `WithLateContextMessages` are **not persisted** into the session transcript (they affect only the current model request).
+- In multi‑agent runs, these options live on `RunOptions` and are propagated via invocation cloning. If you need per‑agent scoping, use callbacks and filter by `invocation.AgentName`.
+
+Runnable example: `examples/prompt/late_context_messages`.
 
 ## Runtime Instruction Updates
 
@@ -1091,3 +1392,235 @@ Caveats
   write `temp:*` via `invocation.Session.SetState` (e.g., via a callback)
   when you need session-scoped temporary values.
 - Placeholders are resolved at request time; changing the stored value updates behavior on the next model request without recreating the agent.
+
+## Static Structure Export
+
+The framework provides static structure export for agents. This is useful for structure inspection, visualization, configuration tools, and diagnostics that need a stable snapshot of nodes, edges, and editable surfaces.
+
+Use `agent/structure` to export a normalized snapshot:
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/agent/structure"
+
+snapshot, err := structure.Export(ctx, llmAgent)
+if err != nil {
+    log.Fatalf("Failed to export structure: %v", err)
+}
+
+fmt.Println(snapshot.StructureID)
+fmt.Println(snapshot.EntryNodeID)
+fmt.Println(len(snapshot.Nodes), len(snapshot.Edges), len(snapshot.Surfaces))
+```
+
+The exported snapshot contains:
+
+- `Nodes`: stable static nodes in the current agent structure
+- `Edges`: static possible connections between nodes
+- `Surfaces`: stable editable baselines such as `instruction`, `model`, `tool`, and `skill`
+
+For a complete example, see [examples/graph/structure_export](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/structure_export).
+
+## Override Runtime Surfaces by `nodeID`
+
+In addition to run-scoped overrides such as `agent.WithInstruction(...)` and
+`agent.WithGlobalInstruction(...)`, the framework also supports overriding
+runtime surfaces for a specific node by stable `nodeID` within a single
+`runner.Run(...)` call.
+
+This is useful when you want to:
+
+- Temporarily change the instruction of one graph node without affecting the entire agent.
+- Apply different instructions, few-shot examples, or tools to multiple nodes in the same `runner.Run(...)`.
+- Precisely target nested nodes inside `chain`, `parallel`, `cycle`, `graph`, `team`, and `swarm` structures.
+
+Entry API:
+
+```go
+var patch agent.SurfacePatch
+patch.SetInstruction("Answer in one short paragraph.")
+patch.SetFewShot([][]model.Message{
+    {
+        model.NewUserMessage("Summarize this report."),
+        model.NewAssistantMessage("Provide a short executive summary first."),
+    },
+})
+
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Please analyze the latest findings."),
+    agent.WithSurfacePatchForNode(nodeID, patch),
+)
+```
+
+### Recommended Workflow
+
+Use the feature in this order:
+
+1. Export a static structure snapshot with `structure.Export(...)`.
+2. Find the stable target `nodeID` from `snapshot.EntryNodeID` or `snapshot.Nodes`.
+3. Build an `agent.SurfacePatch` and set only the surfaces you want to override for this run.
+4. Pass one or more `agent.WithSurfacePatchForNode(...)` options to `runner.Run(...)`.
+
+Example:
+
+```go
+snapshot, err := structure.Export(ctx, workflowAgent)
+if err != nil {
+    return err
+}
+
+var plannerNodeID string
+for _, node := range snapshot.Nodes {
+    if node.Name == "planner" {
+        plannerNodeID = node.NodeID
+        break
+    }
+}
+if plannerNodeID == "" {
+    return errors.New("planner node not found")
+}
+
+var patch agent.SurfacePatch
+patch.SetInstruction("Plan in at most three steps.")
+
+_, err = r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Arrange a trip to Hangzhou next Friday."),
+    agent.WithSurfacePatchForNode(plannerNodeID, patch),
+)
+```
+
+Notes:
+
+- Prefer `nodeID` values exported by `structure.Export(...)` instead of handwritten paths.
+- The override only applies to the current `runner.Run(...)` call and does not mutate the static agent definition.
+- `agent.WithInstruction(...)` and `agent.WithGlobalInstruction(...)` still work and are appropriate when you want one run-scoped override for the root agent. Use `WithSurfacePatchForNode(...)` when you need per-node control.
+
+### Patchable Surfaces
+
+`SurfacePatch` currently provides these setters:
+
+- `SetInstruction(string)`: overrides the node instruction for this run.
+- `SetGlobalInstruction(string)`: overrides the node global instruction for this run.
+- `SetFewShot([][]model.Message)`: overrides the node few-shot examples for this run.
+- `SetModel(model.Model)`: overrides the model instance used by the node for this run.
+- `SetTools([]tool.Tool)`: overrides the node tool surface for this run. This means replacing the tool set visible at runtime, not merely changing tool descriptions.
+- `AppendTools([]tool.Tool)`: appends tools to the node tool surface for this run. This keeps the node's existing tools and adds the supplied tools after them.
+- `SetSkillRepository(skill.Repository)`: overrides the node skill repository for this run. Passing `nil` explicitly disables the node skill surface.
+
+Not every node supports every surface. Common cases are:
+
+- Root `LLMAgent`: supports `instruction`, `global_instruction`, `few_shot`, `model`, `tool`, and `skill`.
+- Graph LLM node: supports `instruction`, `few_shot`, `model`, and `tool`.
+- Graph Tools node: supports `tool`.
+- Child nodes inside graph sub-agents, `chain`, `parallel`, `cycle`, `team`, and `swarm`: support depends on the actual target node you patch.
+
+### Override Multiple Nodes in One Run
+
+To patch multiple nodes in the same `runner.Run(...)`, pass multiple
+`agent.WithSurfacePatchForNode(...)` options. There is no separate batch API.
+
+```go
+snapshot, err := structure.Export(ctx, workflowAgent)
+if err != nil {
+    return err
+}
+
+nodeIDs := make(map[string]string)
+for _, node := range snapshot.Nodes {
+    nodeIDs[node.Name] = node.NodeID
+}
+
+var plannerPatch agent.SurfacePatch
+plannerPatch.SetInstruction("Produce no more than three candidate plans.")
+
+var reviewerPatch agent.SurfacePatch
+reviewerPatch.SetInstruction("Reject any plan that lacks cost analysis.")
+
+var toolsPatch agent.SurfacePatch
+toolsPatch.AppendTools([]tool.Tool{priceTool})
+
+_, err = r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Plan a team offsite in Suzhou next month."),
+    agent.WithSurfacePatchForNode(nodeIDs["planner"], plannerPatch),
+    agent.WithSurfacePatchForNode(nodeIDs["reviewer"], reviewerPatch),
+    agent.WithSurfacePatchForNode(nodeIDs["search_tools"], toolsPatch),
+)
+```
+
+When `WithSurfacePatchForNode(...)` is passed multiple times for the same
+`nodeID`, the framework merges by surface type:
+
+- Different surface types are combined.
+- For the same surface type, the later option overrides the earlier one.
+- Tool append patches are incremental. Repeated `AppendTools(...)` calls add to
+  the effective tool set. A later `SetTools(...)` call replaces earlier tool
+  appends for that node.
+
+### Composite and Nested Structures
+
+The same pattern applies beyond a single `LLMAgent`:
+
+- `graph`: patch graph LLM nodes, Tools nodes, and the root nodes of child agents mounted inside the graph.
+- `chain`, `parallel`, `cycle`: patch any exported child node.
+- `team` and `swarm`: patch the `coordinator`, member nodes, and members reached after transfer.
+
+The most robust workflow is still:
+
+- export with `structure.Export(...)`
+- select the exported `nodeID`
+- pass the patch through `WithSurfacePatchForNode(...)`
+
+This keeps one rule easy to remember: `nodeID` comes from structure export, and the runtime patch is supplied through `WithSurfacePatchForNode(...)`.
+
+## Execution Trace
+
+The framework can export an execution trace for a single `runner.Run` call. This is useful for understanding which nodes actually ran, how steps depend on each other, and what each step saw as input and output.
+
+Enable it explicitly when you start a run:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+r := runner.NewRunner("demo-app", ag)
+events, err := r.Run(
+    ctx,
+    "user-1",
+    "session-1",
+    model.NewUserMessage("hello"),
+    agent.WithExecutionTraceEnabled(true),
+)
+if err != nil {
+    log.Fatalf("Run failed: %v", err)
+}
+for evt := range events {
+    if evt != nil && evt.IsRunnerCompletion() && evt.ExecutionTrace != nil {
+        fmt.Println(evt.ExecutionTrace.RootAgentName)
+        fmt.Println(evt.ExecutionTrace.Status)
+        fmt.Println(len(evt.ExecutionTrace.Steps))
+    }
+}
+```
+
+Execution traces are attached to the runner completion event as an in-memory artifact. They are not serialized by default.
+
+Each recorded step carries stable fields such as:
+
+- `NodeID`: the static node path for the executed node
+- `NodeType`: the node's semantic type (`function`, `llm`, `tool`, or `agent`), matching the node kind in the static structure; `agent` represents an agent execution unit, including `LLMAgent`, and `llm` represents an explicit LLM operation node
+- `PredecessorStepIDs`: the direct step dependencies in this run
+- `Input` and `Output`: stable text snapshots captured for the step
+- `Error`: the terminal step error, when the step fails
+
+For a complete example, see [examples/graph/execution_trace](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/execution_trace).

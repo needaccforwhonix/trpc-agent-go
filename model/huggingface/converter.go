@@ -14,6 +14,7 @@ import (
 	"fmt"
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -22,7 +23,7 @@ func (m *Model) convertRequest(req *model.Request) (*ChatCompletionRequest, erro
 	hfReq := &ChatCompletionRequest{
 		Model:            m.name,
 		Messages:         make([]ChatMessage, 0, len(req.Messages)),
-		MaxTokens:        req.MaxTokens,
+		MaxTokens:        imodel.ClampMaxTokensForModel(m.name, req.MaxTokens),
 		Temperature:      req.Temperature,
 		TopP:             req.TopP,
 		Stream:           req.Stream,
@@ -30,6 +31,10 @@ func (m *Model) convertRequest(req *model.Request) (*ChatCompletionRequest, erro
 		PresencePenalty:  req.PresencePenalty,
 		FrequencyPenalty: req.FrequencyPenalty,
 		ExtraFields:      make(map[string]any),
+	}
+
+	for key, value := range req.ExtraFields {
+		hfReq.ExtraFields[key] = value
 	}
 
 	// Convert messages.

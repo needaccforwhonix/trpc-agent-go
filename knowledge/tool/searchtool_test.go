@@ -13,13 +13,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	internaltool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	ctool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -27,11 +33,15 @@ import (
 // It can be configured to return a predetermined result or error.
 
 type stubKnowledge struct {
-	result *knowledge.SearchResult
-	err    error
+	result  *knowledge.SearchResult
+	err     error
+	capture func(*knowledge.SearchRequest)
 }
 
 func (s stubKnowledge) Search(ctx context.Context, req *knowledge.SearchRequest) (*knowledge.SearchResult, error) {
+	if s.capture != nil {
+		s.capture(req)
+	}
 	return s.result, s.err
 }
 
@@ -47,6 +57,167 @@ func marshalArgsWithFilter(t *testing.T, query string, filter *searchfilter.Univ
 	bts, err := json.Marshal(&KnowledgeSearchRequestWithFilter{Query: query, Filter: filter})
 	require.NoError(t, err)
 	return bts
+}
+
+func historyEvent(message model.Message, partial bool) event.Event {
+	evt := event.NewResponseEvent(
+		"inv",
+		string(message.Role),
+		&model.Response{
+			IsPartial: partial,
+			Choices:   []model.Choice{{Message: message}},
+		},
+	)
+	return *evt
+}
+
+func TestSearchContextFromInvocationEmpty(t *testing.T) {
+	history, userID, sessionID := searchContextFromInvocation(nil)
+	require.Nil(t, history)
+	require.Empty(t, userID)
+	require.Empty(t, sessionID)
+
+	invocation := agent.NewInvocation()
+	history, userID, sessionID = searchContextFromInvocation(invocation)
+	require.Nil(t, history)
+	require.Empty(t, userID)
+	require.Empty(t, sessionID)
+}
+
+func TestConversationMessageFromEvent(t *testing.T) {
+	toolCallEvent := event.NewResponseEvent(
+		"inv",
+		"assistant",
+		&model.Response{
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:      model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{ID: "call-1"}},
+				},
+			}},
+		},
+	)
+	multiChoiceEvent := event.NewResponseEvent(
+		"inv",
+		"assistant",
+		&model.Response{
+			Choices: []model.Choice{
+				{Message: model.Message{Role: model.RoleSystem, Content: "system"}},
+				{Message: model.NewAssistantMessage(" answer ")},
+			},
+		},
+	)
+	contentPartsText := "from content parts"
+	contentPartsEvent := historyEvent(model.Message{
+		Role:         model.RoleUser,
+		ContentParts: []model.ContentPart{{Type: model.ContentTypeText, Text: &contentPartsText}},
+	}, false)
+	multiPartA := "first part"
+	multiPartB := "second part"
+	multiTextPartsEvent := historyEvent(model.Message{
+		Role: model.RoleUser,
+		ContentParts: []model.ContentPart{
+			{Type: model.ContentTypeText, Text: &multiPartA},
+			{Type: model.ContentTypeImage, Image: &model.Image{URL: "http://img"}},
+			{Type: model.ContentTypeText, Text: &multiPartB},
+		},
+	}, false)
+	validEvent := historyEvent(model.NewUserMessage(" question "), false)
+	tests := []struct {
+		name   string
+		evt    *event.Event
+		want   knowledge.ConversationMessage
+		wantOK bool
+	}{
+		{
+			name:   "nil event",
+			evt:    nil,
+			wantOK: false,
+		},
+		{
+			name:   "nil response",
+			evt:    &event.Event{},
+			wantOK: false,
+		},
+		{
+			name:   "partial response",
+			evt:    ptrEvent(historyEvent(model.NewUserMessage("partial"), true)),
+			wantOK: false,
+		},
+		{
+			name:   "tool call response",
+			evt:    toolCallEvent,
+			wantOK: false,
+		},
+		{
+			name:   "tool result response",
+			evt:    ptrEvent(historyEvent(model.NewToolMessage("tool-1", "knowledge_search", "result"), false)),
+			wantOK: false,
+		},
+		{
+			name:   "unsupported role",
+			evt:    ptrEvent(historyEvent(model.Message{Role: model.RoleSystem, Content: "system"}, false)),
+			wantOK: false,
+		},
+		{
+			name:   "empty content",
+			evt:    ptrEvent(historyEvent(model.NewAssistantMessage(" "), false)),
+			wantOK: false,
+		},
+		{
+			name: "empty content with text content parts",
+			evt:  &contentPartsEvent,
+			want: knowledge.ConversationMessage{
+				Role:      "user",
+				Content:   "from content parts",
+				Timestamp: contentPartsEvent.Timestamp.Unix(),
+			},
+			wantOK: true,
+		},
+		{
+			name: "empty content with multiple text content parts",
+			evt:  &multiTextPartsEvent,
+			want: knowledge.ConversationMessage{
+				Role:      "user",
+				Content:   "first part\nsecond part",
+				Timestamp: multiTextPartsEvent.Timestamp.Unix(),
+			},
+			wantOK: true,
+		},
+		{
+			name: "multi choice uses first valid message",
+			evt:  multiChoiceEvent,
+			want: knowledge.ConversationMessage{
+				Role:      "assistant",
+				Content:   "answer",
+				Timestamp: multiChoiceEvent.Timestamp.Unix(),
+			},
+			wantOK: true,
+		},
+		{
+			name: "valid user message",
+			evt:  &validEvent,
+			want: knowledge.ConversationMessage{
+				Role:      "user",
+				Content:   "question",
+				Timestamp: validEvent.Timestamp.Unix(),
+			},
+			wantOK: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := conversationMessageFromEvent(tt.evt)
+			require.Equal(t, tt.wantOK, ok)
+			if tt.wantOK {
+				require.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func ptrEvent(evt event.Event) *event.Event {
+	return &evt
 }
 
 func TestKnowledgeSearchTool(t *testing.T) {
@@ -78,7 +249,7 @@ func TestKnowledgeSearchTool(t *testing.T) {
 		kb := stubKnowledge{result: &knowledge.SearchResult{
 			Documents: []*knowledge.Result{
 				{
-					Document: &document.Document{Content: "foo", Metadata: map[string]any{"source": "test"}},
+					Document: &document.Document{ID: "doc-1", Content: "foo", Metadata: map[string]any{"source": "test"}},
 					Score:    0.9,
 				},
 			},
@@ -88,10 +259,53 @@ func TestKnowledgeSearchTool(t *testing.T) {
 		require.NoError(t, err)
 		rsp := res.(*KnowledgeSearchResponse)
 		require.Len(t, rsp.Documents, 1)
+		require.Equal(t, "doc-1", rsp.Documents[0].ID)
 		require.Equal(t, "foo", rsp.Documents[0].Text)
 		require.Equal(t, 0.9, rsp.Documents[0].Score)
 		require.Equal(t, "test", rsp.Documents[0].Metadata["source"])
 		require.Contains(t, rsp.Message, "Found 1 relevant document")
+	})
+
+	t.Run("passes invocation session context", func(t *testing.T) {
+		var captured *knowledge.SearchRequest
+		kb := stubKnowledge{
+			result: &knowledge.SearchResult{
+				Documents: []*knowledge.Result{
+					{Document: &document.Document{Content: "foo"}, Score: 0.9},
+				},
+			},
+			capture: func(req *knowledge.SearchRequest) {
+				captured = req
+			},
+		}
+		searchTool := NewKnowledgeSearchTool(kb)
+		sess := &session.Session{
+			ID:     "session-1",
+			UserID: "user-1",
+			Events: []event.Event{
+				historyEvent(model.NewUserMessage("oldest dropped"), false),
+				historyEvent(model.NewToolMessage("tool-1", "knowledge_search", "tool result"), false),
+				historyEvent(model.NewAssistantMessage(""), false),
+				historyEvent(model.NewUserMessage("partial skipped"), true),
+			},
+		}
+		for i := 0; i < defaultSearchHistorySize; i++ {
+			sess.Events = append(sess.Events, historyEvent(model.NewUserMessage("valid user"), false))
+		}
+		invocation := agent.NewInvocation(agent.WithInvocationSession(sess))
+		ctx := agent.NewInvocationContext(context.Background(), invocation)
+
+		_, err := searchTool.(ctool.CallableTool).Call(ctx, marshalArgs(t, "hello"))
+		require.NoError(t, err)
+		require.NotNil(t, captured)
+		require.Equal(t, "hello", captured.Query)
+		require.Equal(t, "user-1", captured.UserID)
+		require.Equal(t, "session-1", captured.SessionID)
+		require.Len(t, captured.History, defaultSearchHistorySize)
+		for _, msg := range captured.History {
+			require.Equal(t, "user", msg.Role)
+			require.Equal(t, "valid user", msg.Content)
+		}
 	})
 
 	t.Run("success with multiple documents", func(t *testing.T) {
@@ -301,6 +515,44 @@ func TestAgenticFilterSearchTool(t *testing.T) {
 		require.Contains(t, rsp.Message, "Found 1 relevant document")
 	})
 
+	t.Run("passes invocation session context", func(t *testing.T) {
+		var captured *knowledge.SearchRequest
+		kb := stubKnowledge{
+			result: &knowledge.SearchResult{
+				Documents: []*knowledge.Result{
+					{Document: &document.Document{Content: "filtered content"}, Score: 0.85},
+				},
+			},
+			capture: func(req *knowledge.SearchRequest) {
+				captured = req
+			},
+		}
+		searchTool := NewAgenticFilterSearchTool(kb, agenticFilterInfo)
+		sess := &session.Session{
+			ID:     "session-2",
+			UserID: "user-2",
+			Events: []event.Event{
+				historyEvent(model.NewUserMessage("what is knowledge"), false),
+				historyEvent(model.NewAssistantMessage("knowledge is RAG"), false),
+			},
+		}
+		invocation := agent.NewInvocation(agent.WithInvocationSession(sess))
+		ctx := agent.NewInvocationContext(context.Background(), invocation)
+
+		filter := &searchfilter.UniversalFilterCondition{Field: "category", Operator: "eq", Value: "documentation"}
+		_, err := searchTool.(ctool.CallableTool).Call(ctx, marshalArgsWithFilter(t, "knowledge filter", filter))
+		require.NoError(t, err)
+		require.NotNil(t, captured)
+		require.Equal(t, "knowledge filter", captured.Query)
+		require.Equal(t, "user-2", captured.UserID)
+		require.Equal(t, "session-2", captured.SessionID)
+		require.Len(t, captured.History, 2)
+		require.Equal(t, []knowledge.ConversationMessage{
+			{Role: "user", Content: "what is knowledge", Timestamp: captured.History[0].Timestamp},
+			{Role: "assistant", Content: "knowledge is RAG", Timestamp: captured.History[1].Timestamp},
+		}, captured.History)
+	})
+
 	t.Run("verify declaration metadata", func(t *testing.T) {
 		kb := stubKnowledge{}
 		searchTool := NewAgenticFilterSearchTool(kb, agenticFilterInfo)
@@ -314,6 +566,15 @@ func TestAgenticFilterSearchTool(t *testing.T) {
 		require.Contains(t, decl.Description, "level")
 		require.NotNil(t, decl.InputSchema)
 		require.NotNil(t, decl.OutputSchema)
+		require.Contains(t, decl.InputSchema.Properties, "filter")
+		filterSchema := decl.InputSchema.Properties["filter"]
+		require.Equal(t, "object", filterSchema.Type)
+		require.NotContains(t, filterSchema.Required, "operator")
+		require.Contains(t, filterSchema.Properties, "operator")
+		require.Contains(t, filterSchema.Properties, "value")
+		require.Contains(t, filterSchema.Properties["operator"].Enum, searchfilter.OperatorEqual)
+		require.Contains(t, filterSchema.Properties["operator"].Enum, searchfilter.OperatorAnd)
+		require.Contains(t, filterSchema.Properties["value"].Description, "array of nested filter conditions")
 	})
 
 	t.Run("verify description generation with empty filter info", func(t *testing.T) {
@@ -368,8 +629,11 @@ func TestAgenticFilterSearchTool(t *testing.T) {
 		customDesc := "Custom agentic description"
 		searchTool = NewAgenticFilterSearchTool(kb, agenticFilterInfo, WithToolDescription(customDesc))
 		decl = searchTool.Declaration()
-		require.Contains(t, decl.Description, "tool description:"+customDesc)
-		require.Contains(t, decl.Description, "filter info:")
+		require.Contains(t, decl.Description, customDesc)
+		require.Contains(t, decl.Description, "== FILTER GUIDANCE ==")
+		require.Contains(t, decl.Description, "Available filters:")
+		require.NotContains(t, decl.Description, "tool description:")
+		require.NotContains(t, decl.Description, "filter info:")
 
 		// Verify WithFilter option
 		customFilter := map[string]any{"source": "internal"}
@@ -386,8 +650,41 @@ func TestAgenticFilterSearchTool(t *testing.T) {
 		searchTool = NewAgenticFilterSearchTool(kb, agenticFilterInfo, WithToolName(customName), WithToolDescription(customDesc), WithFilter(customFilter), WithMinScore(0.8))
 		decl = searchTool.Declaration()
 		require.Equal(t, customName, decl.Name)
-		require.Contains(t, decl.Description, "tool description:"+customDesc)
+		require.Contains(t, decl.Description, customDesc)
+		require.Contains(t, decl.Description, "== FILTER GUIDANCE ==")
 	})
+}
+
+func TestKnowledgeSearchRequestWithFilter_AutoGeneratedSchema(t *testing.T) {
+	schema := internaltool.GenerateJSONSchema(reflect.TypeOf(KnowledgeSearchRequestWithFilter{}))
+	require.NotNil(t, schema)
+
+	schemaBytes, err := json.MarshalIndent(schema, "", "  ")
+	require.NoError(t, err)
+	t.Logf("auto-generated schema:\n%s", string(schemaBytes))
+
+	require.Equal(t, "object", schema.Type)
+	require.Empty(t, schema.Required)
+	require.Contains(t, schema.Properties, "query")
+	require.Contains(t, schema.Properties, "filter")
+	require.Equal(t, "string", schema.Properties["query"].Type)
+	require.Equal(t, "object", schema.Properties["filter"].Type)
+	require.Empty(t, schema.Defs)
+
+	filterSchema := schema.Properties["filter"]
+	require.NotNil(t, filterSchema)
+	require.Equal(t, "object", filterSchema.Type)
+	require.Contains(t, filterSchema.Description, "Filter conditions to apply to the search query")
+	require.NotContains(t, filterSchema.Required, "operator")
+	require.Contains(t, filterSchema.Properties, "field")
+	require.Contains(t, filterSchema.Properties, "operator")
+	require.Contains(t, filterSchema.Properties, "value")
+	require.Equal(t, "string", filterSchema.Properties["field"].Type)
+	require.Equal(t, "string", filterSchema.Properties["operator"].Type)
+	require.Equal(t, "object", filterSchema.Properties["value"].Type)
+	require.Contains(t, filterSchema.Description, "Use lowercase operators eq ne gt gte lt lte")
+	require.Contains(t, filterSchema.Properties["operator"].Description, "Valid values are eq ne gt gte lt lte")
+	require.Contains(t, filterSchema.Properties["value"].Description, "array of nested filter conditions")
 }
 
 func TestConvertMetadataToFilterCondition(t *testing.T) {
@@ -532,6 +829,60 @@ func TestGenerateAgenticFilterPrompt(t *testing.T) {
 		require.Contains(t, prompt, "category:")
 		require.Contains(t, prompt, "status:")
 		require.Contains(t, prompt, "- tag")
+	})
+}
+
+func TestComposeAgenticToolDescription(t *testing.T) {
+	t.Parallel()
+
+	sampleFilterInfo := generateAgenticFilterPrompt(map[string][]any{
+		"metadata.topic": {"architecture", "api"},
+	})
+
+	t.Run("with description and filterInfo", func(t *testing.T) {
+		desc := composeAgenticToolDescription("Search docs.", sampleFilterInfo)
+		require.Contains(t, desc, "Search docs.")
+		require.Contains(t, desc, "== FILTER GUIDANCE ==")
+		require.Contains(t, desc, "metadata.topic")
+		require.NotContains(t, desc, metadataFilterHint)
+	})
+
+	t.Run("with description and nil filterInfo", func(t *testing.T) {
+		nilFilterInfo := generateAgenticFilterPrompt(nil)
+		desc := composeAgenticToolDescription("Search docs.", nilFilterInfo)
+		require.Contains(t, desc, "Search docs.")
+		require.Contains(t, desc, "== FILTER GUIDANCE ==")
+		require.Contains(t, desc, metadataFilterHint)
+		require.Contains(t, desc, `"content"`)
+		require.Contains(t, desc, `"metadata.*"`)
+		require.Contains(t, desc, `"like"`)
+	})
+
+	t.Run("no description with filterInfo", func(t *testing.T) {
+		desc := composeAgenticToolDescription("", sampleFilterInfo)
+		require.Contains(t, desc, agenticFilterPromptIntro)
+		require.Contains(t, desc, "== FILTER GUIDANCE ==")
+		require.Contains(t, desc, "metadata.topic")
+		require.NotContains(t, desc, metadataFilterHint)
+	})
+
+	t.Run("no description and nil filterInfo", func(t *testing.T) {
+		nilFilterInfo := generateAgenticFilterPrompt(nil)
+		desc := composeAgenticToolDescription("", nilFilterInfo)
+		require.Contains(t, desc, agenticFilterPromptIntro)
+		require.Contains(t, desc, "== FILTER GUIDANCE ==")
+		require.Contains(t, desc, metadataFilterHint)
+	})
+
+	t.Run("metadata filter hint contains content and metadata examples", func(t *testing.T) {
+		require.Contains(t, metadataFilterHint, `"content"`)
+		require.Contains(t, metadataFilterHint, `"metadata.*"`)
+		require.Contains(t, metadataFilterHint, `metadata.topic`)
+		require.Contains(t, metadataFilterHint, `metadata.source`)
+		require.Contains(t, metadataFilterHint, `"like"`)
+		require.Contains(t, metadataFilterHint, `"eq"`)
+		require.Contains(t, metadataFilterHint, `"in"`)
+		require.Contains(t, metadataFilterHint, `"and"`)
 	})
 }
 
@@ -699,5 +1050,70 @@ func TestAgenticFilterSearchToolWithAdvancedFilter(t *testing.T) {
 		_, err = tool.(ctool.CallableTool).Call(context.Background(), args)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "search failed")
+	})
+}
+
+func TestSearchToolAdditionalOptionCoverage(t *testing.T) {
+	t.Run("option helpers handle conditioned filter exclude keys and nil post processor", func(t *testing.T) {
+		opts := &options{}
+		condition := &searchfilter.UniversalFilterCondition{
+			Field:    "metadata.category",
+			Operator: searchfilter.OperatorEqual,
+			Value:    "api",
+		}
+
+		WithConditionedFilter(condition)(opts)
+		WithExcludeMetadataKeys()(opts)
+		WithExcludeMetadataKeys("", "secret", "secret", "visible")(opts)
+		WithResultPostProcessor(nil)(opts)
+
+		require.Same(t, condition, opts.conditionedFilter)
+		require.Len(t, opts.excludeMetadataKeys, 2)
+		require.Contains(t, opts.excludeMetadataKeys, "secret")
+		require.Contains(t, opts.excludeMetadataKeys, "visible")
+		require.Nil(t, opts.postProcessor)
+	})
+
+	t.Run("knowledge search applies conditioned filter exclusions and post processor", func(t *testing.T) {
+		kb := &captureKnowledge{
+			result: &knowledge.SearchResult{
+				Documents: []*knowledge.Result{{
+					Document: &document.Document{
+						Content: "doc",
+						Metadata: map[string]any{
+							"visible": "yes",
+							"secret":  "no",
+						},
+					},
+					Score: 0.9,
+				}},
+			},
+		}
+		condition := &searchfilter.UniversalFilterCondition{
+			Field:    "metadata.category",
+			Operator: searchfilter.OperatorEqual,
+			Value:    "api",
+		}
+
+		searchTool := NewKnowledgeSearchTool(
+			kb,
+			WithConditionedFilter(condition),
+			WithExcludeMetadataKeys("secret"),
+			WithResultPostProcessor(func(ctx context.Context, resp *KnowledgeSearchResponse) *KnowledgeSearchResponse {
+				resp.Message = "post-processed"
+				return resp
+			}),
+		)
+
+		res, err := searchTool.(ctool.CallableTool).Call(context.Background(), marshalArgs(t, "hello"))
+		require.NoError(t, err)
+
+		rsp := res.(*KnowledgeSearchResponse)
+		require.Equal(t, "post-processed", rsp.Message)
+		require.NotContains(t, rsp.Documents[0].Metadata, "secret")
+		require.Equal(t, "yes", rsp.Documents[0].Metadata["visible"])
+		require.NotNil(t, kb.lastRequest)
+		require.NotNil(t, kb.lastRequest.SearchFilter)
+		require.Same(t, condition, kb.lastRequest.SearchFilter.FilterCondition)
 	})
 }

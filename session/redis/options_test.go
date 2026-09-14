@@ -126,6 +126,28 @@ func TestWithSummaryJobTimeout(t *testing.T) {
 	}
 }
 
+func TestWithSummaryFilterAllowlist(t *testing.T) {
+	opts := ServiceOpts{}
+	WithSummaryFilterAllowlist("tool-usage", "user-messages")(&opts)
+	assert.Equal(t, []string{"tool-usage", "user-messages"}, opts.summaryFilterAllowlist)
+}
+
+func TestWithCascadeFullSessionSummary(t *testing.T) {
+	opts := ServiceOpts{}
+	WithCascadeFullSessionSummary(false)(&opts)
+	require.NotNil(t, opts.cascadeFullSessionSummary)
+	assert.False(t, *opts.cascadeFullSessionSummary)
+}
+
+func TestShouldCascadeFullSessionSummary(t *testing.T) {
+	disabled := false
+	assert.True(t, (ServiceOpts{}).shouldCascadeFullSessionSummary())
+	assert.True(t, defaultOptions.shouldCascadeFullSessionSummary())
+	assert.False(t, (ServiceOpts{
+		cascadeFullSessionSummary: &disabled,
+	}).shouldCascadeFullSessionSummary())
+}
+
 func TestServiceOptsIntegration(t *testing.T) {
 	redisURL, cleanup := setupTestRedis(t)
 	defer cleanup()
@@ -301,6 +323,17 @@ func TestWithSessionTTL(t *testing.T) {
 	}
 }
 
+func TestWithTrackEventTTL(t *testing.T) {
+	opts := ServiceOpts{sessionTTL: time.Hour}
+	assert.Equal(t, time.Hour, opts.effectiveTrackEventTTL())
+	WithTrackEventTTL(0)(&opts)
+	require.NotNil(t, opts.trackEventTTL)
+	assert.Equal(t, time.Duration(0), opts.effectiveTrackEventTTL())
+	WithTrackEventTTL(30 * time.Minute)(&opts)
+	require.NotNil(t, opts.trackEventTTL)
+	assert.Equal(t, 30*time.Minute, opts.effectiveTrackEventTTL())
+}
+
 func TestWithAppStateTTL(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -459,44 +492,4 @@ func TestWithKeyPrefix(t *testing.T) {
 			assert.Equal(t, tt.expected, opts.keyPrefix)
 		})
 	}
-}
-
-func TestKeyPrefixInRedisKeys(t *testing.T) {
-	redisURL, cleanup := setupTestRedis(t)
-	defer cleanup()
-
-	prefix := "test-prefix"
-	s, err := NewService(WithRedisClientURL(redisURL), WithKeyPrefix(prefix))
-	require.NoError(t, err)
-	defer s.Close()
-
-	key := session.Key{AppName: "app", UserID: "user", SessionID: "sid"}
-
-	// Verify that all key generation methods include the prefix
-	assert.Equal(t, "test-prefix:appstate:{app}", s.getAppStateKey(key.AppName))
-	assert.Equal(t, "test-prefix:userstate:{app}:user", s.getUserStateKey(key))
-	assert.Equal(t, "test-prefix:sess:{app}:user", s.getSessionStateKey(key))
-	assert.Equal(t, "test-prefix:sesssum:{app}:user", s.getSessionSummaryKey(key))
-	assert.Equal(t, "test-prefix:event:{app}:user:sid", s.getEventKey(key))
-	assert.Equal(t, "test-prefix:track:{app}:user:sid:alpha", s.getTrackKey(key, "alpha"))
-}
-
-func TestKeyPrefixEmpty(t *testing.T) {
-	redisURL, cleanup := setupTestRedis(t)
-	defer cleanup()
-
-	// No prefix
-	s, err := NewService(WithRedisClientURL(redisURL))
-	require.NoError(t, err)
-	defer s.Close()
-
-	key := session.Key{AppName: "app", UserID: "user", SessionID: "sid"}
-
-	// Verify that keys are generated without prefix
-	assert.Equal(t, "appstate:{app}", s.getAppStateKey(key.AppName))
-	assert.Equal(t, "userstate:{app}:user", s.getUserStateKey(key))
-	assert.Equal(t, "sess:{app}:user", s.getSessionStateKey(key))
-	assert.Equal(t, "sesssum:{app}:user", s.getSessionSummaryKey(key))
-	assert.Equal(t, "event:{app}:user:sid", s.getEventKey(key))
-	assert.Equal(t, "track:{app}:user:sid:alpha", s.getTrackKey(key, "alpha"))
 }

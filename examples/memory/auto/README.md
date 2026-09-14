@@ -1,6 +1,6 @@
 # 🧠 Auto Memory Chat
 
-This example demonstrates automatic memory extraction using the `Runner` orchestration component. Unlike the manual memory tools approach, auto memory extracts user information from conversations automatically in the background without explicit tool calls.
+This example demonstrates automatic memory extraction using the `Runner` orchestration component. Unlike the manual memory tools approach, auto memory extracts user information from conversations automatically in the background, while still allowing selected tools to be exposed when needed.
 
 ## What is Auto Memory?
 
@@ -12,7 +12,7 @@ Auto memory mode uses an LLM-based extractor to analyze conversations and automa
 | ------------------- | ----------------------------------- | --------------------------------------- |
 | **Memory Creation** | Agent explicitly calls `memory_add` | System extracts automatically           |
 | **User Experience** | Visible tool calls in conversation  | Transparent, no tool call interruptions |
-| **Available Tools** | 6 tools (4 default, 2 configurable) | Only `memory_search`                    |
+| **Available Tools** | 6 tools (4 default, 2 configurable) | Default `memory_search`; configurable `memory_load`; enabled write tools can be exposed |
 | **Processing**      | Synchronous during response         | Asynchronous after response             |
 | **Control**         | Agent decides what to remember      | Extractor analyzes and decides          |
 
@@ -20,7 +20,7 @@ Auto memory mode uses an LLM-based extractor to analyze conversations and automa
 
 - **🔄 Automatic Extraction**: LLM-based extractor analyzes conversations and creates memories
 - **🌊 Background Processing**: Memory extraction happens asynchronously after responses
-- **🔍 Search Only**: Agent can search memories but cannot manually add/update/delete
+- **🔍 Configurable Agent Tools**: `memory_search` is exposed by default; `memory_load` and selected enabled write tools can be exposed when needed
 - **💾 Transparent UX**: Users don't see memory tool calls, natural conversation flow
 - **⚡ Async Workers**: Configurable worker pool for memory extraction jobs
 
@@ -42,11 +42,11 @@ Auto memory is enabled by configuring an extractor on the memory service:
 
 ```go
 // Create memory extractor (uses LLM to analyze conversations).
-extractorModel := openai.New("deepseek-chat")
+extractorModel := openai.New("deepseek-v4-flash")
 memExtractor := extractor.NewExtractor(extractorModel)
 
 // Create memory service with auto extraction enabled.
-// When extractor is set, only search and clear tools are exposed.
+// When extractor is set, memory_search is exposed by default.
 memoryService := memoryinmemory.NewMemoryService(
     memoryinmemory.WithExtractor(memExtractor),
     // Optional: configure async worker settings.
@@ -56,11 +56,11 @@ memoryService := memoryinmemory.NewMemoryService(
 )
 
 // Create LLM agent with memory tools.
-// Only search and clear tools are available since extractor is set.
+// memory_search is available by default; enable load or expose write tools when needed.
 llmAgent := llmagent.New(
     "auto-memory-assistant",
     llmagent.WithModel(chatModel),
-    llmagent.WithTools(memoryService.Tools()), // memory_search and memory_clear.
+    llmagent.WithTools(memoryService.Tools()), // memory_search by default.
 )
 
 // Create runner with memory service.
@@ -75,12 +75,18 @@ runner := runner.NewRunner(
 
 ### Auto Memory Configuration Options
 
-| Option                     | Description                            | Default        |
-| -------------------------- | -------------------------------------- | -------------- |
-| `WithExtractor(extractor)` | Enable auto mode with LLM extractor    | nil (disabled) |
-| `WithAsyncMemoryNum(n)`    | Number of background worker goroutines | 3              |
-| `WithMemoryQueueSize(n)`   | Size of memory job queue               | 100            |
-| `WithMemoryJobTimeout(d)`  | Timeout for each extraction job        | 30s            |
+| Option                                             | Description                                        | Default        |
+| -------------------------------------------------- | -------------------------------------------------- | -------------- |
+| `WithExtractor(extractor)`                         | Enable auto mode with LLM extractor                | nil (disabled) |
+| `WithAsyncMemoryNum(n)`                            | Number of background worker goroutines             | 3              |
+| `WithMemoryQueueSize(n)`                           | Size of memory job queue                           | 100            |
+| `WithMemoryJobTimeout(d)`                          | Timeout for each extraction job                    | 30s            |
+| `WithDisableAutoMemoryOnExternalContext(disable)`  | Skip future auto extraction after knowledge search | false          |
+
+When `WithDisableAutoMemoryOnExternalContext(true)` is enabled, framework-owned
+knowledge search tools mark the session state `memory:mode = polluted`. The
+guard only stops future automatic extraction for that session. It does not block
+memory preload, `memory_search`, `memory_load`, or explicit memory write tools.
 
 ### Extraction Checkers (>= 1.3.0)
 
@@ -137,7 +143,10 @@ type ExtractionContext struct {
 
 ### Tool Availability
 
-In auto memory mode, `WithToolEnabled` controls all 6 tools, but they serve different purposes:
+In auto memory mode, `WithToolEnabled` controls whether tools are available.
+`memory_search` is exposed through `Tools()` by default, `memory_load` is
+exposed once enabled, and `WithAutoMemoryExposedTools` selectively exposes
+enabled write tools for hybrid usage.
 
 **Front-end Tools** (exposed via `Tools()` for agent to call):
 
@@ -146,7 +155,7 @@ In auto memory mode, `WithToolEnabled` controls all 6 tools, but they serve diff
 | `memory_search` | ✅ On   | Search memories by query      |
 | `memory_load`   | ❌ Off  | Load all or recent N memories |
 
-**Back-end Tools** (used by extractor in background, not exposed to agent):
+**Back-end Tools** (used by extractor in background by default):
 
 | Tool            | Default | Description                            |
 | --------------- | ------- | -------------------------------------- |
@@ -162,6 +171,8 @@ memoryService := memoryinmemory.NewMemoryService(
     memoryinmemory.WithExtractor(memExtractor),
     // Front-end: enable memory_load for agent to call.
     memoryinmemory.WithToolEnabled(memory.LoadToolName, true),
+    // Hybrid: expose memory_add so the agent can save explicit long-term hints immediately.
+    memoryinmemory.WithAutoMemoryExposedTools(memory.AddToolName),
     // Back-end: disable memory_delete so extractor cannot delete.
     memoryinmemory.WithToolEnabled(memory.DeleteToolName, false),
     // Back-end: enable memory_clear for extractor (use with caution).
@@ -169,18 +180,19 @@ memoryService := memoryinmemory.NewMemoryService(
 )
 ```
 
-**Note**: `WithToolEnabled` can be called before or after `WithExtractor` - the order does not matter.
+**Note**: `WithToolEnabled` and `WithAutoMemoryExposedTools` can be called before or after
+`WithExtractor` - the order does not matter.
 
 ### Comparison: Agentic Mode vs Auto Mode
 
 | Tool            | Agentic Mode (no extractor)             | Auto Mode (with extractor)                 |
 | --------------- | --------------------------------------- | ------------------------------------------ |
-| `memory_add`    | ✅ Agent calls via `Tools()`            | ✅ Extractor uses in background            |
-| `memory_update` | ✅ Agent calls via `Tools()`            | ✅ Extractor uses in background            |
+| `memory_add`    | ✅ Agent calls via `Tools()`            | ⚙️ Agent calls via `Tools()` if exposed; extractor uses in background |
+| `memory_update` | ✅ Agent calls via `Tools()`            | ⚙️ Agent calls via `Tools()` if exposed; extractor uses in background |
 | `memory_search` | ✅ Agent calls via `Tools()`            | ✅ Agent calls via `Tools()`               |
 | `memory_load`   | ✅ Agent calls via `Tools()`            | ⚙️ Agent calls via `Tools()` if enabled    |
-| `memory_delete` | ⚙️ Agent calls via `Tools()` if enabled | ✅ Extractor uses in background            |
-| `memory_clear`  | ⚙️ Agent calls via `Tools()` if enabled | ⚙️ Extractor uses in background if enabled |
+| `memory_delete` | ⚙️ Agent calls via `Tools()` if enabled | ⚙️ Agent calls via `Tools()` if exposed; extractor uses in background |
+| `memory_clear`  | ⚙️ Agent calls via `Tools()` if enabled | ⚙️ Agent calls via `Tools()` if exposed; extractor uses in background if enabled |
 
 ## Prerequisites
 
@@ -193,6 +205,12 @@ memoryService := memoryinmemory.NewMemoryService(
 | ------------------------- | ---------------------------------------- | --------------------------- |
 | `OPENAI_API_KEY`          | API key for the model service (required) | ``                          |
 | `OPENAI_BASE_URL`         | Base URL for the model API endpoint      | `https://api.openai.com/v1` |
+| `SQLITE_MEMORY_DSN`       | SQLite DSN                               | `file:memories.db?_busy_timeout=5000` |
+| `SQLITEVEC_MEMORY_DSN`    | SQLiteVec DSN                            | `file:memories_vec.db?_busy_timeout=5000` |
+| `SQLITEVEC_EMBEDDER_MODEL` | SQLiteVec embedder model                 | `text-embedding-3-small`    |
+| `OPENAI_EMBEDDING_API_KEY` | API key for embedding model (optional)   | (empty)                     |
+| `OPENAI_EMBEDDING_BASE_URL` | Base URL for embedding endpoint (optional) | (empty)                   |
+| `OPENAI_EMBEDDING_MODEL`  | Override embedding model name (optional) | (empty)                     |
 | `REDIS_ADDR`              | Redis server address                     | `localhost:6379`            |
 | `PG_HOST`                 | PostgreSQL host                          | `localhost`                 |
 | `PG_PORT`                 | PostgreSQL port                          | `5432`                      |
@@ -205,6 +223,13 @@ memoryService := memoryinmemory.NewMemoryService(
 | `PGVECTOR_PASSWORD`       | pgvector PostgreSQL password             | ``                          |
 | `PGVECTOR_DATABASE`       | pgvector PostgreSQL database             | `trpc-agent-go-pgmemory`    |
 | `PGVECTOR_EMBEDDER_MODEL` | pgvector embedder model                  | `text-embedding-3-small`    |
+| `CHROMA_BASE_URL`         | ChromaDB REST base URL                   | `http://localhost:8000`     |
+| `CHROMA_API_KEY`          | ChromaDB API key                         | ``                          |
+| `CHROMA_BEARER_TOKEN`     | ChromaDB bearer token                    | ``                          |
+| `CHROMA_TENANT`           | ChromaDB tenant                          | `default_tenant`            |
+| `CHROMA_DATABASE`         | ChromaDB database                        | `default_database`          |
+| `CHROMA_COLLECTION`       | ChromaDB collection                      | `memories`                  |
+| `CHROMA_EMBEDDER_MODEL`   | ChromaDB embedder model                  | `text-embedding-3-small`    |
 | `MYSQL_HOST`              | MySQL host                               | `localhost`                 |
 | `MYSQL_PORT`              | MySQL port                               | `3306`                      |
 | `MYSQL_USER`              | MySQL user                               | `root`                      |
@@ -215,11 +240,15 @@ memoryService := memoryinmemory.NewMemoryService(
 
 | Argument     | Description                                                               | Default Value    |
 | ------------ | ------------------------------------------------------------------------- | ---------------- |
-| `-model`     | Name of the model for chat responses                                      | `deepseek-chat`  |
+| `-model`     | Name of the model for chat responses                                      | `deepseek-v4-flash`  |
 | `-ext-model` | Name of the model for memory extraction                                   | Same as `-model` |
-| `-memory`    | Memory service type: `inmemory`, `redis`, `postgres`, `pgvector`, `mysql` | `inmemory`       |
+| `-memory`    | Memory service type: `inmemory`, `sqlite`, `sqlitevec`, `redis`, `postgres`, `pgvector`, `mysql`, `mysqlvec`, `chromadb` | `inmemory` |
 | `-streaming` | Enable streaming mode for responses                                       | `true`           |
 | `-debug`     | Enable debug mode to print messages sent to model                         | `false`          |
+| `-knowledge` | Enable a small local knowledge base with `knowledge_search`                | `false`          |
+| `-disable-auto-memory-on-external-context` | Stop future auto-memory extraction after `knowledge_search` is used | `false` |
+| `-update-policy` | Update policy: `merge_similar`, `preserve_history`, or `append_only` | `merge_similar` |
+| `-assistant-episode` | Extract reusable assistant results as episode memories | `false` |
 
 ## Usage
 
@@ -238,6 +267,35 @@ go run .
 go run . -model gpt-4o -ext-model gpt-4o-mini
 ```
 
+Model names beginning with `glm` automatically use the OpenAI client's GLM
+compatibility variant.
+
+### Update Policies
+
+The default `merge_similar` policy preserves the existing auto-memory
+behavior. The other policies are opt-in:
+
+```bash
+# Preserve older facts and update only for safe, non-conflicting enrichment.
+go run . -update-policy preserve_history
+
+# Keep non-duplicate extracted memories as independent entries.
+go run . -update-policy append_only
+```
+
+Assistant episode extraction is also opt-in and can be combined with any
+update policy:
+
+```bash
+go run . \
+  -update-policy preserve_history \
+  -assistant-episode
+```
+
+When enabled, reusable assistant-produced results such as recommendations,
+plans, and structured comparisons can be stored as ordinary episode memories.
+The memory schema and storage tables do not change.
+
 ### Memory Backend Configuration
 
 The auto memory example supports multiple memory backends. Configure the appropriate environment variables and use the `-memory` flag:
@@ -245,6 +303,15 @@ The auto memory example supports multiple memory backends. Configure the appropr
 ```bash
 # Default in-memory memory service
 go run . -memory inmemory
+
+# SQLite memory service (local file)
+export SQLITE_MEMORY_DSN="file:memories.db?_busy_timeout=5000"
+go run . -memory sqlite
+
+# SQLiteVec memory service (local file + vector search)
+export SQLITEVEC_MEMORY_DSN="file:memories_vec.db?_busy_timeout=5000"
+export SQLITEVEC_EMBEDDER_MODEL="text-embedding-3-small"
+go run . -memory sqlitevec
 
 # Redis memory service (requires Redis server)
 export REDIS_ADDR=localhost:6379
@@ -264,7 +331,17 @@ go run . -memory postgres
 export PGVECTOR_HOST=localhost
 export PGVECTOR_PASSWORD=password
 go run . -memory pgvector
+
+# ChromaDB memory service
+export CHROMA_BASE_URL=http://localhost:8000
+export CHROMA_COLLECTION=memories
+export CHROMA_EMBEDDER_MODEL=text-embedding-3-small
+go run . -memory chromadb
 ```
+
+ChromaDB runs as a separate server. `CHROMA_BASE_URL` may target localhost,
+a remote deployment, or Chroma Cloud; remote credentials require HTTPS.
+Changing the embedding model requires a new collection or a full re-embedding.
 
 ### Debug Mode
 
@@ -280,6 +357,21 @@ go run . -debug
 go run . -streaming=false
 ```
 
+### External Context Guard Smoke
+
+```bash
+go run . \
+  -memory inmemory \
+  -streaming=false \
+  -knowledge \
+  -disable-auto-memory-on-external-context
+```
+
+Use `/state` to inspect the current session state. After `knowledge_search`
+returns successfully with the guard enabled, `/state` prints
+`memory:mode = polluted`, and future automatic extraction for that session is
+skipped.
+
 ### Help
 
 ```bash
@@ -290,16 +382,24 @@ Output:
 
 ```
 Usage of ./auto:
+  -assistant-episode
+        Extract reusable assistant results as episode memories
   -debug
         Enable debug mode to print messages sent to model
+  -disable-auto-memory-on-external-context
+        Stop future auto-memory extraction after knowledge_search is used
   -ext-model string
         Model for memory extraction (defaults to chat model)
+  -knowledge
+        Enable a small local knowledge base with knowledge_search
   -memory string
-        Memory service type: inmemory, redis, postgres, pgvector, mysql (default "inmemory")
+        Memory service type: inmemory, sqlite, sqlitevec, redis, postgres, pgvector, mysql, mysqlvec, chromadb (default "inmemory")
   -model string
-        Model for chat responses (default "deepseek-chat")
+        Model for chat responses (default "deepseek-v4-flash")
   -streaming
         Enable streaming mode for responses (default true)
+  -update-policy string
+        Memory update policy: merge_similar, preserve_history, or append_only (default "merge_similar")
 ```
 
 ## Chat Interface
@@ -308,9 +408,14 @@ The interface is simple and intuitive:
 
 ```
 🧠 Auto Memory Demo
-Chat Model: deepseek-chat
-Extractor Model: deepseek-chat
+Chat Model: deepseek-v4-flash
+Extractor Model: deepseek-v4-flash
+Memory Service: inmemory
 Streaming: true
+Knowledge: false
+Disable Auto Memory On External Context: false
+Update Policy: merge_similar
+Assistant Episode Extraction: false
 ==================================================
 
 💡 Auto memory mode extracts user information automatically.
@@ -321,6 +426,7 @@ Streaming: true
 
 💡 Special commands:
    /memory   - Show what the system remembers about you
+   /state    - Show current memory guard session state
    /new      - Start a new session
    /exit     - End the conversation
 
@@ -341,7 +447,7 @@ backend engineer from TechCorp. How can I help you today?
    (Memories persist across sessions)
 
 👤 You: What do you know about me?
-🔧 Memory tool calls:
+🔧 Tool calls:
    • memory_search (ID: call_xyz789)
      Args: {"query":"user information"}
 
@@ -358,8 +464,12 @@ work at TechCorp as a backend engineer.
 ### Session Commands
 
 - `/memory` - Show stored memories for the current user
+- `/state` - Show current memory guard session state
 - `/new` - Start a new session (memories persist across sessions)
 - `/exit` - End the conversation
+
+**Note**: Memory extraction runs asynchronously after each assistant response.
+If `/memory` shows no entries, wait a few seconds and try again.
 
 ## How Auto Memory Works
 
@@ -398,7 +508,9 @@ llmAgent := llmagent.New(
     llmagent.WithTools(memoryService.Tools()),
     // Preload options:
     // llmagent.WithPreloadMemory(0),   // Disable preloading (default).
-    // llmagent.WithPreloadMemory(10),  // Load 10 most recent.
+    // llmagent.WithPreloadMemory(10),  // Adaptive preload budget 10.
+    //                                  // Loads all memories when count <= 10,
+    //                                  // otherwise injects top 10 search results.
     // llmagent.WithPreloadMemory(-1),  // Load all.
 )
 ```
@@ -413,9 +525,16 @@ Use `-debug` flag to see preloaded memories in the system prompt.
 | **Control**     | Configured at agent creation       | Agent-driven, on-demand             |
 | **Token Usage** | Always included in context         | Only when agent calls the tool      |
 | **Auto Mode**   | Works with preloading              | Disabled by default, can be enabled |
-| **Use Case**    | Always need full context           | Selective memory access             |
+| **Use Case**    | Framework-managed adaptive context | Selective memory access             |
 
-In auto memory mode, you can use `WithPreloadMemory(-1)` to inject all memories into the system prompt, or enable `memory_load` tool via `WithToolEnabled(memory.LoadToolName, true)` for agent-driven loading.
+In auto memory mode, `WithPreloadMemory(N)` uses framework-managed adaptive
+preloading: small memory sets are injected in full, while larger memory sets
+inject only the top `N` search results for the current user message. If
+query extraction is empty, the search fails, or the search returns no
+matches, it falls back to directly loading up to `N` memories. Use
+`WithPreloadMemory(-1)` to force full preload, or enable `memory_load`
+via `WithToolEnabled(memory.LoadToolName, true)` for agent-driven
+loading.
 
 ## Comparison with Manual Memory
 
@@ -488,4 +607,4 @@ defer memoryService.Close()
 ## See Also
 
 - [Manual Memory Example](../) - Traditional memory tools approach
-- [Memory Module Documentation](../../../docs/mkdocs/en/memory.md) - Complete memory guide
+- [Memory Module Documentation](../../../docs/mkdocs/en/memory/index.md) - Complete memory guide

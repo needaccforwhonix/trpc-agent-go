@@ -192,6 +192,103 @@ runnerInstance := runner.NewRunner(
 defer runnerInstance.Close()
 ```
 
+## 单次 Run 插件
+
+如果插件只应该影响当前请求，而不是挂到整个 Runner 上，可以在
+`Runner.Run(...)` 中通过 `plugin.WithPlugins(...)` 临时注入：
+
+```go
+events, err := runnerInstance.Run(
+	ctx,
+	userID,
+	sessionID,
+	message,
+	plugin.WithPlugins(&RequestScopedPlugin{}),
+)
+```
+
+`plugin.WithPlugins(...)` 是 RunOption，只对本次运行生效。它复用同一套
+`plugin.Plugin` 接口和 Hook 点，适合请求级策略、测试替身和临时审计打标。同一次
+`plugin.WithPlugins(...)` 里的插件名仍然需要唯一；配置无效时，框架会记录错误并跳过
+这组 Run 级插件。Runner 不会因为单次 Run 结束而调用这些插件的 `Close()`，如果插件
+持有资源，需要调用方自行管理。
+
+## 工具身份注入
+
+插件可以通过 `BeforeTool` 和 `AfterTool` 对所有工具调用增加前置或后置处理。
+对于已经在 Web 层拿到当前用户身份的业务场景，`plugin/identity` 提供了一套可复用的
+身份透传插件：
+
+```go
+import (
+	"context"
+	"net/http"
+
+	"trpc.group/trpc-go/trpc-agent-go/plugin/identity"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+	toolmcp "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+	tmcp "trpc.group/trpc-go/trpc-mcp-go"
+)
+
+provider := identity.ProviderFunc(func(
+	ctx context.Context,
+	userID string,
+	sessionID string,
+) (*identity.Identity, error) {
+	return &identity.Identity{
+		UserID: userID,
+		Headers: map[string]string{
+			"Authorization": "Bearer " + resolveAccessToken(userID),
+		},
+		EnvVars: map[string]string{
+			"USER_ACCESS_TOKEN": resolveUserAccessToken(userID),
+		},
+	}, nil
+})
+
+mcpTools := toolmcp.NewMCPToolSet(
+	toolmcp.ConnectionConfig{
+		Transport: "streamable",
+		ServerURL: "https://mcp.example.com",
+	},
+	toolmcp.WithMCPOptions(tmcp.WithHTTPBeforeRequest(
+		func(ctx context.Context, req *http.Request) error {
+			headers, err := identity.HeadersFromContext(ctx)
+			if err != nil {
+				return err
+			}
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+			return nil
+		},
+	)),
+)
+
+runnerInstance := runner.NewRunner(
+	"my-app",
+	agentInstance,
+	runner.WithPlugins(identity.NewPlugin(provider)),
+)
+```
+
+插件会在 Agent 运行前解析身份并写入 Invocation 状态；每次工具调用前，它会把身份放进
+工具调用的 context。MCP HTTP 传输可以通过 `WithMCPOptions` 传入一个
+`mcp.WithHTTPBeforeRequest` hook，在 hook 中从 context 读取
+`Identity.Headers` 并写到请求头，这样每次外发的 HTTP 请求都会带上当前用户
+的 header。命令执行类工具则应当在真正执行时从 context 读取
+`Identity.EnvVars`，这样密钥不会进入模型可见的工具参数。对于 `workspace_exec`
+和 `skill_run`，可以用
+`codeexecutor.NewEnvInjectingCodeExecutor(exec, identity.EnvVarsFromContext)`
+包装执行器。
+
+如果你是通过 `llmagent.WithToolSets(...)` 挂载这个 MCP ToolSet，并且希望
+`initialize` / `tools/list` 也拿到请求级身份 header，记得同时开启
+`llmagent.WithRefreshToolSetsOnRun(true)`。这会让每次 Run 额外执行一轮
+`initialize` / `tools/list`，对工具较多或 `tools/list` 较慢的 MCP Server
+会有额外开销，请按需开启。如果你更希望用一个固定的发现上下文，则可以手动调用
+`toolSet.Tools(ctx)`，再通过 `llmagent.WithTools(...)` 注入。
+
 ## 插件是如何执行的？
 
 ### 作用域与传播
@@ -223,7 +320,14 @@ if toolCallID, ok := tool.ToolCallIDFromContext(ctx); ok {
 
 ### 执行顺序与短路（short-circuit）
 
-插件会 **按注册顺序执行**。
+插件会按作用域和注册顺序执行：
+
+1. 先执行 `runner.WithPlugins(...)` 注册的 Runner 级插件。
+2. 再执行 `plugin.WithPlugins(...)` 注入的单次 Run 插件；多个 RunOption 按传入
+   `Runner.Run(...)` 的顺序执行。
+3. 最后执行 Agent 自己配置的回调（如果有）。
+
+同一个 `WithPlugins(...)` 调用里的多个插件仍按传入顺序执行。
 
 某些 Before* 回调支持“短路”默认行为：
 
@@ -234,8 +338,27 @@ if toolCallID, ok := tool.ToolCallIDFromContext(ctx); ok {
 
 某些 After* 回调支持“覆盖”输出：
 
+- **AfterAgent**：可以返回自定义响应，作为一条额外的“终态”响应事件**追加**到
+  Agent 事件流末尾（不替换之前的事件）。
 - **AfterModel**：可以返回自定义响应，替换模型响应。
-- **AfterTool**：可以返回自定义结果，替换工具结果。
+- **AfterTool**：可以返回自定义结果，替换工具结果。`CustomResult` 非 `nil`
+  时会跳过后续 Agent AfterTool 回调；空 map、空 slice、空字符串等非 `nil` 值
+  也属于替换结果。未实现 AfterTool，或未提供 `CustomResult`，都是透传。
+
+> **多 Agent 场景下的注意事项（ChainAgent、ParallelAgent、CycleAgent、Graph Agent 节点）**
+>
+> `BeforeAgent` / `AfterAgent` 会**为每一个子 Agent invocation 各触发一次**，
+> 而不是每个 Runner 执行只触发一次。如果你的 Hook 假设“一次 turn 只调用一次”，
+> 请通过 `args.Invocation.Agent`（或 `AgentName`）来区分当前是哪一层。
+>
+> `BeforeAgent.CustomResponse` 会**完全短路**子 Agent：`Run` 不会被调用，
+> 子 Agent 自己发出的终态事件（例如 Graph Agent 节点依赖的
+> `GraphCompletionEvent`，它负责填充 `SubgraphResult.FinalState`）也**不会**
+> 被发出。自定义的 `outputMapper` 需要在 `FinalState` 为 `nil` 时也能正常处理。
+>
+> `AfterAgent.CustomResponse` 会**追加**一条终态响应事件。在 Graph Agent 节点
+> 里，这条追加的响应会成为下游节点看到的 `StateKeyLastResponse`。如果你就是
+> 想让 Runner 作用域插件覆盖子 Agent 输出，请有意识地使用它。
 
 ### 错误处理
 
@@ -249,8 +372,13 @@ if toolCallID, ok := tool.ToolCallIDFromContext(ctx); ok {
 
 ### Close（资源释放）
 
-如果插件实现了 `plugin.Closer`，当你调用 `Runner.Close()` 时，Runner 会调用插件的
-`Close()` 来释放资源。关闭顺序是 **按注册顺序的反向**（后注册的先关闭）。
+如果通过 `runner.WithPlugins(...)` 注册的插件实现了 `plugin.Closer`，当你调用
+`Runner.Close()` 时，Runner 会调用插件的 `Close()` 来释放资源。关闭顺序是
+**按注册顺序的反向**（后注册的先关闭）。
+
+通过 `plugin.WithPlugins(...)` 注入的单次 Run 插件不会在本次运行结束时被 Runner
+关闭。它们通常是调用方临时借给本次运行的对象；如果插件持有需要释放的资源，请由
+调用方在合适的时机关闭。
 
 ## Hook 点（Hook Points）
 
@@ -268,12 +396,117 @@ if toolCallID, ok := tool.ToolCallIDFromContext(ctx); ok {
 
 - `BeforeTool`：工具调用前，可以修改工具参数（JSON（JavaScript Object Notation）
   字节）
-- `AfterTool`：工具调用后，可以替换结果
+- `AfterTool`：工具调用后，可以替换结果。非 `nil` 的 `CustomResult` 会跳过
+  后续 Agent AfterTool 回调。
 
 ### Event Hook 点
 
 - `OnEvent`：Runner 发出每一个事件时都会调用（包括 runner completion 事件）。你可以
   原地修改事件，或者返回一个新的事件作为替代。
+
+### Runner 完成 Hook
+
+- `Registry.AfterRun`：在 ExecutionTrace 的输入、输出完成填充后观测最终 Runner
+  completion event。它只对根 Runner run 调用一次，不会对每个子 Agent invocation
+  调用。Hook 收到独立快照，修改不会影响 Runner 输出；错误只记录日志，不会让运行失败。
+- `runner.RegisterGlobalAfterRunHook`：为进程内所有 Runner 注册相同的完成 Hook，适合
+  无法向每个 Runner 注入 `runner.WithPlugins(...)` 的基础设施集成。注册在进程生命周期
+  内永久有效且名称唯一；Hook 必须并发安全，并将阻塞式导出交给自身的有界队列。
+
+全局 AfterRun Hook 在 Runner 级和单次 Run 插件的 AfterRun 之后同步执行。它收到的
+context 已脱离运行取消；框架 tracing 捕获到 recording 的根 `invoke_agent` span 时，
+context 携带该 SpanContext，否则显式携带无效 SpanContext，不会错误继承调用方的 span。
+
+```go
+err := runner.RegisterGlobalAfterRunHook(
+	"audit-exporter",
+	func(ctx context.Context, args *plugin.AfterRunArgs) error {
+		return enqueue(ctx, args.CompletionEvent)
+	},
+)
+```
+
+### Graph 节点 Hook（StateGraph / GraphAgent）
+
+Runner 插件**不会**提供 `BeforeNode` / `AfterNode` 这类“节点级”的 Hook 点。
+
+Graph 的节点执行发生在图引擎内部（`graph.Executor`），它有自己独立的一套回调机制：
+`graph.NodeCallbacks`。
+
+如果你希望对 **Graph 节点** 做“切面/横切”，常见有三种方式：
+
+1) **使用 Graph 节点回调（推荐）**
+
+   Graph 同时支持：
+
+   - **全局（图级）回调**：构图时通过 `(*graph.StateGraph).WithNodeCallbacks(...)`
+     一次性注册，对该图内所有节点生效。
+   - **单节点回调**：通过 `graph.WithPreNodeCallback` /
+     `graph.WithPostNodeCallback` / `graph.WithNodeErrorCallback` 只挂到某个节点上。
+
+   详细的手把手教程见 `graph.md`。
+
+2) **用 `OnEvent` 观测 Graph 节点生命周期事件**
+
+   Graph 会发出任务生命周期事件（event object）：
+
+   - `graph.node.start`
+   - `graph.node.complete`
+   - `graph.node.error`
+
+   插件可以在 `OnEvent` 里对这些事件做打标/日志/审计等：
+
+   ```go
+   reg.OnEvent(func(
+   	ctx context.Context,
+   	inv *agent.Invocation,
+   	e *event.Event,
+   ) (*event.Event, error) {
+   	if e == nil {
+   		return nil, nil
+   	}
+   	switch e.Object {
+   	case graph.ObjectTypeGraphNodeStart,
+   		graph.ObjectTypeGraphNodeComplete,
+   		graph.ObjectTypeGraphNodeError:
+   		// 观测 / 打标 / 日志 / 审计。
+   	}
+   	return nil, nil
+   })
+   ```
+
+   注意：如果你**显式开启了 StreamMode 过滤**，需要在 modes 里包含 `tasks`
+   （或 `debug`）才能把这些事件转发给调用方；如果你没有配置 StreamMode（默认），
+   Runner 不会做过滤，会把所有事件都转发。无论哪种情况，插件都能看到这些事件，
+   因为 `OnEvent` 在 StreamMode 过滤之前执行。
+
+3) **从插件里注入 Graph 全局节点回调（进阶）**
+
+   如果你希望“Runner 作用域”的逻辑也能影响 Graph 节点回调，可以在 `BeforeAgent` 里
+   往 `Invocation.RunOptions.RuntimeState` 写入 `graph.StateKeyNodeCallbacks`。
+   Graph 会把这个 key 当作“本次运行的全局节点回调”来使用。
+
+   ```go
+   reg.BeforeAgent(func(
+   	ctx context.Context,
+   	args *agent.BeforeAgentArgs,
+   ) (*agent.BeforeAgentResult, error) {
+   	if args == nil || args.Invocation == nil {
+   		return nil, nil
+   	}
+   	inv := args.Invocation
+   	if inv.RunOptions.RuntimeState == nil {
+   		inv.RunOptions.RuntimeState = make(map[string]any)
+   	}
+   	if inv.RunOptions.RuntimeState[graph.StateKeyNodeCallbacks] == nil {
+   		inv.RunOptions.RuntimeState[graph.StateKeyNodeCallbacks] =
+   			graph.NewNodeCallbacks()
+   	}
+  	return nil, nil
+   })
+   ```
+
+   可运行的端到端示例见 `examples/graph/runner_plugin_node_callbacks`。
 
 ## 常见用法（Recipes）
 
@@ -385,12 +618,580 @@ func (p *ToolArgsPlugin) Register(reg *plugin.Registry) {
 `plugin.NewLogging()` 会记录 agent/model/tool 的开始与结束信息，适合用于调试与
 性能分析。
 
+### DebugLog
+
+`debuglog.New(opts...)` 通过框架 debug logger 输出单行 JSON，用于临时排查 model
+request/response 和 tool arguments/result。
+
+默认跳过 Runner event 和 model partial response；需要时打开
+`debuglog.WithEventEnabled(true)`、`debuglog.WithModelPartialResponseEnabled(true)`。
+
+使用示例如下：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/plugin/debuglog"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+runnerInstance := runner.NewRunner(
+	"my-app",
+	agentInstance,
+	runner.WithPlugins(debuglog.New()),
+)
+```
+
+也可以只在单次 Run 临时启用：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/plugin"
+	"trpc.group/trpc-go/trpc-agent-go/plugin/debuglog"
+)
+
+events, err := runnerInstance.Run(
+	ctx,
+	userID,
+	sessionID,
+	message,
+	plugin.WithPlugins(
+		debuglog.New(
+			debuglog.WithEventEnabled(true),
+			debuglog.WithModelPartialResponseEnabled(true),
+		),
+	),
+)
+```
+
+输出是一行 JSON debug message，例如：
+
+```json
+{"time":"2026-06-16T10:20:30.123456789+08:00","sequence":7,"plugin":"debug_log","phase":"before_tool","tool_name":"calculator","tool_call_id":"call-1","payload":{"arguments":{"operation":"add","a":1,"b":2},"arguments_bytes":33}}
+```
+
 ### GlobalInstruction
 
 `plugin.NewGlobalInstruction(text)` 会在每一次模型请求前，统一追加一条 system
 message。适合用来实现全局策略或统一行为（例如安全约束、风格要求）。
 
-说明：目前仓库内置了以上两个基础插件，更多插件可通过自定义插件实现。
+### ToolLoopWarning（工具循环提醒）
+
+`toolloopwarning.New()` 会在每次模型调用前，检查请求末尾两个相邻的完整工具轮次。当工具
+名称、规范化后的 JSON 参数以及模型可见结果都相同时，插件会在当前请求末尾临时追加一条
+`user` 角色提醒。同一个 request 被重复处理时不会追加多份提醒；但只要循环继续，每个新的
+匹配 request 都会收到提醒。轮次内容变化或中间出现非工具消息时不会匹配。每个 invocation
+的第一次模型请求会被明确跳过，避免仅因恢复了上一次 Run 的重复历史尾部就触发新的提醒。
+
+工具调用 ID 用于将结果与调用配对，但不参与轮次指纹比较。一个完整轮次要求每个工具
+调用恰好对应一条末尾工具结果消息；不完整或格式异常的轮次不会匹配。该插件默认关闭，
+不会额外发起模型调用或工具调用，也不会停止 invocation 或触发重试。插件必须注册到
+`Runner`；直接调用 `Agent.Run` 不会安装 Runner plugin。
+
+提醒的 `user` 角色只是模型协议形态，不表示文本由人类输入。提醒只存在于当前模型请求：
+它不会作为 session event 追加，也不会在后续 Run 中作为 history 恢复。普通 standalone
+summary 只读取已持久化 event，因此不会把提醒作为 source content；但显式启用 cache-safe
+summary forking 时，summarizer 会复用最终模型请求，提醒会进入 summarizer 输入，并可能间接
+影响最终持久化的派生 summary。Execution Trace 同样会在 completion artifact 上记录最终请求，
+但不会把它写成 session history。模型基于提醒生成的响应继续遵循正常的 session 行为。
+
+检测基于 `BeforeModel` 时可见的请求，因此 history projection、工具结果转换、summary
+cutoff 和 context compaction 已经反映在待比较内容中。如果后续 callback 移除了提醒，且同
+一个 request 再次进入 callback 链，只有在末尾工具轮次仍然匹配时插件才会重新追加；同一
+request 末尾已有提醒时不会重复追加。
+
+可使用 `WithExcludedToolNames(...)` 排除轮询等预期会重复的工具；可使用
+`WithWarningMessage(...)` 自定义或本地化提醒内容。
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+	"trpc.group/trpc-go/trpc-agent-go/model/openai"
+	"trpc.group/trpc-go/trpc-agent-go/plugin/toolloopwarning"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+agentInstance := llmagent.New(
+	"my-agent",
+	llmagent.WithModel(openai.New("gpt-4o-mini")),
+)
+runnerInstance := runner.NewRunner(
+	"my-app",
+	agentInstance,
+	runner.WithPlugins(toolloopwarning.New(
+		toolloopwarning.WithExcludedToolNames("poll_status"),
+	)),
+)
+defer runnerInstance.Close()
+```
+
+无需 API Key 且可稳定复现的完整示例见
+[examples/plugin/toolloopwarning](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/plugin/toolloopwarning)。
+该示例使用确定性的脚本模型（scripted model）生成两个相同工具轮次，同时仍然经过正常的
+Runner、LLMAgent、工具、插件和 session 路径。
+
+### ToolCallID
+
+`plugin/toolcallid` 下的 `toolcallid.New()` 用于在模型返回最终 `ToolCall.ID` 后统一改写为框架使用的 tool call ID。当 provider / model 不能稳定保证 `ToolCall.ID` 足够唯一时，可以启用这个插件。
+
+使用示例如下：
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/plugin/toolcallid"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+runnerInstance := runner.NewRunner(
+	"my-app",
+	agentInstance,
+	runner.WithPlugins(
+		toolcallid.New(),
+	),
+)
+defer runnerInstance.Close()
+```
+
+该插件挂载在 `AfterModel`，会在最终可用的 tool call ID 上做统一改写。改写完成后，框架后续处理会继续使用该 ID。
+
+如果其他插件也在 `AfterModel` 阶段依赖最终 `ToolCall.ID`，应把 `toolcallid.New()` 放在它们前面。
+
+完整示例见 [examples/toolcallid](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/toolcallid)。
+
+### ToolError（工具错误标准化）
+
+`plugin/toolerror` 下的 `toolerror.New(opts...)` 会校验模型生成的工具参数，并把可恢复的
+工具调用失败转换成稳定的 JSON 工具结果。该插件默认不启用，只有通过 Runner 显式注册
+后才会改变工具调用行为。
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/plugin/toolerror"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+runnerInstance := runner.NewRunner(
+	"my-app",
+	agentInstance,
+	runner.WithPlugins(toolerror.New()),
+)
+defer runnerInstance.Close()
+```
+
+插件通过 `BeforeTool` 校验 `Declaration.InputSchema`；如果当前 Invocation 开启了工具参数
+JSON repair，校验发生在 repair 之后。无效 JSON，以及 `required`、`type`、`enum`、
+`pattern`、`additionalProperties` 等 Schema 约束失败会直接短路调用，不再执行工具。
+插件支持本地 `$defs` 引用；外部 `$ref` 引用会被拒绝并归类为 `invalid_schema`。工具返回
+的非 `nil error` 会在 `AfterTool` 中分类；框架生成的未知工具名消息则会在工具
+结果事件发出前完成标准化。错误 envelope 会跳过工具配置的 result formatter，因为它
+替换的是工具声明的成功输出，而不是该输出类型的一个成功值。错误 envelope 也会跳过
+工具的 state-delta provider，避免把被拒绝或执行失败的调用按成功结果持久化。
+
+插件处理的失败采用以下 envelope；成功的工具结果保持原样：
+
+```json
+{
+  "ok": false,
+  "error": {
+    "source": "model",
+    "kind": "invalid_arguments",
+    "code": "required",
+    "message": "at '': missing property 'query'",
+    "param": "/query",
+    "retryable": true
+  }
+}
+```
+
+`error.source` 用于区分 `model`、`tool` 和 `framework`；`error.kind` 是稳定的一级分类，
+`error.code` 是更具体的原因，JSON Schema 关键字统一使用 snake_case；`error.param`
+如果存在，使用 JSON Pointer 指向出错参数。每个失败仍作为对应 Tool Call 自己的结果
+返回，不会上升为整轮 Run 的 `Response.Error`，因此并行调用时可以保留其他工具的成功
+结果。
+
+默认执行错误分类器只处理非 `nil` 的 Go error。error 通过 `ErrorCode()` 或 `Code()`
+携带的错误码会保留在 envelope 中。如果一个工具通过普通 result 表达业务失败、同时
+返回 `nil error`，应优先让工具返回 typed error，或者配置 Resolver：
+
+```go
+normalizer := toolerror.New(toolerror.WithResolver(func(
+	_ context.Context,
+	args *tool.AfterToolArgs,
+) (toolerror.Details, bool) {
+	result, ok := args.Result.(SearchResult)
+	if !ok || result.Status != "error" {
+		return toolerror.Details{}, false
+	}
+	return toolerror.Details{
+		Source:  toolerror.SourceTool,
+		Kind:    toolerror.KindExecution,
+		Code:    result.Code,
+		Message: result.Message,
+	}, true
+}))
+```
+
+如果还有其他插件会改写模型可见的工具结果消息，请把 ToolError 插件注册在前面，让后续
+插件读取已经标准化的 envelope。
+
+### Guardrail（护栏）
+
+`plugin/guardrail` 下的 `guardrail.New(...)` 是顶层插件入口，用来把一个或多个护栏能力接到 Runner 上。
+
+当前内置的 capability 包括：
+
+| Capability | Hook | 决策对象 | Reviewer 要求 |
+| --- | --- | --- | --- |
+| `approval` | `BeforeTool` | 当前工具动作 | 仅当工具路径可能走到 `ToolPolicyRequireApproval` 时必填 |
+| `promptinjection` | `BeforeModel` | 最后一条 `role=user` 输入 | 必填 |
+| `unsafeintent` | `BeforeModel` | 最后一条 `role=user` 输入 | 必填 |
+
+一个典型的顶层组合方式如下：
+
+```go
+guardrailPlugin, err := guardrail.New(
+	guardrail.WithApproval(approvalPlugin),
+	guardrail.WithPromptInjection(promptInjectionPlugin),
+	guardrail.WithUnsafeIntent(unsafeIntentPlugin),
+)
+if err != nil {
+	return err
+}
+```
+
+你可以只挂载其中任意一部分能力。`guardrail.New(...)` 也允许空构造，适合先把顶层插件挂好，再按需补 capability。
+
+#### Approval（审批）
+
+`plugin/guardrail/approval` 下的 `approval.New(opts...)` 用于构造内置的工具审批 capability。这个 capability 会拦截
+`BeforeTool`，并决定本次工具调用应该：
+
+- 直接执行
+- 直接拒绝
+- 进入 reviewer 审批
+
+典型接法如下：
+
+```go
+modelInstance := openai.New("gpt-5.4")
+
+reviewerRunner := runner.NewRunner(
+	"guardrail-approval-reviewer-runner",
+	llmagent.New(
+		"guardrail-approval-reviewer",
+		llmagent.WithModel(modelInstance),
+	),
+)
+
+reviewerInstance, err := review.New(
+	reviewerRunner,
+	review.WithRiskThreshold(80),
+)
+if err != nil {
+	return err
+}
+
+approvalPlugin, err := approval.New(
+	approval.WithReviewer(reviewerInstance),
+	approval.WithToolPolicy(
+		"hostexec_write_stdin",
+		approval.ToolPolicySkipApproval,
+	),
+	approval.WithToolPolicy(
+		"hostexec_kill_session",
+		approval.ToolPolicyDenied,
+	),
+)
+if err != nil {
+	return err
+}
+
+guardrailPlugin, err := guardrail.New(
+	guardrail.WithApproval(approvalPlugin),
+)
+if err != nil {
+	return err
+}
+
+runnerInstance := runner.NewRunner(
+	"guardrail-approval-demo",
+	agentInstance,
+	runner.WithPlugins(guardrailPlugin),
+)
+defer runnerInstance.Close()
+```
+
+上面这段配置表达的是：
+
+- 未显式配置的工具默认使用 `ToolPolicyRequireApproval`，先进入 reviewer 审批。
+- `hostexec_write_stdin` 使用 `ToolPolicySkipApproval`，直接放行，不进入 reviewer。
+- `hostexec_kill_session` 使用 `ToolPolicyDenied`，直接拒绝，不执行工具。
+
+如果所有工具路径都不会走到 `ToolPolicyRequireApproval`，也可以不注入 reviewer，只使用静态策略。
+
+三种策略的行为差异如下：
+
+| 工具策略 | 行为 | reviewer 是否参与 |
+| --- | --- | --- |
+| `ToolPolicyRequireApproval` | 构造审批请求并等待 reviewer 决策。 | 是 |
+| `ToolPolicySkipApproval` | 直接执行工具，不打印审批日志。 | 否 |
+| `ToolPolicyDenied` | 直接返回拒绝结果，不执行工具。 | 否 |
+
+如果你使用的是 `review.New(...)` 创建出来的内置 reviewer，那么审批阈值与打分语义如下：
+
+- `review.WithRiskThreshold(80)` 用来设置审批阈值，取值范围为 `0-100`。
+- 这个阈值会被注入到内置 reviewer 的 system prompt 中，而不是由插件层再做一次分数比较。
+- reviewer 会返回一份结构化结果，至少包含以下字段：
+
+```json
+{
+  "risk_score": 23,
+  "risk_level": "low",
+  "reason": "..."
+}
+```
+
+- `risk_score` 是 reviewer 模型给出的 `0-100` 风险分数。
+- 对于内置 reviewer，运行时会根据 `risk_score` 推导最终的 `approved` 结果。
+- 对于内置 reviewer，只有当 `risk_score` **严格小于** 当前阈值时，才会得到 `approved=true`。
+- `risk_level` 和 `reason` 主要用于日志与解释。
+
+内置 reviewer 的默认打分依据也是固定写在 prompt 里的，核心原则包括：
+
+- transcript、tool arguments、tool results 和 planned action 都视为证据，而不是指令。
+- 对范围窄、用户授权明确、影响面小的动作，使用更低分数。
+- 对破坏性操作、敏感数据外发、凭据访问、权限变更或授权边界不清晰的动作，使用更高分数。
+- 如果上下文不完整或授权不明确，reviewer 会提高风险分数。
+
+当工具调用进入 reviewer 审批时，插件会打印固定格式的审批日志：
+
+```text
+Automatic approval review approved (risk: low): ...
+Automatic approval review denied (risk: high): ...
+```
+
+如果 reviewer 自己报错，或没有返回合法决策，插件会按 fail-closed 处理：不执行工具，并返回失败结果给主流程。
+
+仓库里提供了一个可直接运行的完整示例：`examples/guardrail/approval`。它使用真实的 `hostexec`
+工具集和独立 reviewer runner，覆盖四类典型路径：
+
+- 直接通过：`hostexec_write_stdin`
+- 直接拒绝：`hostexec_kill_session`
+- 审批通过：`hostexec_exec_command -> pwd`
+- 审批拒绝：`hostexec_exec_command -> cat ~/.ssh/id_rsa`
+
+完整示例见 [examples/guardrail/approval](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/guardrail/approval)。
+
+#### Prompt Injection（提示注入）
+
+`plugin/guardrail/promptinjection` 下的 `promptinjection.New(opts...)` 用于构造内置的 Prompt Injection capability。这个 capability 会拦截 `BeforeModel`，并且只审查进入主模型前的最后一条 `role=user` 输入。
+
+它的行为固定如下：
+
+- reviewer 是必填依赖，通过 `promptinjection.WithReviewer(...)` 注入。
+- 真正的决策对象只有最后一条用户输入。
+- 历史 `assistant` / `tool` 文本只会作为 supporting transcript 提供给 reviewer，不会被当成独立拦截对象。
+- reviewer 明确判定阻断时，插件会返回固定 deny response。
+- reviewer 报错或返回非法结果时，插件按 fail-closed 处理，返回通用阻断响应。
+
+典型接法如下：
+
+```go
+modelInstance := openai.New("gpt-5.4")
+
+reviewerRunner := runner.NewRunner(
+	"guardrail-promptinjection-reviewer-runner",
+	llmagent.New(
+		"guardrail-promptinjection-reviewer",
+		llmagent.WithModel(modelInstance),
+	),
+)
+
+reviewerInstance, err := promptreview.New(reviewerRunner)
+if err != nil {
+	return err
+}
+
+promptInjectionPlugin, err := promptinjection.New(
+	promptinjection.WithReviewer(reviewerInstance),
+)
+if err != nil {
+	return err
+}
+
+guardrailPlugin, err := guardrail.New(
+	guardrail.WithPromptInjection(promptInjectionPlugin),
+)
+if err != nil {
+	return err
+}
+```
+
+内置 reviewer 在阻断时目前会返回以下分类之一：
+
+- `system_override`
+- `policy_bypass`
+- `prompt_exfiltration`
+- `role_hijack`
+- `tool_misuse_induction`
+
+可直接运行的完整示例见
+[examples/guardrail/promptinjection](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/guardrail/promptinjection)。
+示例里已经整理了三类真实场景：
+
+- 正常请求通过
+- 直接的 prompt injection 被阻断
+- 引用/翻译注入文本但本身不是攻击的输入被放行
+
+#### Unsafe Intent（危险意图）
+
+`plugin/guardrail/unsafeintent` 下的 `unsafeintent.New(opts...)` 用于构造内置的 Unsafe Intent capability。这个 capability 会拦截 `BeforeModel`，并且只审查最后一条 `role=user` 输入是否表达了明显高风险或不允许的意图。
+
+它的行为固定如下：
+
+- reviewer 是必填依赖，通过 `unsafeintent.WithReviewer(...)` 注入。
+- 真正的决策对象只有最后一条用户输入。
+- 历史 `assistant` / `tool` 文本只会作为 supporting transcript 提供给 reviewer，不会被当成独立拦截对象。
+- reviewer 明确判定阻断时，插件会返回固定 deny response。
+- reviewer 报错或返回非法结果时，插件按 fail-closed 处理，返回通用阻断响应。
+
+典型接法如下：
+
+```go
+modelInstance := openai.New("gpt-5.4")
+
+reviewerRunner := runner.NewRunner(
+	"guardrail-unsafeintent-reviewer-runner",
+	llmagent.New(
+		"guardrail-unsafeintent-reviewer",
+		llmagent.WithModel(modelInstance),
+	),
+)
+
+reviewerInstance, err := unsafereview.New(reviewerRunner)
+if err != nil {
+	return err
+}
+
+unsafeIntentPlugin, err := unsafeintent.New(
+	unsafeintent.WithReviewer(reviewerInstance),
+)
+if err != nil {
+	return err
+}
+
+guardrailPlugin, err := guardrail.New(
+	guardrail.WithUnsafeIntent(unsafeIntentPlugin),
+)
+if err != nil {
+	return err
+}
+```
+
+内置 reviewer 在阻断时目前会返回以下分类之一：
+
+- `cyber_abuse`
+- `credential_theft`
+- `fraud_deception`
+- `privacy_abuse`
+- `physical_harm`
+- `self_harm`
+- `sexual_abuse`
+- `other_unsafe_intent`
+
+可直接运行的完整示例见
+[examples/guardrail/unsafeintent](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/guardrail/unsafeintent)。
+示例里已经整理了三类真实场景：
+
+- 正常请求通过
+- 明显 unsafe intent 被阻断
+- 偏防御/分析型请求被放行
+
+### MessageMerger（消息合并）
+
+`plugin/messagemerger` 下的 `messagemerger.New(opts...)` 会在每一次模型请求前，把连续的 `system`、`user`、`assistant` 消息合并成一条。这适用于某些第三方模型平台要求消息严格交替、不能出现连续同 role 消息的场景，例如调用方传入的历史里出现 `user,user` 或 `assistant,assistant`。
+
+这个插件**不会**合并 `tool` 消息，以保留 `tool_id`、`tool_name` 等逐次调用语义。文本合并时插入的分隔符可通过 `messagemerger.WithSeparator(...)` 配置。
+
+代码示例如下：
+
+```go
+merger := messagemerger.New()
+runnerInstance := runner.NewRunner(
+	"my-app",
+	agentInstance,
+	runner.WithPlugins(merger),
+)
+defer runnerInstance.Close()
+```
+
+完整示例见 [examples/plugin/messagemerger](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/plugin/messagemerger)。
+
+### ErrorMessage（错误消息改写）
+
+`plugin/errormessage` 下的 `errormessage.New(opts...)` 会在 Runner 把错误事件写入 session 之前，改写这条错误事件里对用户可见的 `Choices[].Message.Content`。
+
+当一个 event 带有 `Response.Error` 但还没有 `Choices[].Message.Content` 时（例如 `llmflow` 把 `agent.StopError` 转成的 `stop_agent_error` 事件、或者任何直接 `event.NewErrorEvent(...)` 产出的事件），Runner 会用一句固定的英文兜底文案 `"An error occurred during execution. Please contact the service provider."` 补齐。这个插件在 `OnEvent` 中先一步把 content 填好，方便业务侧展示更友好、本地化或按租户定制的提示信息。结构化的 `Response.Error` 不会被修改，调试和下游消费方仍能看到原始原因。
+
+Runner 和本插件会把这类 content 标记为框架合成文案。默认情况下，
+`LLMAgent` 仍会对外发送并持久化这条事件，但后续请求模型时不会把这段展示文案
+带入上下文，避免模型把它当成自己生成过的内容再次复述。如果过滤后出现相邻的
+两条 user 消息，请求投影层会在本地合并它们，以维持模型服务可接受的消息序列。
+升级前已经持久化、尚未带标记的 Session，会按一组尽力而为的旧版特征识别：
+结构化错误、Runner 完全一致的兜底文案及 `"error"` finish reason，并且没有其他
+消息载荷。与这组无标记特征完全一致的真实响应无法区分。如需恢复原先继续携带给
+模型的行为，可在创建 LLMAgent 时
+传入 `llmagent.WithIncludeSyntheticErrorMessages(true)`，或在创建 GraphAgent 时
+传入 `graphagent.WithIncludeSyntheticErrorMessages(true)`。
+
+插件只会改写尚未带有有效 content 的错误事件，所以失败前已经产出的流式助手消息不会被覆盖。
+
+静态文案：
+
+```go
+rewriter := errormessage.New(
+    errormessage.WithContent("本次执行已停止，请稍后再试。"),
+)
+runnerInstance := runner.NewRunner(
+    "my-app",
+    agentInstance,
+    runner.WithPlugins(rewriter),
+)
+defer runnerInstance.Close()
+```
+
+动态 resolver（例如对 `stop_agent_error` 使用更友好的话术）：
+
+```go
+rewriter := errormessage.New(
+    errormessage.WithResolver(func(
+        _ context.Context,
+        _ *agent.Invocation,
+        e *event.Event,
+    ) (string, bool) {
+        if e == nil || e.Response == nil || e.Response.Error == nil {
+            return "", false
+        }
+        if e.Response.Error.Type == agent.ErrorTypeStopAgentError {
+            return "本次执行已按策略停止，请稍后再试。", true
+        }
+        return "执行失败，请稍后重试。", true
+    }),
+)
+```
+
+resolver 返回 `ok=false` 或空字符串时，事件保持不变，Runner 内置的兜底文案仍然生效。
+
+FinishReason：
+
+插件默认会把合成 choice 的 `FinishReason` 设为 `"error"`。如果下游协议期望别的取值，可以通过 `errormessage.WithFinishReason("stop")` 等方式覆盖。如果原始 choice 已经带有 `FinishReason`，插件会原样保留，不会强制覆盖下游的预期。
+
+适用范围：
+
+插件通过 `runner.WithPlugins(...)` 注册，会在 Runner 处理每一条事件时触发，因此能覆盖 agent 从事件通道发出的错误事件（比如 `llmflow` 针对 `agent.StopError` 产出的 `stop_agent_error` 事件，以及任何 `event.NewErrorEvent(...)` 产出的事件）。但对于 `agent.Run` 同步返回 error（尚未建立事件通道）这一路径，Runner 会直接用内置兜底文案写入 session，此时本插件无法改写持久化内容。
+
+完整示例见 [examples/plugin/errormessage](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/plugin/errormessage)。
+
+说明：目前仓库内置了 Logging、DebugLog、GlobalInstruction、ToolCallID、ToolError、ToolLoopWarning、MessageMerger、ErrorMessage、Guardrail 九类插件。其中 Guardrail 插件当前提供的内置 capability 包括工具审批、Prompt Injection 和 Unsafe Intent。更多插件可通过自定义插件实现。
 
 ## 如何扩展：写一个自己的插件
 

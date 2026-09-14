@@ -16,10 +16,10 @@ Within the same conversation, it allows for seamless transitions between multipl
 - **Session Summary**: Automatically compress long conversation history using LLM while preserving key context and significantly reducing token consumption
 - **Event Limiting**: Control maximum number of events stored per session to prevent memory overflow
 - **TTL Management**: Support automatic expiration and cleanup of session data
-- **Multiple Storage Backends**: Support Memory, Redis, PostgreSQL, MySQL, ClickHouse storage
+- **Multiple Storage Backends**: Support Memory, SQLite, Redis, PostgreSQL, MySQL, ClickHouse storage
 - **Concurrency Safety**: Built-in read-write locks ensure safe concurrent access
 - **Automatic Management**: Automatically handle session creation, loading, and updates after Runner integration
-- **Soft Delete Support**: PostgreSQL/MySQL support soft delete with data recovery capability
+- **Soft Delete Support**: PostgreSQL/MySQL/SQLite support soft delete with data recovery capability
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ Within the same conversation, it allows for seamless transitions between multipl
 
 tRPC-Agent-Go's session management integrates with Runner through `runner.WithSessionService`. Runner automatically handles session creation, loading, updates, and persistence.
 
-**Supported Storage Backends:** Memory, Redis, PostgreSQL, MySQL, ClickHouse
+**Supported Storage Backends:** Memory, SQLite, Redis, PostgreSQL, MySQL, ClickHouse
 
 **Default Behavior:** If `runner.WithSessionService` is not configured, Runner defaults to using memory storage (Memory), and data will be lost after process restarts.
 
@@ -59,7 +59,7 @@ func main() {
         summary.WithChecksAny(                         // Trigger when any condition is met
             summary.CheckEventThreshold(20),           // Trigger when 20+ new events since last summary
             summary.CheckTokenThreshold(4000),         // Trigger when 4000+ new tokens since last summary
-            summary.CheckTimeThreshold(5*time.Minute), // Trigger after 5 minutes of inactivity
+            summary.CheckTimeThreshold(5*time.Minute), // Runner path: trigger when the idle gap before the next request exceeds 5 minutes
         ),
         summary.WithMaxSummaryWords(200), // Limit summary to 200 words
     )
@@ -183,7 +183,7 @@ As conversations continue to grow, maintaining complete event history can consum
 
 **Core Features:**
 
-- **Automatic Triggering**: Automatically generate summaries based on event count, token count, or time thresholds
+- **Automatic Triggering**: During summary checks, automatically generate summaries based on event count, token count, or time thresholds
 - **Incremental Processing**: Only process new events since the last summary, avoiding redundant computation
 - **LLM-Driven**: Use configured LLM model to generate high-quality, context-aware summaries
 - **Non-Destructive**: Original events are fully preserved, summaries stored separately
@@ -205,7 +205,7 @@ summarizer := summary.NewSummarizer(
     summary.WithChecksAny(                         // Trigger when any condition is met
         summary.CheckEventThreshold(20),           // Trigger when 20+ new events since last summary
         summary.CheckTokenThreshold(4000),         // Trigger when 4000+ new tokens since last summary
-        summary.CheckTimeThreshold(5*time.Minute), // Trigger after 5 minutes of inactivity
+        summary.CheckTimeThreshold(5*time.Minute), // Runner path: trigger when the idle gap before the next request exceeds 5 minutes
     ),
     summary.WithMaxSummaryWords(200),              // Limit summary to 200 words
 )
@@ -283,15 +283,12 @@ Notes:
 
 **Context Injection Mechanism:**
 
-After enabling summary, the framework prepends the summary as a system message to the LLM input, while including all incremental events after the summary timestamp to ensure complete context:
+After enabling summary, the framework merges the summary into the existing system message when one exists, or prepends a new system message when none exists. It also includes all incremental events after the summary timestamp to ensure complete context:
 
-```
+```text
 ┌─────────────────────────────────────────┐
-│ System Prompt                           │
-├─────────────────────────────────────────┤
-│ Session Summary (system message)        │ ← Compressed version of historical conversations
-│ - Updated at: 2024-01-10 14:30          │   (events before updated_at)
-│ - Includes: Event1 ~ Event20            │
+│ System Prompt                           │ ← Existing system prompt, if present,
+│ (merged with Session Summary)           │    now merged with summary content
 ├─────────────────────────────────────────┤
 │ Event 21 (user message)                 │ ┐
 │ Event 22 (assistant response)           │ │
@@ -406,16 +403,18 @@ sessionService := inmemory.NewSessionService(
 | ------------ | ---------------------------------------------- | ------------ |
 | Memory       | Periodic scanning + access-time checking       | Yes          |
 | Redis        | Redis native TTL                               | Yes          |
+| SQLite       | Periodic scanning (soft delete or hard delete) | Yes          |
 | PostgreSQL   | Periodic scanning (soft delete or hard delete) | Yes          |
 | MySQL        | Periodic scanning (soft delete or hard delete) | Yes          |
 
 ## Storage Backend Comparison
 
-tRPC-Agent-Go provides five session storage backends to meet different scenario requirements:
+tRPC-Agent-Go provides six session storage backends to meet different scenario requirements:
 
 | Storage Type | Use Case                         |
 | ------------ | -------------------------------- |
 | Memory       | Development/testing, small-scale |
+| SQLite       | Local persistence, single-node   |
 | Redis        | Production, distributed          |
 | PostgreSQL   | Production, complex queries      |
 | MySQL        | Production, complex queries      |
@@ -490,23 +489,124 @@ sessionService := inmemory.NewSessionService(
 )
 ```
 
-## Redis Storage
+## SQLite Storage
 
-Suitable for production environments and distributed applications, provides high performance and auto-expiration capabilities.
+SQLite is an embedded database stored in a single file. It is a good fit for:
+
+- Local development and demos (no external database needed)
+- Single-node deployments that still want persistence across restarts
+- Lightweight persistence for CLI tools or small services
+
+### Requirements
+
+This backend uses the `github.com/mattn/go-sqlite3` driver, which requires CGO
+(a C compiler). Make sure your environment can build CGO code.
+
+### Basic Configuration Example
+
+```go
+import (
+    "database/sql"
+    "time"
+
+    _ "github.com/mattn/go-sqlite3"
+    sessionsqlite "trpc.group/trpc-go/trpc-agent-go/session/sqlite"
+)
+
+db, err := sql.Open("sqlite3", "file:sessions.db?_busy_timeout=5000")
+if err != nil {
+    // handle error
+}
+
+sessionService, err := sessionsqlite.NewService(
+    db,
+    sessionsqlite.WithSessionEventLimit(1000),
+    sessionsqlite.WithSessionTTL(30*time.Minute),
+    sessionsqlite.WithSoftDelete(true),
+)
+if err != nil {
+    // handle error
+}
+defer sessionService.Close()
+```
+
+**Notes**:
+
+- `NewService` accepts a `*sql.DB`. The session service owns the DB and will
+  close it in `Close()`. Do not close the DB twice.
+- For better concurrency on a single machine, consider enabling WAL mode
+  (e.g. `_journal_mode=WAL`) and setting `_busy_timeout` in your DSN.
 
 ### Configuration Options
 
+- **TTL and cleanup**: `WithSessionTTL`, `WithAppStateTTL`, `WithUserStateTTL`,
+  `WithCleanupInterval`
+- **Retention**: `WithSessionEventLimit`
+- **Persistence**: `WithEnableAsyncPersist`, `WithAsyncPersisterNum`
+- **Soft delete**: `WithSoftDelete` (default is enabled)
+- **Summaries**: `WithSummarizer`, `WithAsyncSummaryNum`, `WithSummaryQueueSize`,
+  `WithSummaryJobTimeout`
+- **Schema/DDL**: `WithSkipDBInit`, `WithTablePrefix`
+- **Hooks**: `WithAppendEventHook`, `WithGetSessionHook`
+
+## Redis Storage
+
+Suitable for production environments and distributed applications, provides high performance and auto-expiration capabilities. The Redis Session Service internally maintains two storage engines: **HashIdx** (new, default) and **ZSet** (legacy), with smooth migration between them via CompatMode.
+
+### Configuration Options
+
+**Connection Configuration:**
+
 - **`WithRedisClientURL(url string)`**: Create Redis client via URL. Format: `redis://[username:password@]host:port[/database]`.
 - **`WithRedisInstance(instanceName string)`**: Use pre-configured Redis instance. Note: `WithRedisClientURL` has higher priority than `WithRedisInstance`.
+- **`WithExtraOptions(extraOptions ...interface{})`**: Set extra options for Redis client, passed to the underlying client builder.
+
+**Session Configuration:**
+
 - **`WithSessionEventLimit(limit int)`**: Set maximum number of events stored per session. Default is 1000.
-- **`WithSessionTTL(ttl time.Duration)`**: Set TTL for session state and events. Default is 0 (no expiration).
+- **`WithSessionTTL(ttl time.Duration)`**: Set TTL for session state and events. Default is 0 (no expiration). Negative values are treated as 0.
 - **`WithAppStateTTL(ttl time.Duration)`**: Set TTL for application-level state. Default is 0 (no expiration).
 - **`WithUserStateTTL(ttl time.Duration)`**: Set TTL for user-level state. Default is 0 (no expiration).
-- **`WithSummarizer(s summary.SessionSummarizer)`**: Inject session summarizer.
+- **`WithKeyPrefix(prefix string)`**: Set Redis key prefix. All keys will be prefixed with `prefix:`. Default is empty (no prefix). Useful when multiple applications share the same Redis instance.
+- **`WithCompatMode(mode CompatMode)`**: Set storage compatibility mode. Options: `CompatModeNone`, `CompatModeLegacy` (default), `CompatModeTransition`. See [Storage Format & Version Migration](#storage-format-version-migration) below.
+
+**Async Persistence Configuration:**
+
+- **`WithEnableAsyncPersist(enable bool)`**: Enable async persistence. Default is `false`. When enabled, `AppendEvent` and `AppendTrackEvent` write events to internal channels, which are consumed by background workers for Redis persistence, reducing request latency.
+- **`WithAsyncPersisterNum(num int)`**: Number of async persistence workers. Default is 10. Each worker handles one Event channel and one TrackEvent channel, with a channel buffer size of 100.
+
+**Summary Configuration:**
+
+- **`WithSummarizer(s summary.SessionSummarizer)`**: Inject session summarizer. Summary-related operations are no-ops when not set.
 - **`WithAsyncSummaryNum(num int)`**: Set number of summary processing workers. Default is 3.
 - **`WithSummaryQueueSize(size int)`**: Set summary task queue size. Default is 100.
-- **`WithKeyPrefix(prefix string)`**: Set Redis key prefix. All keys will be prefixed with `prefix:`. Default is empty (no prefix).
-- **`WithExtraOptions(extraOptions ...interface{})`**: Set extra options for Redis client.
+- **`WithSummaryJobTimeout(timeout time.Duration)`**: Set timeout for a single summary job. Default is 60 seconds.
+
+**Tracing Configuration:**
+
+- **`WithEnableTracing(enable bool)`**: Enable OpenTelemetry tracing for Redis session operations. Default is `false`. When enabled, operations like `CreateSession`, `GetSession`, `AppendEvent`, `DeleteSession`, `AppendTrackEvent`, `CreateSessionSummary`, and `GetSessionSummaryText` automatically create spans.
+
+> **About Root Span**
+>
+> Session operations are executed by the Runner, occurring before and after the Agent's `Run()` call. The Agent's root span is created inside `agent.Run()`, so Session spans are not automatically attached as children of the Agent span. To see a complete Session span hierarchy in observability platforms like Langfuse, you need to manually create a root span before calling `runner.Run()`:
+>
+> ```go
+> import atrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
+>
+> // Create a root span before runner.Run(), so that session spans
+> // (create_session, get_session, append_event, etc.) become children
+> // of this root span via context propagation.
+> ctx, span := atrace.Tracer.Start(ctx, "my_request")
+> defer span.End()
+>
+> eventChan, err := r.Run(ctx, userID, sessionID, message)
+> ```
+
+**Hook Configuration:**
+
+- **`WithAppendEventHook(hooks ...session.AppendEventHook)`**: Add `AppendEvent` hooks.
+- **`WithGetSessionHook(hooks ...session.GetSessionHook)`**: Add `GetSession` hooks.
+- Hooks are a cross-backend capability shared by all Session backends. See [Advanced Usage - Hook Capabilities](#hook-capabilities-appendget) for details.
 
 ### Basic Configuration Example
 
@@ -570,26 +670,129 @@ sessionService, err := redis.NewService(
     redis.WithSummarizer(summarizer),
     redis.WithAsyncSummaryNum(4),
     redis.WithSummaryQueueSize(200),
+    redis.WithSummaryJobTimeout(120*time.Second),
 )
 ```
 
-### Storage Structure
+### Async Persistence
+
+When async persistence is enabled, `AppendEvent` and `AppendTrackEvent` no longer write to Redis synchronously. Instead, events are dispatched to internal channels and consumed by background worker goroutines. This significantly reduces request latency and is suitable for latency-sensitive scenarios.
+
+```go
+sessionService, err := redis.NewService(
+    redis.WithRedisClientURL("redis://localhost:6379"),
+    redis.WithEnableAsyncPersist(true),
+    redis.WithAsyncPersisterNum(10), // 10 worker goroutines
+)
+```
+
+How it works:
+
+- Each worker goroutine holds one Event channel and one TrackEvent channel (buffer size 100).
+- `AppendEvent` selects a channel via `session.Hash % workerNum`, ensuring ordered writes for the same session.
+- If the channel is full and the context is cancelled, `context.Canceled` error is returned.
+- Async write timeout is 2 seconds (`defaultAsyncPersistTimeout`).
+- Calling `Close()` closes all channels and waits for workers to finish remaining tasks.
+
+> **Caution**
+>
+> In async persistence mode, events still in the channel may be lost if the service process crashes unexpectedly. Evaluate whether to enable this based on your data consistency requirements.
+
+### Storage Format & Version Migration
+
+Redis Session storage has two data storage engines. Each session's storage version is tracked via the `storage_type` field in `ServiceMeta`, enabling operation routing:
+
+| Storage Format | Version | Hash Tag | Characteristics |
+| --- | --- | --- | --- |
+| **ZSet** | Legacy | `{appName}` | All user data concentrated in one Cluster slot; hot spot risk at scale. Simple data structure with full Event JSON stored directly in SortedSet members. |
+| **HashIdx** | **New (default)** | `{userID}` | Per-user distribution eliminates hot spots; separated data and index (Hash for data + ZSet for index); ZSet stores only eventIDs to avoid memory bloat; independent session metadata supports flexible queries. |
+
+> **How to distinguish new vs. legacy mode**
+>
+> - **HashIdx is the new mode**: Session-related keys are prefixed with `hashidx:`, using `{userID}` as the hash tag to distribute data across different Redis Cluster slots by user.
+> - **ZSet is the legacy mode**: Session-related keys use `{appName}` as the hash tag, concentrating all user data for the same app in a single slot.
+> - **AppState is the exception**: `appstate:{appName}` has an identical format in both modes (no `hashidx:` prefix), so AppState is unaffected by storage version migration — zero migration cost.
+> - Newly created sessions use HashIdx storage in `CompatModeLegacy` (default) and `CompatModeNone` modes.
+
+The new version uses **CompatMode** (compatibility mode) to enable smooth migration from the legacy storage format to the new one without downtime.
+
+#### Three Compatibility Modes
+
+| Mode | Session Read Behavior | Session Write Behavior | UserState Behavior | Use Case |
+| --- | --- | --- | --- | --- |
+| `CompatModeTransition` | Pipeline checks both HashIdx and ZSet existence; reads ZSet if it exists, otherwise reads HashIdx | ZSet only | Write: dual-write (HashIdx + ZSet); Read: HashIdx first, fallback to ZSet if empty | Rolling upgrade with mixed old/new version instances |
+| `CompatModeLegacy` **(default)** | Pipeline checks both HashIdx and ZSet existence; reads ZSet if it exists, otherwise reads HashIdx | HashIdx only | Write: HashIdx only; Read: HashIdx first, fallback to ZSet if empty | All instances upgraded, but legacy ZSet data not yet expired |
+| `CompatModeNone` | HashIdx only (no ZSet check) | HashIdx only | Write: HashIdx only; Read: HashIdx only | ZSet data fully expired, pure new storage mode |
+
+#### Migration Steps
 
 ```
-# Application data
-appdata:{appName} -> Hash {key: value}
+Phase 1                      Phase 2                      Phase 3
+CompatModeTransition         CompatModeLegacy (default)   CompatModeNone
+┌─────────────────────┐      ┌─────────────────────┐      ┌────────────────────┐
+│ Mixed old/new nodes │  →   │ All nodes upgraded  │  →   │ ZSet data expired  │
+│ New nodes write ZSet│      │ New sessions: HIdx  │      │ Pure HashIdx mode  │
+│ Same as old nodes   │      │ Old sessions: fbk   │      │ No ZSet overhead   │
+└─────────────────────┘      └─────────────────────┘      └────────────────────┘
+```
 
-# User data
-userdata:{appName}:{userID} -> Hash {key: value}
+**Phase 1: Rolling Upgrade (mixed old/new instances)**
 
-# Session data
-session:{appName}:{userID} -> Hash {sessionID: SessionData(JSON)}
+Use `CompatModeTransition`. New instances behave identically to old instances (session creation goes through ZSet, UserState is dual-written), ensuring full data compatibility during mixed deployment.
 
-# Event records
-events:{appName}:{userID}:{sessionID} -> SortedSet {score: timestamp, value: Event(JSON)}
+```go
+sessionService, err := redis.NewService(
+    redis.WithRedisClientURL("redis://localhost:6379"),
+    redis.WithCompatMode(redis.CompatModeTransition),
+)
+```
 
-# Summary data (optional)
-summary:{appName}:{userID}:{sessionID}:{filterKey} -> String (JSON)
+> **When is Phase 1 needed?**
+>
+> `CompatModeTransition` is only required for **canary/gray releases or mixed-version deployments**. If you can upgrade all instances at once (e.g., full release), you can skip Phase 1 and directly use the default `CompatModeLegacy`.
+
+**UserState Considerations:** The old and new storage formats use **different Redis keys** for UserState (old: `userstate:{appName}:{userID}`, new: `hashidx:userstate:appName:{userID}`). After upgrading, new sessions created via HashIdx will **only read the new key** when merging UserState, and cannot access data in the old key.
+
+- In `CompatModeTransition` mode, `UpdateUserState` **writes to both old and new keys simultaneously**, ensuring both old and new instances can read the data. It is **recommended to re-write UserState via `UpdateUserState` during the Transition phase** to sync data to the new key.
+- Calling the `ListUserStates` API directly in Transition and Legacy modes tries the new key first, automatically falling back to the old key if empty. However, the internal UserState merge during `CreateSession`/`GetSession` does not use this fallback — it only reads the new key.
+- **AppState is unaffected** — the `appstate:{appName}` key format is identical across both storage formats, requiring no extra handling.
+
+**Phase 2: All Instances Upgraded**
+
+After all instances are upgraded, switch to `CompatModeLegacy` (the default — no explicit configuration needed). New sessions use the HashIdx storage format; existing ZSet data remains accessible via fallback reads.
+
+```go
+sessionService, err := redis.NewService(
+    redis.WithRedisClientURL("redis://localhost:6379"),
+    // CompatModeLegacy is the default, can be omitted
+    // redis.WithCompatMode(redis.CompatModeLegacy),
+)
+```
+
+> **Important**
+>
+> This compatibility concern only applies to **multi-node deployments where requests from the same user may be routed to both old and new version Session Service instances**. If you are running a single node, or your routing strategy ensures the same user always hits the same version instance, this limitation does not apply.
+
+**Phase 3: Cleanup Complete**
+
+After ZSet data expires naturally via TTL (or is manually cleaned up if TTL is not set), switch to `CompatModeNone` to fully remove the ZSet compatibility layer for optimal performance.
+
+```go
+sessionService, err := redis.NewService(
+    redis.WithRedisClientURL("redis://localhost:6379"),
+    redis.WithCompatMode(redis.CompatModeNone),
+)
+```
+
+#### Fresh Deployment (No Legacy Data)
+
+For brand new deployments without legacy data, it is recommended to use `CompatModeNone` to skip unnecessary ZSet compatibility logic:
+
+```go
+sessionService, err := redis.NewService(
+    redis.WithRedisClientURL("redis://localhost:6379"),
+    redis.WithCompatMode(redis.CompatModeNone),
+)
 ```
 
 ## PostgreSQL Storage
@@ -1265,7 +1468,7 @@ COMMENT 'User states table';
 - **AppendEventHook**: Intercept/modify/abort events before they are stored. Useful for content safety or auditing (e.g., tagging `violation=<word>`), or short-circuiting persistence. For filterKey usage, see the “Session Summarization / FilterKey with AppendEventHook” section below.
 - **GetSessionHook**: Intercept/modify/filter sessions after they are read. Useful for removing tagged events or dynamically augmenting the returned session state.
 - **Chain-of-responsibility**: Hooks call `next()` to continue; returning early short-circuits later hooks, and errors bubble up.
-- **Backend parity**: Memory, Redis, MySQL, and PostgreSQL share the same hook interface—inject hook slices when constructing the service.
+- **Backend parity**: Memory, SQLite, Redis, MySQL, and PostgreSQL share the same hook interface—inject hook slices when constructing the service.
 - **Example**: See `examples/session/hook` ([code](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/hook))
 
 ### Direct Use of Session Service API
@@ -1287,6 +1490,30 @@ for _, sess := range sessions {
     fmt.Printf("SessionID: %s, Events: %d\n", sess.ID, len(sess.Events))
 }
 ```
+
+```go
+// Fetch session metadata only, without Events or Tracks
+sessions, err := sessionService.ListSessions(ctx, session.UserKey{
+    AppName: "my-agent",
+    UserID:  "user123",
+}, session.WithListSessionOnlyMeta())
+```
+
+```go
+// Fetch the second page of sessions, ordered by UpdatedAt descending
+sessions, err := sessionService.ListSessions(ctx, session.UserKey{
+    AppName: "my-agent",
+    UserID:  "user123",
+}, session.WithListSessionPage(20, 20))
+```
+
+Notes:
+
+- `session.WithListSessionOnlyMeta()` is only for `ListSessions`
+- This optimization is currently supported only by the `inmemory` and `redis` backends
+- `session.WithListSessionPage(offset, limit)` is only for `ListSessions`; `offset` must be `>= 0`, and `limit == 0` means no session-level pagination
+- Session list pagination is independent from `session.WithEventNum()` and `session.WithEventTime()`, which filter events inside each returned session
+- Results are ordered by `UpdatedAt` descending, with session ID used as a deterministic tie-breaker
 
 #### Manually Delete Session
 
@@ -1477,7 +1704,7 @@ As conversations grow longer, maintaining full event history can become memory-i
 
 ### Key Features
 
-- **Automatic summarization**: Automatically trigger summaries based on configurable conditions such as event count, token count, or time threshold.
+- **Automatic summarization**: During summary checks, automatically trigger summaries based on configurable conditions such as event count, token count, or time threshold.
 - **Incremental summarization**: Only new events since the last summary are processed, avoiding redundant computation.
 - **LLM-powered**: Uses any configured LLM model to generate high-quality, context-aware summaries.
 - **Non-destructive**: Original events remain unchanged; summaries are stored separately.
@@ -1578,28 +1805,96 @@ eventChan, err := runner.Run(ctx, userID, sessionID, userMessage)
 
 The framework provides two distinct modes for managing conversation context sent to the LLM:
 
+First, separate the three context-reduction mechanisms:
+
+| Mechanism | Layer | What changes | Typical use |
+| --- | --- | --- | --- |
+| Summary | Session Service + prompt assembly | Uses an LLM to create a persisted historical summary. With `WithAddSessionSummary(true)`, the request injects that summary and appends only incremental events after the summary point | Preserve semantic continuity in long sessions |
+| Context compaction | Agent prompt assembly | Does not call an LLM or drop whole turns; it only rewrites `tool result` content | Clean up large search results, logs, web fetches, and similar tool outputs |
+| Token tailoring | Model provider | Drops or keeps message rounds by token budget immediately before the provider call | Final fallback to keep the request within the context window |
+
+In call order, the agent assembles the prompt, injects summary when
+`WithAddSessionSummary(true)` is enabled, and optionally compacts `tool result`
+content. If summary injection is enabled and the request still approaches the
+context window, the flow may refresh the summary once and rebuild the request.
+Finally, model-layer token tailoring trims the message list. Context compaction
+shrinks tool-output payloads inside messages, token tailoring drops message
+rounds, and summary creates a semantic replacement for historical context.
+
 **Mode 1: With Summary (`WithAddSessionSummary(true)`)**
 
-- The session summary is inserted as a separate system message after the first existing system message (or prepended if no system message exists).
+- The session summary is merged into the existing system message when one is already present, or prepended as a new system message when none exists.
 - **All incremental events** after the summary timestamp are included (no truncation).
 - This ensures complete context: condensed history (summary) + all new conversations since summarization.
 - `WithMaxHistoryRuns` is **ignored** in this mode.
+
+**Context compaction details**
+
+Context compaction is not another name for summary, and it is not token
+tailoring. It only targets `tool result` content, which is the part most likely
+to grow unexpectedly. It does not summarize ordinary user/assistant messages
+with an LLM, and it does not discard complete message rounds the way token
+tailoring may.
+
+> **Naming note**: "compaction" in `WithEnableContextCompaction(true)` means
+> prompt-side tool result compaction/pruning. Semantic summaries are still
+> controlled by `WithAddSessionSummary(true)` and the configured session
+> summarizer.
+
+When `WithEnableContextCompaction(true)` is enabled, the framework applies prompt-side `tool result` compaction before the LLM call, depending on configuration:
+
+- **Pass 0** — Historical tool results whose tool name appears in `ForceCleanToolNames` are replaced with a policy placeholder without requiring them to exceed `ContextCompactionToolResultMaxTokens`; current/recent protection and `KeepToolNames` still apply.
+- **Pass 1** — Historical tool results from older requests that exceed `ContextCompactionToolResultMaxTokens` (default 1024 tokens) are replaced with a placeholder while keeping `ToolID` and `ToolName`.
+- **Pass 2** — Any single tool result (including the current request) exceeding `ContextCompactionOversizedToolResultMaxTokens` is truncated using head+tail preservation with a `[...N characters truncated...]` marker. **Disabled by default (value `0`)** — you must explicitly call `WithContextCompactionOversizedToolResultMaxTokens(...)` and keep `WithEnableContextCompaction(true)` for Pass 2 to fire (recommended opt-in value: 8192 tokens).
+- The recent protected set is exempt from Pass 0 and Pass 1. It includes the current request, the latest `ContextCompactionKeepRecentRequests` completed requests, and the request/invocation units that own the tail events returned by `WithToolResultCompactionConfig(...).SkipRecentFunc`. `SkipRecentFunc` and `ContextCompactionKeepRecentRequests` are additive; set `ContextCompactionKeepRecentRequests` to `0` if the custom recency function should define the boundary by itself. If Pass 2 is opted into, recent/current tool results remain subject to Pass 2 truncation unless kept by tool policy.
+- `WithToolResultCompactionConfig(...)` also supports tool-name policy: `ForceCleanToolNames` forces selected historical tool results to be cleaned after current/recent protection, while `KeepToolNames` preserves selected tool results and has higher priority.
+- When a Pass 1 placeholder or Pass 2 truncation marker is created from an event with an `event_id`, it includes recovery hints such as `event_id`, `tool_call_id`, and `tool_name`; Pass 0 policy placeholders do not include these recovery hints. With `WithEnableOnDemandSession(true)` and a session backend that implements `session.WindowService`, the model can call `session_load` with `content_offset` / `content_limit` to reload a precise slice of the original tool result.
+- Pass 2 skips tool results returned by `session_load` itself. This prevents recovered slices from being silently compacted again; `session_load` output size is controlled by its own window parameters and `content_limit`, so very large results should be reloaded in slices instead of as one full payload.
+- If `WithAddSessionSummary(true)` is also enabled and the rebuilt request still approaches the model context window, the framework performs one synchronous `CreateSessionSummary(...)` retry before calling the model.
+- Model-layer token tailoring remains the final fallback. It trims whole message rounds, so keep recovered slices small enough that they still fit in the final provider request.
+- Context compaction uses `SimpleTokenCounter` by default. For CJK-heavy
+  workloads or provider-specific tokenization, pass the same custom counter
+  used by token tailoring via `WithContextCompactionTokenCounter(...)`.
+
+```go
+counter := model.NewSimpleTokenCounter(model.WithApproxRunesPerToken(1.6))
+
+llmAgent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(summaryModel),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithEnableContextCompaction(true), // only shrinks tool results; does not generate a summary
+    llmagent.WithContextCompactionThresholdRatio(0.7),
+    llmagent.WithContextCompactionToolResultMaxTokens(1024),  // Pass 1: old tool results → placeholder
+    llmagent.WithContextCompactionOversizedToolResultMaxTokens(8192),  // Pass 2: any huge result → head+tail
+    llmagent.WithContextCompactionKeepRecentRequests(1),
+    llmagent.WithContextCompactionTokenCounter(counter),
+    llmagent.WithToolResultCompactionConfig(&llmagent.ToolResultCompactionConfig{
+        ForceCleanToolNames: []string{"shell", "grep"},
+        KeepToolNames:       []string{"session_load", "session_search"},
+        SkipRecentFunc: func(events []event.Event) int {
+            return 3
+        },
+    }),
+)
+```
 
 **Mode 2: Without Summary (`WithAddSessionSummary(false)`)**
 
 - No summary is prepended.
 - Only the **most recent `MaxHistoryRuns` conversation turns** are included.
 - When `MaxHistoryRuns=0` (default), no limit is applied and all history is included.
+- If `WithEnableContextCompaction(true)` is enabled, oversized tool results in older retained requests can still be compacted (Pass 1). If you additionally call `WithContextCompactionOversizedToolResultMaxTokens(8192)` (or another positive value), extremely large tool results in any request will be head+tail truncated (Pass 2). Both passes require the `EnableContextCompaction=true` master switch.
+- The pre-LLM synchronous summary retry is disabled in this mode.
 - Use this mode for short sessions or when you want direct control over context window size.
 
 **Context Construction Details:**
 
-```
+```text
 When AddSessionSummary = true:
 ┌─────────────────────────────────────┐
-│ Existing System Message (optional)  │ ← If present
-├─────────────────────────────────────┤
-│ Session Summary (system message)    │ ← Inserted after first system message
+│ System Prompt                       │ ← Existing system prompt, if present,
+│ (merged with Session Summary)       │    now merged with summary content
 ├─────────────────────────────────────┤
 │ Event 1 (after summary timestamp)   │ ┐
 │ Event 2                             │ │ All incremental
@@ -1622,6 +1917,8 @@ When AddSessionSummary = false:
 **Best Practices:**
 
 - For long-running sessions, use `WithAddSessionSummary(true)` to maintain full context while managing token usage.
+- Enable `WithEnableContextCompaction(true)` when long sessions contain large tool outputs such as search results, logs, or code scans.
+- Pair `WithEnableContextCompaction(true)` with `WithAddSessionSummary(true)` when you also want the pre-LLM synchronous summary retry.
 - For short sessions or when testing, use `WithAddSessionSummary(false)` with appropriate `MaxHistoryRuns`.
 - The Runner automatically enqueues async summary jobs after appending events to the session.
 
@@ -1633,9 +1930,33 @@ Configure the summarizer behavior with the following options:
 
 **Trigger Conditions:**
 
+- **`WithContextThreshold(opts ...ContextThresholdOption)`**: Zero-configuration trigger that dynamically resolves the model's context window at evaluation time. It calculates a token threshold as a fraction of the context window (default 50%), adapting automatically when the user switches models mid-session. This is the recommended option for most use cases, similar to the auto-compact behavior in Codex CLI and Claude Code. Example: `WithContextThreshold()` for zero-config, or `WithContextThreshold(summary.WithContextThresholdRatio(0.6))` for custom ratio.
 - **`WithEventThreshold(eventCount int)`**: Trigger summarization when the number of new events since last summary exceeds the threshold. Example: `WithEventThreshold(20)` triggers when 20+ new events have occurred since last summary.
 - **`WithTokenThreshold(tokenCount int)`**: Trigger summarization when the new token count since last summary exceeds the threshold. Example: `WithTokenThreshold(4000)` triggers when 4000+ new tokens have been added since last summary.
-- **`WithTimeThreshold(interval time.Duration)`**: Trigger summarization when time elapsed since the last event exceeds the interval. Example: `WithTimeThreshold(5*time.Minute)` triggers after 5 minutes of inactivity.
+- **`WithTimeThreshold(interval time.Duration)`**: In the Runner path, trigger when the idle gap before the current top-level request exceeds the interval. The request-arrival time is captured once, so model latency and async queue delay do not count toward the gap. This is not a background timer: `WithTimeThreshold(5*time.Minute)` is evaluated when the next request causes a summary check. Direct calls without a Runner request observation retain the legacy last-event-age behavior.
+
+> **Context Window Configuration**
+>
+> `WithContextThreshold` and Token Tailoring both need a model context window. Built-in model names are resolved automatically. For private deployments, fine-tuned variants, tenant-provided models, or endpoint IDs, prefer model-instance or per-run configuration so different users do not overwrite a process-wide registry entry:
+>
+> ```go
+> modelInstance := openai.New(
+>     "my-custom-model",
+>     openai.WithContextWindow(32768),
+> )
+>
+> eventChan, err := r.Run(
+>     ctx,
+>     userID,
+>     sessionID,
+>     userMessage,
+>     agent.WithModelContextWindow(32768),
+> )
+> ```
+>
+> Use `model.RegisterModelContextWindow` or `model.RegisterModelContextWindows` only when the model names have stable process-wide meanings.
+>
+> Model names are matched case-insensitively, and the registry also supports prefix matching (e.g., registering `"my-model"` will match `"my-model-v2"`).
 
 **Composite Conditions:**
 
@@ -1659,7 +1980,8 @@ Configure the summarizer behavior with the following options:
 **Summary Generation:**
 
 - **`WithMaxSummaryWords(maxWords int)`**: Limit the summary to a maximum word count. The limit is included in the prompt to guide the model's generation. Example: `WithMaxSummaryWords(150)` requests summaries within 150 words.
-- **`WithPrompt(prompt string)`**: Provide a custom summarization prompt. The prompt must include the placeholder `{conversation_text}`, which will be replaced with the conversation content. Optionally include `{max_summary_words}` for word limit instructions.
+- **`WithPrompt(prompt string)`**: Provide a custom summarization prompt. The prompt must include `{conversation_text}` and may include `{previous_summary}` to place the previous rolling summary separately from newly uncovered conversation events. When `WithMaxSummaryWords(...)` is set, include `{max_summary_words}` in either `WithPrompt(...)` or `WithSystemPrompt(...)`.
+- **`WithSystemPrompt(prompt string)`**: Add a dedicated system message for summarization instructions. It must not include `{conversation_text}` or `{previous_summary}`; keep the conversation content in `WithPrompt(...)` so the system message remains instruction-only.
 - **`WithSkipRecent(skipFunc SkipRecentFunc)`**: Skip the _most recent_ events during summarization using a custom function. The function receives all events and returns how many tail events to skip. Return 0 to skip none. Useful for avoiding summarizing very recent/incomplete conversations, or applying time/content-based skipping strategies.
 
 #### Token Counter Configuration
@@ -1795,6 +2117,41 @@ summarizer := summary.NewSummarizer(
     summaryModel,
     summary.WithPrompt(customPrompt), // Custom Prompt
     summary.WithMaxSummaryWords(100), // Inject into {max_summary_words}
+    summary.WithEventThreshold(15),
+)
+
+// Optionally position the previous rolling summary separately.
+incrementalPrompt := `<previous_summary>
+{previous_summary}
+</previous_summary>
+
+<new_conversation>
+{conversation_text}
+</new_conversation>
+
+Updated summary:`
+
+summarizer = summary.NewSummarizer(
+    summaryModel,
+    summary.WithPrompt(incrementalPrompt),
+)
+
+// Split instructions into a dedicated system message
+systemPrompt := `Summarize faithfully.
+Focus on decisions and action items.
+Keep it within {max_summary_words} words.`
+
+userPrompt := `<conversation>
+{conversation_text}
+</conversation>
+
+Summary:`
+
+summarizer = summary.NewSummarizer(
+    summaryModel,
+    summary.WithSystemPrompt(systemPrompt),
+    summary.WithPrompt(userPrompt),
+    summary.WithMaxSummaryWords(100),
     summary.WithEventThreshold(15),
 )
 
@@ -1953,7 +2310,7 @@ The `GetSessionSummaryText` method supports an optional `WithSummaryFilterKey` o
 
 2. **Delta Summarization**: New events are combined with the previous summary (prepended as a system event) to generate an updated summary that incorporates both old context and new information.
 
-3. **Trigger Evaluation**: Before generating a summary, the summarizer evaluates configured trigger conditions (based on incremental event count, token count, and time threshold since last summary). If conditions aren't met and `force=false`, summarization is skipped.
+3. **Trigger Evaluation**: Before generating a summary, the summarizer evaluates configured trigger conditions. Event and token checks use the incremental input. In the Runner path, time checks use the idle gap between the current top-level request's arrival and the previous relevant event in the checked scope; direct calls without a Runner observation retain the last-event-age fallback. If conditions aren't met and `force=false`, summarization is skipped.
 
 4. **Async Workers**: Summary jobs are distributed across multiple worker goroutines using hash-based distribution. This ensures jobs for the same session are processed sequentially while different sessions can be processed in parallel.
 
@@ -2040,12 +2397,51 @@ evt.FilterKey = "user-messages"
 
 **Technical Details:** The framework uses prefix matching (`strings.HasPrefix`) to determine which events should be included in the context. See `ContentRequestProcessor` filtering logic for details.
 
+#### Restricting Summary Targets
+
+By default, when a non-empty branch `FilterKey` triggers summarization, the session service refreshes both that branch summary and the full-session summary (`SummaryFilterKeyAllContents`). If some branches do not need summaries, you can reduce LLM usage with an allowlist and optionally disable the full-session cascade:
+
+```go
+sessionService := inmemory.NewSessionService(
+    inmemory.WithSummarizer(summarizer),
+    inmemory.WithSummaryFilterAllowlist(
+        "my-app/user-messages",
+        "my-app/tool-calls",
+    ),
+    inmemory.WithCascadeFullSessionSummary(false),
+)
+```
+
+- `WithSummaryFilterAllowlist(...)` only controls non-empty branch summary targets. It does not block `session.SummaryFilterKeyAllContents`.
+- `WithCascadeFullSessionSummary(...)` controls whether a non-empty branch trigger also refreshes the full-session summary.
+- To keep only full-session summaries from branch-triggered automatic summary, pass an explicit empty allowlist and leave cascade enabled:
+
+```go
+sessionService, err := mysql.NewService(
+    mysql.WithMySQLClientDSN(dsn),
+    mysql.WithSummarizer(summarizer),
+    mysql.WithSummaryFilterAllowlist(""),
+)
+```
+
+- `mysql.WithSummaryFilterAllowlist("")` and `mysql.WithSummaryFilterAllowlist()` both mean "no branch keys are allowed"; with the default cascade behavior, the full-session summary still refreshes.
+- If you also set `mysql.WithCascadeFullSessionSummary(false)`, non-empty branch triggers have no summary target and no summary is generated.
+- Allowlist matching is hierarchical and segment-aware, not a raw string prefix check. Internally the framework appends the filter-key delimiter (`"/"`) to both sides and then checks whether either key is an ancestor/descendant of the other.
+- Examples:
+  - Allowing `my-app/tool` matches `my-app/tool` and `my-app/tool/search`.
+  - Allowing `my-app/tool/search` also matches `my-app/tool`.
+  - Allowing `my-app/tool` does not match `my-app/toolbox`.
+  - Allowing `my-app/tool` does not match `other-app/tool`.
+- `session.SummaryFilterKeyAllContents` remains available for direct full-session summaries even when an allowlist is configured.
+- Leaving the allowlist unset preserves the legacy behavior and allows every branch `FilterKey` to trigger summaries.
+- Passing an explicit empty allowlist blocks branch summary targets; with cascade enabled, branch triggers still refresh the full-session summary.
+
 #### Complete Examples
 
 See the following examples for complete FilterKey usage scenarios:
 
 - [examples/session/hook](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/hook) - Hook basics
-- [examples/summary/filterkey](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/summary/filterkey) - Summarizing by FilterKey
+- [examples/summary/filterkey](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/summary/filterkey) - Summarizing by FilterKey, allowlists, and full-session cascade control
 
 ### Performance Considerations
 
@@ -2086,7 +2482,7 @@ func main() {
         summary.WithChecksAny(
             summary.CheckEventThreshold(20),
             summary.CheckTokenThreshold(4000),
-            summary.CheckTimeThreshold(5*time.Minute),
+            summary.CheckTimeThreshold(5*time.Minute), // Runner path: trigger when the idle gap before the next request exceeds 5 minutes
         ),
     )
 

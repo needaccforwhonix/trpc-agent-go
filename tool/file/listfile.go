@@ -12,6 +12,7 @@ package file
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,10 +27,10 @@ import (
 // listFileRequest represents the input for the list file operation.
 type listFileRequest struct {
 	// Path is a relative directory under base_directory.
-	Path string `json:"path"`
+	Path string `json:"path" jsonschema:"description=Relative directory path under base_directory or workspace:// directory ref; empty means the base directory"`
 
 	// WithSize returns the size of the files.
-	WithSize bool `json:"with_size"`
+	WithSize bool `json:"with_size" jsonschema:"description=Whether to include file sizes in files_with_size"`
 }
 
 // listFileResponse represents the output from the list file operation.
@@ -55,8 +56,13 @@ func (f *fileToolSet) listFile(
 ) (*listFileResponse, error) {
 	rsp := &listFileResponse{
 		BaseDirectory: f.baseDir,
-		Path:          req.Path,
 	}
+	if req == nil {
+		err := errors.New("request cannot be nil")
+		rsp.Message = "Error: " + err.Error()
+		return rsp, err
+	}
+	rsp.Path = req.Path
 
 	ref, err := fileref.Parse(req.Path)
 	if err != nil {
@@ -65,7 +71,7 @@ func (f *fileToolSet) listFile(
 	}
 	if ref.Scheme == fileref.SchemeArtifact {
 		rsp.Message = "Error: listing artifact:// is not supported"
-		return rsp, fmt.Errorf("listing artifact:// is not supported")
+		return rsp, errors.New("listing artifact:// is not supported")
 	}
 	if ref.Scheme == fileref.SchemeWorkspace {
 		rsp.Path = fileref.WorkspaceRef(ref.Path)

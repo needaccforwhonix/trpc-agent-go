@@ -10,7 +10,6 @@
 package openai
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -197,11 +196,76 @@ func (m *Model) generateBatchJSONL(requests []*BatchRequestInput) ([]byte, error
 		if r.Body.Model == "" {
 			r.Body.Model = m.name
 		}
-		if err := enc.Encode(r); err != nil {
+		payload := m.batchRequestPayload(r)
+		if err := enc.Encode(payload); err != nil {
 			return nil, fmt.Errorf("failed to encode jsonl line: %w", err)
 		}
 	}
 	return buf.Bytes(), nil
+}
+
+func (m *Model) batchRequestPayload(
+	r *BatchRequestInput,
+) batchRequestPayload {
+	messages := make([]batchMessagePayload, len(r.Body.Messages))
+	for i, msg := range r.Body.Messages {
+		messages[i] = m.newBatchMessagePayload(msg)
+	}
+
+	return batchRequestPayload{
+		CustomID: r.CustomID,
+		Method:   r.Method,
+		URL:      r.URL,
+		Body: batchRequestBodyPayload{
+			Messages:         messages,
+			GenerationConfig: r.Body.GenerationConfig,
+			StructuredOutput: r.Body.StructuredOutput,
+			Model:            r.Body.Model,
+		},
+	}
+}
+
+func (m *Model) newBatchMessagePayload(
+	msg model.Message,
+) batchMessagePayload {
+	payload := batchMessagePayload{
+		Role:         msg.Role,
+		Content:      msg.Content,
+		ContentParts: msg.ContentParts,
+		ToolID:       msg.ToolID,
+		ToolName:     msg.ToolName,
+		ToolCalls:    msg.ToolCalls,
+	}
+	if msg.ReasoningContent != "" ||
+		m.shouldBackfillReasoningContent(msg) {
+		reasoningContent := msg.ReasoningContent
+		payload.ReasoningContent = &reasoningContent
+	}
+	return payload
+}
+
+type batchRequestPayload struct {
+	CustomID string                  `json:"custom_id"`
+	Method   string                  `json:"method"`
+	URL      string                  `json:"url"`
+	Body     batchRequestBodyPayload `json:"body"`
+}
+
+type batchRequestBodyPayload struct {
+	Messages         []batchMessagePayload   `json:"messages"`
+	GenerationConfig model.GenerationConfig  `json:"generation_config,omitempty"`
+	StructuredOutput *model.StructuredOutput `json:"structured_output,omitempty"`
+	Model            string                  `json:"model"`
+}
+
+type batchMessagePayload struct {
+	Role             model.Role          `json:"role"`
+	Content          string              `json:"content,omitempty"`
+	ContentParts     []model.ContentPart `json:"content_parts,omitempty"`
+	ToolID           string              `json:"tool_id,omitempty"`
+	ToolName         string              `json:"tool_name,omitempty"`
+	ToolCalls        []model.ToolCall    `json:"tool_calls,omitempty"`
+	ReasoningContent *string             `json:"reasoning_content,omitempty"`
 }
 
 // RetrieveBatch retrieves a batch job by ID.
@@ -295,26 +359,28 @@ type BatchResponse struct {
 
 // ParseBatchOutput parses output JSONL into OpenAI-aligned structures.
 func (m *Model) ParseBatchOutput(text string) ([]BatchRequestOutput, error) {
-	scanner := bufio.NewScanner(strings.NewReader(text))
-	// Pre-allocate with reasonable default capacity to avoid frequent reallocations.
+	// Split on newlines directly. bufio.Scanner rejects tokens larger than
+	// 64KiB by default, and a batch output line contains a full ChatCompletion
+	// JSON object that routinely exceeds that limit.
 	var entries []BatchRequestOutput
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for remaining := text; remaining != ""; {
+		line, rest, found := strings.Cut(remaining, "\n")
+		if found {
+			remaining = rest
+		} else {
+			remaining = ""
+		}
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		// Unmarshal the line into a BatchRequestOutput.
 		var out BatchRequestOutput
 		if err := json.Unmarshal([]byte(line), &out); err != nil {
 			return nil, fmt.Errorf("failed to parse jsonl line: %w", err)
 		}
-		// Store the original line for debugging purposes.
-		out.RawLine = line
-		// Append the entry to the slice.
+		// Clone so a retained entry does not pin the entire JSONL input.
+		out.RawLine = strings.Clone(line)
 		entries = append(entries, out)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to scan jsonl: %w", err)
 	}
 	return entries, nil
 }

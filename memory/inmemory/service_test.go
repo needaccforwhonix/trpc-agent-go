@@ -56,6 +56,45 @@ func TestMemoryService_AddMemory(t *testing.T) {
 	assert.Len(t, memories[0].Memory.Topics, 2, "Expected 2 topics")
 }
 
+func TestMemoryService_AddMemory_DifferentEpisodeMetadataGetsDifferentIDs(t *testing.T) {
+	service := NewMemoryService()
+	ctx := context.Background()
+	userKey := memory.UserKey{
+		AppName: "test-app",
+		UserID:  "test-user",
+	}
+	day1 := time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC)
+	day2 := time.Date(2024, 5, 2, 0, 0, 0, 0, time.UTC)
+
+	require.NoError(t, service.AddMemory(
+		ctx,
+		userKey,
+		"User met Alice",
+		nil,
+		memory.WithMetadata(&memory.Metadata{
+			Kind:         memory.KindEpisode,
+			EventTime:    &day1,
+			Participants: []string{"Alice"},
+		}),
+	))
+	require.NoError(t, service.AddMemory(
+		ctx,
+		userKey,
+		"User met Alice",
+		nil,
+		memory.WithMetadata(&memory.Metadata{
+			Kind:         memory.KindEpisode,
+			EventTime:    &day2,
+			Participants: []string{"Alice"},
+		}),
+	))
+
+	memories, err := service.ReadMemories(ctx, userKey, 10)
+	require.NoError(t, err)
+	require.Len(t, memories, 2)
+	assert.NotEqual(t, memories[0].ID, memories[1].ID)
+}
+
 func TestMemoryService_UpdateMemory(t *testing.T) {
 	service := NewMemoryService()
 	ctx := context.Background()
@@ -85,6 +124,173 @@ func TestMemoryService_UpdateMemory(t *testing.T) {
 	require.NoError(t, err, "ReadMemories failed")
 
 	assert.Equal(t, "updated memory", memories[0].Memory.Memory, "Expected updated memory content")
+}
+
+func TestMemoryService_UpdateMemory_RotatesIDAndReturnsResult(t *testing.T) {
+	service := NewMemoryService()
+	ctx := context.Background()
+	userKey := memory.UserKey{
+		AppName: "test-app",
+		UserID:  "test-user",
+	}
+
+	require.NoError(t, service.AddMemory(ctx, userKey, "first memory", nil))
+	memories, err := service.ReadMemories(ctx, userKey, 1)
+	require.NoError(t, err)
+	require.Len(t, memories, 1)
+
+	oldID := memories[0].ID
+	result := &memory.UpdateResult{}
+	memKey := memory.Key{
+		AppName:  userKey.AppName,
+		UserID:   userKey.UserID,
+		MemoryID: oldID,
+	}
+	require.NoError(t, service.UpdateMemory(
+		ctx,
+		memKey,
+		"updated memory",
+		[]string{"updated"},
+		memory.WithUpdateResult(result),
+	))
+
+	assert.NotEmpty(t, result.MemoryID)
+	assert.NotEqual(t, oldID, result.MemoryID)
+
+	memories, err = service.ReadMemories(ctx, userKey, 10)
+	require.NoError(t, err)
+	require.Len(t, memories, 1)
+	assert.Equal(t, result.MemoryID, memories[0].ID)
+	assert.Equal(t, memory.KindFact, memories[0].Memory.Kind)
+}
+
+func TestMemoryService_UpdateMemory_SameIDUpdatesInPlace(t *testing.T) {
+	service := NewMemoryService()
+	ctx := context.Background()
+	userKey := memory.UserKey{
+		AppName: "test-app",
+		UserID:  "test-user",
+	}
+
+	require.NoError(t, service.AddMemory(ctx, userKey, "same content", []string{"old"}))
+	entries, err := service.ReadMemories(ctx, userKey, 1)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	oldID := entries[0].ID
+
+	result := &memory.UpdateResult{}
+	require.NoError(t, service.UpdateMemory(
+		ctx,
+		memory.Key{
+			AppName:  userKey.AppName,
+			UserID:   userKey.UserID,
+			MemoryID: oldID,
+		},
+		"same content",
+		[]string{"new"},
+		memory.WithUpdateResult(result),
+	))
+	require.Equal(t, oldID, result.MemoryID)
+
+	entries, err = service.ReadMemories(ctx, userKey, 1)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, oldID, entries[0].ID)
+	require.Equal(t, []string{"new"}, entries[0].Memory.Topics)
+}
+
+func TestMemoryService_UpdateMemory_ActiveIDConflictPreservesEntries(t *testing.T) {
+	service := NewMemoryService()
+	ctx := context.Background()
+	userKey := memory.UserKey{
+		AppName: "test-app",
+		UserID:  "test-user",
+	}
+
+	require.NoError(t, service.AddMemory(ctx, userKey, "source", []string{"source"}))
+	require.NoError(t, service.AddMemory(ctx, userKey, "target", []string{"target"}))
+
+	entries, err := service.ReadMemories(ctx, userKey, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	var sourceID string
+	for _, entry := range entries {
+		if entry.Memory.Memory == "source" {
+			sourceID = entry.ID
+		}
+	}
+	require.NotEmpty(t, sourceID)
+
+	result := &memory.UpdateResult{MemoryID: "unchanged"}
+	err = service.UpdateMemory(
+		ctx,
+		memory.Key{
+			AppName:  userKey.AppName,
+			UserID:   userKey.UserID,
+			MemoryID: sourceID,
+		},
+		"target",
+		[]string{"target"},
+		memory.WithUpdateResult(result),
+	)
+	require.Error(t, err)
+	require.Equal(t, "unchanged", result.MemoryID)
+
+	entries, err = service.ReadMemories(ctx, userKey, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	entriesByID := make(map[string]*memory.Entry, len(entries))
+	for _, entry := range entries {
+		entriesByID[entry.ID] = entry
+	}
+	require.Len(t, entriesByID, 2)
+	require.Contains(t, entriesByID, sourceID)
+	require.Equal(t, "source", entriesByID[sourceID].Memory.Memory)
+	require.Equal(t, []string{"source"}, entriesByID[sourceID].Memory.Topics)
+}
+
+func TestMemoryService_UpdateMemory_PreservesMetadataWhenNotProvided(t *testing.T) {
+	service := NewMemoryService()
+	ctx := context.Background()
+	userKey := memory.UserKey{
+		AppName: "test-app",
+		UserID:  "test-user",
+	}
+	eventTime := time.Date(2024, 5, 7, 0, 0, 0, 0, time.UTC)
+
+	require.NoError(t, service.AddMemory(
+		ctx,
+		userKey,
+		"first memory",
+		nil,
+		memory.WithMetadata(&memory.Metadata{
+			Kind:         memory.KindEpisode,
+			EventTime:    &eventTime,
+			Participants: []string{"Alice"},
+			Location:     "Kyoto",
+		}),
+	))
+
+	memories, err := service.ReadMemories(ctx, userKey, 1)
+	require.NoError(t, err)
+	memKey := memory.Key{
+		AppName:  userKey.AppName,
+		UserID:   userKey.UserID,
+		MemoryID: memories[0].ID,
+	}
+
+	require.NoError(t, service.UpdateMemory(ctx, memKey, "updated memory", []string{"updated"}))
+
+	memories, err = service.ReadMemories(ctx, userKey, 1)
+	require.NoError(t, err)
+	require.Len(t, memories, 1)
+	assert.Equal(t, memory.KindEpisode, memories[0].Memory.Kind)
+	require.NotNil(t, memories[0].Memory.EventTime)
+	assert.Equal(t, eventTime, *memories[0].Memory.EventTime)
+	assert.Equal(t, []string{"Alice"}, memories[0].Memory.Participants)
+	assert.Equal(t, "Kyoto", memories[0].Memory.Location)
 }
 
 func TestMemoryService_DeleteMemory(t *testing.T) {
@@ -172,6 +378,105 @@ func TestMemoryService_SearchMemories(t *testing.T) {
 	assert.Len(t, results, 0, "Expected 0 results for 'nonexistent' search")
 }
 
+func TestMemoryService_SearchMemories_RanksAndLimitsByDefault(t *testing.T) {
+	service := NewMemoryService()
+	ctx := context.Background()
+	userKey := memory.UserKey{
+		AppName: "test-app",
+		UserID:  "test-user",
+	}
+
+	app := service.getAppMemories(userKey.AppName)
+	app.memories[userKey.UserID] = make(map[string]*memory.Entry)
+
+	base := time.Now().UTC()
+	app.memories[userKey.UserID]["best"] = &memory.Entry{
+		ID:        "best",
+		AppName:   userKey.AppName,
+		UserID:    userKey.UserID,
+		CreatedAt: base.Add(-20 * time.Minute),
+		UpdatedAt: base.Add(-20 * time.Minute),
+		Memory: &memory.Memory{
+			Memory:      "User likes coffee and tea",
+			LastUpdated: ptrTime(base.Add(-20 * time.Minute)),
+		},
+	}
+
+	for i := 0; i < 10; i++ {
+		ts := base.Add(time.Duration(i) * time.Minute)
+		id := fmt.Sprintf("partial-%02d", i)
+		app.memories[userKey.UserID][id] = &memory.Entry{
+			ID:        id,
+			AppName:   userKey.AppName,
+			UserID:    userKey.UserID,
+			CreatedAt: ts,
+			UpdatedAt: ts,
+			Memory: &memory.Memory{
+				Memory:      "User likes coffee",
+				LastUpdated: ptrTime(ts),
+			},
+		}
+	}
+
+	results, err := service.SearchMemories(ctx, userKey, "coffee tea")
+	require.NoError(t, err, "SearchMemories failed")
+	require.Len(t, results, 10)
+	assert.Equal(t, "best", results[0].ID)
+	assert.Equal(t, "partial-09", results[1].ID)
+	assert.Equal(t, "partial-01", results[9].ID)
+}
+
+func TestMemoryService_SearchMemories_CustomSearchOptions(t *testing.T) {
+	service := NewMemoryService(
+		WithMinSearchScore(0),
+		WithMaxResults(0),
+	)
+	ctx := context.Background()
+	userKey := memory.UserKey{
+		AppName: "test-app",
+		UserID:  "test-user",
+	}
+
+	app := service.getAppMemories(userKey.AppName)
+	app.memories[userKey.UserID] = make(map[string]*memory.Entry)
+
+	base := time.Now().UTC()
+	app.memories[userKey.UserID]["best"] = &memory.Entry{
+		ID:        "best",
+		AppName:   userKey.AppName,
+		UserID:    userKey.UserID,
+		CreatedAt: base.Add(-20 * time.Minute),
+		UpdatedAt: base.Add(-20 * time.Minute),
+		Memory: &memory.Memory{
+			Memory:      "User likes coffee and tea",
+			LastUpdated: ptrTime(base.Add(-20 * time.Minute)),
+		},
+	}
+
+	for i := 0; i < 10; i++ {
+		ts := base.Add(time.Duration(i) * time.Minute)
+		id := fmt.Sprintf("partial-%02d", i)
+		app.memories[userKey.UserID][id] = &memory.Entry{
+			ID:        id,
+			AppName:   userKey.AppName,
+			UserID:    userKey.UserID,
+			CreatedAt: ts,
+			UpdatedAt: ts,
+			Memory: &memory.Memory{
+				Memory:      "User likes coffee",
+				LastUpdated: ptrTime(ts),
+			},
+		}
+	}
+
+	results, err := service.SearchMemories(ctx, userKey, "coffee tea")
+	require.NoError(t, err, "SearchMemories failed")
+	require.Len(t, results, 11)
+	assert.Equal(t, "best", results[0].ID)
+	assert.Equal(t, "partial-09", results[1].ID)
+	assert.Equal(t, "partial-00", results[10].ID)
+}
+
 func TestMemoryService_ReadMemoriesWithLimit(t *testing.T) {
 	service := NewMemoryService()
 	ctx := context.Background()
@@ -194,6 +499,10 @@ func TestMemoryService_ReadMemoriesWithLimit(t *testing.T) {
 	memories, err = service.ReadMemories(ctx, userKey, 0)
 	require.NoError(t, err, "ReadMemories failed")
 	assert.Len(t, memories, 5, "Expected 5 memories without limit")
+}
+
+func ptrTime(t time.Time) *time.Time {
+	return &t
 }
 
 func TestMemoryService_Concurrency(t *testing.T) {
@@ -541,6 +850,7 @@ func TestSearchMemories_NilUser(t *testing.T) {
 
 // mockExtractor is a mock implementation of extractor.MemoryExtractor.
 type mockExtractor struct {
+	mu            sync.RWMutex
 	extractCalled bool
 }
 
@@ -549,8 +859,16 @@ func (m *mockExtractor) Extract(
 	messages []model.Message,
 	existing []*memory.Entry,
 ) ([]*extractor.Operation, error) {
+	m.mu.Lock()
 	m.extractCalled = true
+	m.mu.Unlock()
 	return nil, nil
+}
+
+func (m *mockExtractor) wasExtractCalled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.extractCalled
 }
 
 func (m *mockExtractor) ShouldExtract(ctx *extractor.ExtractionContext) bool {
@@ -611,6 +929,16 @@ func TestWithMemoryJobTimeout(t *testing.T) {
 	assert.Equal(t, time.Minute, service.opts.memoryJobTimeout)
 }
 
+func TestWithDisableAutoMemoryOnExternalContext(t *testing.T) {
+	service := NewMemoryService(WithDisableAutoMemoryOnExternalContext(true))
+	require.NotNil(t, service)
+	assert.True(t, service.opts.disableAutoMemoryOnExternalContext)
+
+	service = NewMemoryService(WithDisableAutoMemoryOnExternalContext(false))
+	require.NotNil(t, service)
+	assert.False(t, service.opts.disableAutoMemoryOnExternalContext)
+}
+
 func TestEnqueueAutoMemoryJob_NoExtractor(t *testing.T) {
 	service := NewMemoryService()
 	ctx := context.Background()
@@ -644,9 +972,39 @@ func TestEnqueueAutoMemoryJob_WithExtractor(t *testing.T) {
 	err := service.EnqueueAutoMemoryJob(ctx, sess)
 	assert.NoError(t, err)
 
-	// Wait for async processing.
-	time.Sleep(50 * time.Millisecond)
-	assert.True(t, ext.extractCalled)
+	require.Eventually(
+		t,
+		ext.wasExtractCalled,
+		time.Second,
+		time.Millisecond,
+		"extractor was not called",
+	)
+}
+
+func TestEnqueueAutoMemoryJob_DisableOnExternalContext(t *testing.T) {
+	ext := &mockExtractor{}
+	service := NewMemoryService(
+		WithExtractor(ext),
+		WithDisableAutoMemoryOnExternalContext(true),
+	)
+	defer service.Close()
+
+	ctx := context.Background()
+	sess := session.NewSession("test-app", "test-user", "test-session")
+	sess.SetState(memory.SessionStateKeyMemoryMode, []byte(memory.MemoryModePolluted))
+	sess.Events = []event.Event{
+		{
+			Timestamp: time.Now(),
+			Response: &model.Response{
+				Choices: []model.Choice{{Message: model.NewUserMessage("hello")}},
+			},
+		},
+	}
+
+	err := service.EnqueueAutoMemoryJob(ctx, sess)
+	require.NoError(t, err)
+
+	assert.False(t, ext.wasExtractCalled())
 }
 
 func TestClose(t *testing.T) {
@@ -698,6 +1056,118 @@ func TestTools_AutoMemoryMode(t *testing.T) {
 	assert.False(t, toolNames[memory.ClearToolName], "Clear tool should not be exposed via Tools()")
 }
 
+func TestTools_AutoMemoryMode_WithAutoMemoryExposedTools(t *testing.T) {
+	ext := &mockExtractor{}
+
+	service := NewMemoryService(
+		WithExtractor(ext),
+		WithAutoMemoryExposedTools(memory.AddToolName),
+	)
+	defer service.Close()
+
+	tools := service.Tools()
+	toolNames := make(map[string]bool)
+	for _, tool := range tools {
+		toolNames[tool.Declaration().Name] = true
+	}
+
+	assert.Len(t, tools, 2, "Auto mode should expose Search and Add when Add is explicitly exposed")
+	assert.True(t, toolNames[memory.SearchToolName], "Search should remain exposed by default")
+	assert.True(t, toolNames[memory.AddToolName], "Add should be exposed when explicitly requested")
+}
+
+func TestTools_AutoMemoryMode_WithCustomToolPreservesExplicitEnablement(t *testing.T) {
+	ext := &mockExtractor{}
+
+	service := NewMemoryService(
+		WithExtractor(ext),
+		WithCustomTool(memory.LoadToolName, func() tool.Tool {
+			return &mockTool{name: memory.LoadToolName}
+		}),
+	)
+	defer service.Close()
+
+	toolNames := make(map[string]bool)
+	for _, memoryTool := range service.Tools() {
+		toolNames[memoryTool.Declaration().Name] = true
+	}
+
+	assert.True(t, toolNames[memory.SearchToolName], "Search should remain exposed by default")
+	assert.True(t, toolNames[memory.LoadToolName], "Custom load tool should stay enabled in auto mode")
+
+	service2 := NewMemoryService(
+		WithExtractor(ext),
+		WithCustomTool(memory.ClearToolName, func() tool.Tool {
+			return &mockTool{name: memory.ClearToolName}
+		}),
+		WithAutoMemoryExposedTools(memory.ClearToolName),
+	)
+	defer service2.Close()
+
+	toolNames = make(map[string]bool)
+	for _, memoryTool := range service2.Tools() {
+		toolNames[memoryTool.Declaration().Name] = true
+	}
+
+	assert.True(t, toolNames[memory.ClearToolName], "Custom clear tool should stay enabled when explicitly exposed")
+}
+
+func TestOptions_WithToolEnabledAndToolExposed(t *testing.T) {
+	opts := defaultOptions.clone()
+
+	WithToolEnabled(memory.LoadToolName, true)(&opts)
+	_, ok := opts.enabledTools[memory.LoadToolName]
+	require.True(t, ok)
+	_, ok = opts.userExplicitlySet[memory.LoadToolName]
+	require.True(t, ok)
+
+	WithAutoMemoryExposedTools(memory.AddToolName)(&opts)
+	_, ok = opts.toolExposed[memory.AddToolName]
+	require.True(t, ok)
+	_, ok = opts.toolHidden[memory.AddToolName]
+	require.False(t, ok)
+
+	WithToolExposed(memory.AddToolName, false)(&opts)
+	_, ok = opts.toolExposed[memory.AddToolName]
+	require.False(t, ok)
+	_, ok = opts.toolHidden[memory.AddToolName]
+	require.True(t, ok)
+
+	WithAutoMemoryExposedTools("invalid_tool_name")(&opts)
+	_, ok = opts.toolExposed["invalid_tool_name"]
+	require.False(t, ok)
+
+	service := NewMemoryService(
+		WithExtractor(&mockExtractor{}),
+		WithAutoMemoryExposedTools(memory.AddToolName),
+		WithToolExposed(memory.AddToolName, false),
+		WithAutoMemoryExposedTools("invalid_tool_name"),
+	)
+	defer service.Close()
+
+	toolNames := make(map[string]bool)
+	for _, memoryTool := range service.Tools() {
+		toolNames[memoryTool.Declaration().Name] = true
+	}
+
+	assert.True(t, toolNames[memory.SearchToolName], "Search should remain exposed by default")
+	assert.False(t, toolNames[memory.AddToolName], "Add should be hidden after WithToolExposed(false)")
+	assert.False(t, toolNames["invalid_tool_name"], "Invalid tool names should never appear in Tools()")
+}
+
+func TestOptions_WithToolEnabled_ZeroValueOpts(t *testing.T) {
+	var opts serviceOpts
+
+	require.NotPanics(t, func() {
+		WithToolEnabled(memory.LoadToolName, true)(&opts)
+	})
+
+	_, ok := opts.enabledTools[memory.LoadToolName]
+	require.True(t, ok)
+	_, ok = opts.userExplicitlySet[memory.LoadToolName]
+	require.True(t, ok)
+}
+
 func TestTools_AutoMemoryMode_OptionOrder(t *testing.T) {
 	ext := &mockExtractor{}
 
@@ -742,6 +1212,34 @@ func TestTools_AutoMemoryMode_OptionOrder(t *testing.T) {
 
 	tools3 := service3.Tools()
 	assert.Len(t, tools3, 0, "No tools should be returned when Search is disabled")
+
+	// Test: WithAutoMemoryExposedTools BEFORE WithExtractor should still work.
+	service4 := NewMemoryService(
+		WithAutoMemoryExposedTools(memory.AddToolName),
+		WithExtractor(ext),
+	)
+	defer service4.Close()
+
+	tools4 := service4.Tools()
+	toolNames4 := make(map[string]bool)
+	for _, tool := range tools4 {
+		toolNames4[tool.Declaration().Name] = true
+	}
+	assert.True(t, toolNames4[memory.AddToolName], "Add should be exposed even when set before WithExtractor")
+
+	// Test: WithAutoMemoryExposedTools AFTER WithExtractor should also work.
+	service5 := NewMemoryService(
+		WithExtractor(ext),
+		WithAutoMemoryExposedTools(memory.AddToolName),
+	)
+	defer service5.Close()
+
+	tools5 := service5.Tools()
+	toolNames5 := make(map[string]bool)
+	for _, tool := range tools5 {
+		toolNames5[tool.Declaration().Name] = true
+	}
+	assert.True(t, toolNames5[memory.AddToolName], "Add should be exposed when set after WithExtractor")
 }
 
 func TestTools_AgenticMode(t *testing.T) {

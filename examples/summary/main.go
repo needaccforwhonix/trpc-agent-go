@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	modelName      = flag.String("model", "deepseek-chat", "Model name to use for LLM summarization and chat")
+	modelName      = flag.String("model", "deepseek-v4-flash", "Model name to use for LLM summarization and chat")
 	streaming      = flag.Bool("streaming", true, "Enable streaming mode for responses")
 	flagEvents     = flag.Int("events", 1, "Event count threshold to trigger summarization")
 	flagTokens     = flag.Int("tokens", 0, "Token-count threshold to trigger summarization (0=disabled)")
@@ -84,7 +84,12 @@ func (c *summaryChat) setup(_ context.Context) error {
 	// You can customize the summary prompt using WithPrompt().
 	// Available placeholders:
 	//   - {conversation_text}: The conversation content to be summarized
-	//   - {max_summary_words}: The maximum word count for the summary (only included when max-words > 0)
+	//   - {previous_summary}: Optional previous rolling summary; when used,
+	//     conversation_text contains only newly uncovered events
+	//   - {max_summary_words}: The maximum word count for the summary (only included when max-words > 0);
+	//     when max-words is enabled, include it in either WithPrompt() or WithSystemPrompt()
+	// You can also add a dedicated system message with WithSystemPrompt(), but it must not contain
+	// {conversation_text} or {previous_summary}.
 	sum := summary.NewSummarizer(llm, summary.WithMaxSummaryWords(*flagMaxWords),
 		summary.WithSkipRecent(func(_ []event.Event) int {
 			if *flagSkipRecent > 0 {
@@ -99,6 +104,7 @@ func (c *summaryChat) setup(_ context.Context) error {
 		),
 		// For example:
 		// summary.WithPrompt("Summarize this conversation focusing on key decisions: {conversation_text}"),
+		// summary.WithSystemPrompt("Focus on decisions and keep it within {max_summary_words} words."),
 	)
 	// In-memory session service with summarizer and async config.
 	// Async summary processing is enabled by default with the following configuration:

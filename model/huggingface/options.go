@@ -84,6 +84,8 @@ type options struct {
 	TailoringStrategy model.TailoringStrategy
 	// MaxInputTokens is the max input tokens for token tailoring.
 	MaxInputTokens int
+	// ContextWindow is the model context window size in tokens.
+	ContextWindow int
 	// TokenTailoringConfig allows customization of token tailoring parameters.
 	TokenTailoringConfig *model.TokenTailoringConfig
 }
@@ -138,7 +140,10 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
-// WithChatRequestCallback sets the function to be called before sending a chat request.
+// WithChatRequestCallback sets the function to be called before sending a
+// chat request. The callback runs synchronously in GenerateContent before
+// the response goroutine starts. Start your own goroutine in the callback
+// if asynchronous behavior is needed.
 func WithChatRequestCallback(fn ChatRequestCallbackFunc) Option {
 	return func(opts *options) {
 		opts.ChatRequestCallback = fn
@@ -161,7 +166,8 @@ func WithChatChunkCallback(fn ChatChunkCallbackFunc) Option {
 	}
 }
 
-// WithChatStreamCompleteCallback sets the function to be called when streaming is completed.
+// WithChatStreamCompleteCallback sets the function to be called when
+// streaming is completed.
 // Called for both successful and failed streaming completions.
 func WithChatStreamCompleteCallback(fn ChatStreamCompleteCallbackFunc) Option {
 	return func(opts *options) {
@@ -209,6 +215,16 @@ func WithEnableTokenTailoring(enabled bool) Option {
 func WithMaxInputTokens(limit int) Option {
 	return func(opts *options) {
 		opts.MaxInputTokens = limit
+	}
+}
+
+// WithContextWindow sets the model context window size in tokens for this
+// model instance.
+func WithContextWindow(tokens int) Option {
+	return func(opts *options) {
+		if tokens > 0 {
+			opts.ContextWindow = tokens
+		}
 	}
 }
 

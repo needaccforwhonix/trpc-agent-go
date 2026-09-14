@@ -11,7 +11,6 @@ package processor
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -19,6 +18,10 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+const (
+	defaultCurrentDateFormat = "2006-01-02"
 )
 
 // TimeRequestProcessor implements time processing logic.
@@ -29,6 +32,12 @@ type TimeRequestProcessor struct {
 	Timezone string
 	// TimeFormat specifies the format for time display.
 	TimeFormat string
+	// CurrentTimeToolName is the exact-time tool the model should call when it
+	// needs clock-level precision.
+	CurrentTimeToolName string
+	// CurrentTimeToolAvailable controls whether the system prompt should guide
+	// the model to call CurrentTimeToolName for exact time.
+	CurrentTimeToolAvailable bool
 }
 
 // TimeOption is a function that can be used to configure the time request processor.
@@ -55,12 +64,22 @@ func WithTimeFormat(format string) TimeOption {
 	}
 }
 
+// WithCurrentTimeTool configures the exact-time tool guidance.
+func WithCurrentTimeTool(name string, available bool) TimeOption {
+	return func(p *TimeRequestProcessor) {
+		p.CurrentTimeToolName = strings.TrimSpace(name)
+		p.CurrentTimeToolAvailable = available
+	}
+}
+
 // NewTimeRequestProcessor creates a new time request processor.
 func NewTimeRequestProcessor(opts ...TimeOption) *TimeRequestProcessor {
 	p := &TimeRequestProcessor{
-		AddCurrentTime: false,
-		Timezone:       "",
-		TimeFormat:     "2006-01-02 15:04:05 MST",
+		AddCurrentTime:           false,
+		Timezone:                 "",
+		TimeFormat:               defaultCurrentDateFormat,
+		CurrentTimeToolName:      "",
+		CurrentTimeToolAvailable: false,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -100,10 +119,28 @@ func (p *TimeRequestProcessor) ProcessRequest(
 
 	// Get current time with timezone support.
 	currentTime := p.getCurrentTime()
-	timeContent := fmt.Sprintf("The current time is: %s", currentTime)
+	timeContent := p.formatTimePrompt(currentTime)
 
 	// Add time information to the system message.
 	p.addTimeToSystemMessage(req, timeContent)
+}
+
+// SupportsContextCompactionRebuild reports that time decoration can be safely
+// replayed during the sync-summary rebuild path.
+func (p *TimeRequestProcessor) SupportsContextCompactionRebuild(
+	_ *agent.Invocation,
+) bool {
+	return true
+}
+
+// RebuildRequestForContextCompaction re-applies time decoration during the
+// safe sync-summary rebuild path without replaying the full processor chain.
+func (p *TimeRequestProcessor) RebuildRequestForContextCompaction(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	req *model.Request,
+) {
+	p.ProcessRequest(ctx, invocation, req, nil)
 }
 
 // getCurrentTime returns the current time string with timezone support.
@@ -124,10 +161,41 @@ func (p *TimeRequestProcessor) getCurrentTime() string {
 	now := time.Now().In(loc)
 	format := p.TimeFormat
 	if format == "" {
-		format = "2006-01-02 15:04:05 MST"
+		format = defaultCurrentDateFormat
 	}
 
 	return now.Format(format)
+}
+
+func (p *TimeRequestProcessor) formatTimePrompt(currentTime string) string {
+	label := "The current time is"
+	if p.effectiveTimeFormat() == defaultCurrentDateFormat {
+		label = "The current date is"
+	}
+	var b strings.Builder
+	b.WriteString(label)
+	b.WriteString(": ")
+	b.WriteString(currentTime)
+	if tz := strings.TrimSpace(p.Timezone); tz != "" {
+		b.WriteString(" (timezone: ")
+		b.WriteString(tz)
+		b.WriteString(")")
+	}
+	if p.CurrentTimeToolAvailable && strings.TrimSpace(p.CurrentTimeToolName) != "" {
+		b.WriteString("\n\n")
+		b.WriteString("For exact current time or timezone-specific time, call the built-in ")
+		b.WriteString(p.CurrentTimeToolName)
+		b.WriteString(" tool. Treat its result as valid only for the current request; ")
+		b.WriteString("do not reuse previous time tool results as current time.")
+	}
+	return b.String()
+}
+
+func (p *TimeRequestProcessor) effectiveTimeFormat() string {
+	if p.TimeFormat == "" {
+		return defaultCurrentDateFormat
+	}
+	return p.TimeFormat
 }
 
 // addTimeToSystemMessage adds time information to the system message.

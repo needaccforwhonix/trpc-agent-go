@@ -44,23 +44,119 @@ const (
 	metadataJSONKey       = "metadata_json"
 )
 
+var luaPutCheckpoint = redis.NewScript(`
+-- Put checkpoint core data and indexes atomically.
+--
+-- KEYS[1] = checkpointKey
+-- KEYS[2] = checkpointTSKey
+-- KEYS[3] = lineageNSKey
+--
+-- ARGV[1] = ttl_ms
+-- ARGV[2] = lineage_id
+-- ARGV[3] = checkpoint_ns
+-- ARGV[4] = checkpoint_id
+-- ARGV[5] = parent_checkpoint_id
+-- ARGV[6] = ts (unix nano)
+-- ARGV[7] = checkpoint_json
+-- ARGV[8] = metadata_json
+local ttl = tonumber(ARGV[1])
+
+redis.call('HSET', KEYS[1],
+  'lineage_id', ARGV[2],
+  'checkpoint_ns', ARGV[3],
+  'checkpoint_id', ARGV[4],
+  'parent_checkpoint_id', ARGV[5],
+  'ts', ARGV[6],
+  'checkpoint_json', ARGV[7],
+  'metadata_json', ARGV[8]
+)
+
+redis.call('ZADD', KEYS[2], ARGV[6], ARGV[4])
+redis.call('SADD', KEYS[3], ARGV[3])
+
+if ttl and ttl > 0 then
+  redis.call('PEXPIRE', KEYS[1], ttl)
+  redis.call('PEXPIRE', KEYS[2], ttl)
+  redis.call('PEXPIRE', KEYS[3], ttl)
+end
+
+return 1
+`)
+
+var luaPutFullCheckpoint = redis.NewScript(`
+-- Put checkpoint core data, indexes and writes atomically.
+--
+-- KEYS[1] = checkpointKey
+-- KEYS[2] = checkpointTSKey
+-- KEYS[3] = lineageNSKey
+-- KEYS[4] = writesKey
+--
+-- ARGV[1] = ttl_ms
+-- ARGV[2] = lineage_id
+-- ARGV[3] = checkpoint_ns
+-- ARGV[4] = checkpoint_id
+-- ARGV[5] = parent_checkpoint_id
+-- ARGV[6] = ts (unix nano)
+-- ARGV[7] = checkpoint_json
+-- ARGV[8] = metadata_json
+-- ARGV[9...] = write_field_1, write_json_1, write_field_2, write_json_2, ...
+local ttl = tonumber(ARGV[1])
+
+redis.call('HSET', KEYS[1],
+  'lineage_id', ARGV[2],
+  'checkpoint_ns', ARGV[3],
+  'checkpoint_id', ARGV[4],
+  'parent_checkpoint_id', ARGV[5],
+  'ts', ARGV[6],
+  'checkpoint_json', ARGV[7],
+  'metadata_json', ARGV[8]
+)
+
+redis.call('ZADD', KEYS[2], ARGV[6], ARGV[4])
+redis.call('SADD', KEYS[3], ARGV[3])
+
+for i = 9, #ARGV, 2 do
+  redis.call('HSET', KEYS[4], ARGV[i], ARGV[i + 1])
+end
+
+if ttl and ttl > 0 then
+  redis.call('PEXPIRE', KEYS[1], ttl)
+  redis.call('PEXPIRE', KEYS[2], ttl)
+  redis.call('PEXPIRE', KEYS[3], ttl)
+  redis.call('PEXPIRE', KEYS[4], ttl)
+end
+
+return 1
+`)
+
+func ttlMilliseconds(ttl time.Duration) int64 {
+	if ttl <= 0 {
+		return 0
+	}
+	ttlMs := ttl.Milliseconds()
+	if ttlMs == 0 {
+		return 1
+	}
+	return ttlMs
+}
+
 func checkpointKey(lineageID, checkpointNS, checkpointID string) string {
-	return fmt.Sprintf("%s%s:%s:%s", keyPrefixCheckpoint, lineageID, checkpointNS, checkpointID)
+	return fmt.Sprintf("%s{%s}:%s:%s", keyPrefixCheckpoint, lineageID, checkpointNS, checkpointID)
 }
 
 func checkpointTSKey(lineageID, checkpointNS string) string {
 	if checkpointNS == "" {
-		return fmt.Sprintf("%s%s", keyPrefixCheckpointTS, lineageID)
+		return fmt.Sprintf("%s{%s}", keyPrefixCheckpointTS, lineageID)
 	}
-	return fmt.Sprintf("%s%s:%s", keyPrefixCheckpointTS, lineageID, checkpointNS)
+	return fmt.Sprintf("%s{%s}:%s", keyPrefixCheckpointTS, lineageID, checkpointNS)
 }
 
 func writesKey(lineageID, checkpointNS, checkpointID string) string {
-	return fmt.Sprintf("%s%s:%s:%s", keyPrefixWrites, lineageID, checkpointNS, checkpointID)
+	return fmt.Sprintf("%s{%s}:%s:%s", keyPrefixWrites, lineageID, checkpointNS, checkpointID)
 }
 
 func lineageNSKey(lineageID string) string {
-	return fmt.Sprintf("%s%s", keyPrefixLineageNS, lineageID)
+	return fmt.Sprintf("%s{%s}", keyPrefixLineageNS, lineageID)
 }
 
 type writeData struct {
@@ -257,24 +353,47 @@ func (s *Saver) List(ctx context.Context, config map[string]any, filter *graph.C
 	return tuples, nil
 }
 
+// getCheckpointIDs returns the checkpoint IDs for the lineage/namespace in
+// newest-first order. When filter.Before is set, only checkpoints strictly
+// before the cursor checkpoint are returned, ordered by their exact nanosecond
+// timestamps.
 func (s *Saver) getCheckpointIDs(ctx context.Context, lineageID, checkpointNS string, filter *graph.CheckpointFilter) ([]string, error) {
 	key := checkpointTSKey(lineageID, checkpointNS)
 	var members []string
 	var err error
 
+	beforeID := ""
 	if filter != nil && filter.Before != nil {
-		beforeID := graph.GetCheckpointID(filter.Before)
-		if beforeID != "" {
-			beforeScore, err := s.getCheckpointScore(ctx, lineageID, checkpointNS, beforeID)
+		beforeID = graph.GetCheckpointID(filter.Before)
+	}
+
+	// beforeApplied is set once members were fetched with an inclusive score
+	// bound around the cursor, so they still need exact-timestamp filtering.
+	beforeApplied := false
+	if beforeID != "" {
+		beforeScore, err := s.getCheckpointScore(ctx, lineageID, checkpointNS, beforeID)
+		if err != nil {
+			return nil, err
+		}
+		if beforeScore > 0 {
+			// Reverse order (newest first) keeps List consistent with the
+			// CheckpointSaver contract and the inmemory/sqlite savers when
+			// combined with filter.Limit; see issue #2503.
+			//
+			// The upper bound is inclusive: Redis ZSET scores are IEEE-754
+			// doubles that cannot represent nanosecond timestamps exactly
+			// beyond 2^53, so distinct checkpoints can share one score. An
+			// exclusive bound would drop the whole bucket and silently lose
+			// checkpoints that are strictly before the cursor. Same-score
+			// candidates are filtered by their exact timestamps below.
+			members, err = s.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
+				Min: "0",
+				Max: fmt.Sprintf("%d", beforeScore),
+			}).Result()
 			if err != nil {
 				return nil, err
 			}
-			if beforeScore > 0 {
-				members, err = s.client.ZRangeByScore(ctx, key, &redis.ZRangeBy{
-					Min: "0",
-					Max: fmt.Sprintf("(%d", beforeScore),
-				}).Result()
-			}
+			beforeApplied = true
 		}
 	}
 
@@ -295,7 +414,19 @@ func (s *Saver) getCheckpointIDs(ctx context.Context, lineageID, checkpointNS st
 			)
 			continue
 		}
+		if beforeApplied && id == beforeID {
+			// Exclude the cursor checkpoint itself; exact-timestamp filtering
+			// below can only compare against it, not drop it.
+			continue
+		}
 		checkpointIDs = append(checkpointIDs, id)
+	}
+
+	if beforeApplied {
+		checkpointIDs, err = s.filterBeforeIDs(ctx, lineageID, checkpointNS, beforeID, checkpointIDs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return checkpointIDs, nil
@@ -308,6 +439,102 @@ func (s *Saver) getCheckpointScore(ctx context.Context, lineageID, checkpointNS,
 		return 0, err
 	}
 	return int64(score), nil
+}
+
+// filterBeforeIDs keeps only the checkpoints strictly before the cursor and
+// orders them by their exact nanosecond timestamps, newest first. Redis ZSET
+// scores are doubles, so checkpoints whose timestamps exceed 2^53 can share the
+// cursor's score; the exact timestamp stored in each checkpoint hash decides
+// membership and order. If the cursor's exact timestamp is unavailable, no
+// checkpoints are returned, keeping Before strict like the inmemory saver.
+func (s *Saver) filterBeforeIDs(ctx context.Context, lineageID, checkpointNS, beforeID string, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return ids, nil
+	}
+	beforeTS, err := s.getCheckpointTS(ctx, lineageID, checkpointNS, beforeID)
+	if err != nil {
+		return nil, err
+	}
+	if beforeTS <= 0 {
+		// The cursor checkpoint data is unavailable, so strict Before
+		// semantics cannot be guaranteed for same-score candidates. Return
+		// nothing instead of risking checkpoints at or after the cursor.
+		return nil, nil
+	}
+
+	cmds, err := s.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, id := range ids {
+			pipe.HGet(ctx, checkpointKey(lineageID, checkpointNS, id), tsKey)
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	// A redis.Nil pipeline error means the first candidate's hash data is
+	// missing (e.g. its checkpoint expired while the ZSET entry remains); the
+	// per-command results below still carry each candidate's own error, so
+	// missing data is handled candidate by candidate.
+
+	type tsEntry struct {
+		id string
+		ts int64
+	}
+	entries := make([]tsEntry, 0, len(ids))
+	for i, id := range ids {
+		// The pipeline only queues HGET commands, so each result is a
+		// *redis.StringCmd.
+		cmd := cmds[i].(*redis.StringCmd)
+		if err := cmd.Err(); err != nil {
+			// redis.Nil means the candidate's hash data is missing (e.g. its
+			// checkpoint expired while the ZSET entry remains); drop the
+			// candidate. Any other per-command error aborts the filter so
+			// List never returns silently incomplete history.
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			return nil, err
+		}
+		ts, err := strconv.ParseInt(cmd.Val(), 10, 64)
+		if err != nil {
+			// A malformed timestamp is corrupted stored data; surface it
+			// like getCheckpointTS does instead of silently dropping the
+			// checkpoint from the result.
+			return nil, fmt.Errorf("parse timestamp: %w", err)
+		}
+		if ts > 0 && ts < beforeTS {
+			entries = append(entries, tsEntry{id: id, ts: ts})
+		}
+	}
+
+	// Newest first. Equal timestamps keep the ZSET order, which is a stable
+	// tie-breaker (reverse lexicographical member order in Redis).
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].ts > entries[j].ts
+	})
+
+	sortedIDs := make([]string, len(entries))
+	for i, entry := range entries {
+		sortedIDs[i] = entry.id
+	}
+	return sortedIDs, nil
+}
+
+// getCheckpointTS returns the exact nanosecond timestamp stored in the
+// checkpoint hash, or 0 if the checkpoint data is unavailable.
+func (s *Saver) getCheckpointTS(ctx context.Context, lineageID, checkpointNS, checkpointID string) (int64, error) {
+	val, err := s.client.HGet(ctx, checkpointKey(lineageID, checkpointNS, checkpointID), tsKey).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	ts, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse timestamp: %w", err)
+	}
+	return ts, nil
 }
 
 // Put stores the checkpoint and returns the updated config with checkpoint ID.
@@ -335,39 +562,29 @@ func (s *Saver) Put(ctx context.Context, req graph.PutRequest) (map[string]any, 
 		return nil, fmt.Errorf("marshal metadata: %w", err)
 	}
 
-	pipe := s.client.TxPipeline()
-
 	checkpointID := req.Checkpoint.ID
 	ts := req.Checkpoint.Timestamp.UnixNano()
 	if ts <= 0 {
 		ts = time.Now().UTC().UnixNano()
 	}
 
-	checkpointKey := checkpointKey(lineageID, checkpointNS, checkpointID)
-	pipe.HSet(ctx, checkpointKey,
-		lingeageIDKey, lineageID,
-		checkpointNSKey, checkpointNS,
-		checkpointIDKey, checkpointID,
-		parentCheckpointIDKey, req.Checkpoint.ParentCheckpointID,
-		tsKey, ts,
-		checkpointJSONKey, checkpointJSON,
-		metadataJSONKey, metadataJSON,
-	)
-	pipe.Expire(ctx, checkpointKey, s.opts.ttl)
-
-	tsKey := checkpointTSKey(lineageID, checkpointNS)
-	pipe.ZAdd(ctx, tsKey, redis.Z{
-		Score:  float64(ts),
-		Member: checkpointID,
-	})
-	pipe.Expire(ctx, tsKey, s.opts.ttl)
-
-	nsKey := lineageNSKey(lineageID)
-	pipe.SAdd(ctx, nsKey, checkpointNS)
-	pipe.Expire(ctx, nsKey, s.opts.ttl)
-
-	if _, err := pipe.Exec(ctx); err != nil {
-		return nil, fmt.Errorf("redis transaction failed: %w", err)
+	keys := []string{
+		checkpointKey(lineageID, checkpointNS, checkpointID),
+		checkpointTSKey(lineageID, checkpointNS),
+		lineageNSKey(lineageID),
+	}
+	args := []any{
+		ttlMilliseconds(s.opts.ttl),
+		lineageID,
+		checkpointNS,
+		checkpointID,
+		req.Checkpoint.ParentCheckpointID,
+		ts,
+		checkpointJSON,
+		metadataJSON,
+	}
+	if _, err := luaPutCheckpoint.Run(ctx, s.client, keys, args...).Result(); err != nil {
+		return nil, fmt.Errorf("save checkpoint: %w", err)
 	}
 
 	return graph.CreateCheckpointConfig(lineageID, checkpointID, checkpointNS), nil
@@ -436,38 +653,30 @@ func (s *Saver) PutFull(ctx context.Context, req graph.PutFullRequest) (map[stri
 		return nil, fmt.Errorf("marshal metadata: %w", err)
 	}
 
-	pipe := s.client.TxPipeline()
-
 	checkpointID := req.Checkpoint.ID
 	ts := req.Checkpoint.Timestamp.UnixNano()
 	if ts <= 0 {
 		ts = time.Now().UTC().UnixNano()
 	}
 
-	checkpointKey := checkpointKey(lineageID, checkpointNS, checkpointID)
-	pipe.HSet(ctx, checkpointKey,
-		lingeageIDKey, lineageID,
-		checkpointNSKey, checkpointNS,
-		checkpointIDKey, checkpointID,
-		parentCheckpointIDKey, req.Checkpoint.ParentCheckpointID,
-		tsKey, ts,
-		checkpointJSONKey, checkpointJSON,
-		metadataJSONKey, metadataJSON,
-	)
-	pipe.Expire(ctx, checkpointKey, s.opts.ttl)
-
-	tsKey := checkpointTSKey(lineageID, checkpointNS)
-	pipe.ZAdd(ctx, tsKey, redis.Z{
-		Score:  float64(ts),
-		Member: checkpointID,
-	})
-	pipe.Expire(ctx, tsKey, s.opts.ttl)
-
-	nsKey := lineageNSKey(lineageID)
-	pipe.SAdd(ctx, nsKey, checkpointNS)
-	pipe.Expire(ctx, nsKey, s.opts.ttl)
-
 	writeKey := writesKey(lineageID, checkpointNS, checkpointID)
+
+	keys := []string{
+		checkpointKey(lineageID, checkpointNS, checkpointID),
+		checkpointTSKey(lineageID, checkpointNS),
+		lineageNSKey(lineageID),
+		writeKey,
+	}
+	args := []any{
+		ttlMilliseconds(s.opts.ttl),
+		lineageID,
+		checkpointNS,
+		checkpointID,
+		req.Checkpoint.ParentCheckpointID,
+		ts,
+		checkpointJSON,
+		metadataJSON,
+	}
 	for idx, w := range req.PendingWrites {
 		valueJSON, err := json.Marshal(w.Value)
 		if err != nil {
@@ -493,12 +702,10 @@ func (s *Saver) PutFull(ctx context.Context, req graph.PutFullRequest) (map[stri
 		if err != nil {
 			return nil, fmt.Errorf("marshal write data: %w", err)
 		}
-		pipe.HSet(ctx, writeKey, field, writeJSON)
+		args = append(args, field, writeJSON)
 	}
-	pipe.Expire(ctx, writeKey, s.opts.ttl)
-
-	if _, err := pipe.Exec(ctx); err != nil {
-		return nil, fmt.Errorf("redis transaction failed: %w", err)
+	if _, err := luaPutFullCheckpoint.Run(ctx, s.client, keys, args...).Result(); err != nil {
+		return nil, fmt.Errorf("save checkpoint: %w", err)
 	}
 
 	return graph.CreateCheckpointConfig(lineageID, checkpointID, checkpointNS), nil

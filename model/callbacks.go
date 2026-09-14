@@ -20,7 +20,7 @@ import (
 
 const (
 	callbackPanicErrFmt = "%s: %v"
-	callbackPanicLogFmt = "%s: %v\n%s"
+	callbackPanicLogFmt = log.PanicPrefix + " %s: %v\n%s"
 
 	beforeModelCallbackPanic = "before model callback panic"
 	afterModelCallbackPanic  = "after model callback panic"
@@ -135,6 +135,21 @@ func NewCallbacks(opts ...CallbacksOption) *Callbacks {
 		opt(c)
 	}
 	return c
+}
+
+// Clone returns an independent copy of c, including callback lists
+// and execution options.
+func (c *Callbacks) Clone() *Callbacks {
+	if c == nil {
+		return nil
+	}
+	out := &Callbacks{
+		BeforeModel:        append([]BeforeModelCallbackStructured(nil), c.BeforeModel...),
+		AfterModel:         append([]AfterModelCallbackStructured(nil), c.AfterModel...),
+		continueOnError:    c.continueOnError,
+		continueOnResponse: c.continueOnResponse,
+	}
+	return out
 }
 
 // RegisterBeforeModel registers a before model callback.

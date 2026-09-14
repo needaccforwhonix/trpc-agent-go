@@ -13,6 +13,7 @@ package local_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -32,6 +33,9 @@ import (
 const (
 	permDenied        = "permission denied"
 	unsupportedLangJS = "unsupported language: javascript"
+	envPathKey        = "PATH"
+	testProgramOutput = "local path command"
+	testExecFileMode  = 0o755
 )
 
 func TestRuntime_RunProgram_Basic(t *testing.T) {
@@ -63,6 +67,12 @@ func TestRuntime_RunProgram_Basic(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Contains(t, res.Stdout, "hello runtime")
+}
+
+func TestRuntime_PathListSeparator(t *testing.T) {
+	rt := local.NewRuntime("")
+
+	require.Equal(t, string(os.PathListSeparator), rt.PathListSeparator())
 }
 
 func TestRuntime_CreateWorkspace_TrustedLocal_ReusesRoot(t *testing.T) {
@@ -138,6 +148,51 @@ func TestRuntime_CreateWorkspace_TrustedLocal_RelativeRoot_AutoInputs(
 	require.NoError(t, rt.Cleanup(ctx, ws))
 	_, err = os.Stat(ws.Path)
 	require.NoError(t, err)
+}
+
+func TestRuntime_CreateWorkspace_TrustedLocal_RepairsCorruptMetadata(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	host := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(host, "auto.txt"),
+		[]byte("V"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, codeexecutor.MetaFileName),
+		[]byte("not-json"),
+		0o600,
+	))
+	rt := local.NewRuntimeWithOptions(
+		root,
+		local.WithRuntimeWorkspaceMode(
+			local.WorkspaceModeTrustedLocal,
+		),
+		local.WithInputsHostBase(host),
+	)
+
+	ws, err := rt.CreateWorkspace(
+		context.Background(),
+		"rt-trusted-corrupt",
+		codeexecutor.WorkspacePolicy{},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, root, ws.Path)
+	data, err := os.ReadFile(filepath.Join(
+		root,
+		codeexecutor.DirWork,
+		"inputs",
+		"auto.txt",
+	))
+	require.NoError(t, err)
+	require.Equal(t, "V", string(data))
+	md, err := codeexecutor.LoadMetadata(root)
+	require.NoError(t, err)
+	require.Equal(t, 1, md.Version)
+	require.Len(t, md.Inputs, 1)
 }
 
 func TestRuntime_CreateWorkspace_TrustedLocal_FileRootErrors(t *testing.T) {
@@ -313,6 +368,125 @@ func TestRuntime_RunProgram_EnvAndStdin(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, res.Stdout, "HELLO")
 	require.Contains(t, res.Stdout, "BAR")
+}
+
+func TestRuntime_RunProgram_UsesSpecPATHForBareCommand(t *testing.T) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx, "rt-path", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	cwd := filepath.Join(ws.Path, codeexecutor.DirWork)
+	bin := filepath.Join(cwd, "custom-bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	writeExecutable(
+		t,
+		filepath.Join(bin, "pathcmd"),
+		"#!/bin/sh\necho '"+testProgramOutput+"'\n",
+	)
+
+	res, err := rt.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
+		Cmd: "pathcmd",
+		Env: map[string]string{
+			envPathKey: "custom-bin",
+		},
+		Cwd:     codeexecutor.DirWork,
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, res.ExitCode)
+	require.Contains(t, res.Stdout, testProgramOutput)
+}
+
+func TestRuntime_RunProgram_SpecPATHWinsForExistingCommand(t *testing.T) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx, "rt-path-priority", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	cwd := filepath.Join(ws.Path, codeexecutor.DirWork)
+	bin := filepath.Join(cwd, "custom-bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+	writeExecutable(
+		t,
+		filepath.Join(bin, "sh"),
+		"#!/bin/sh\necho '"+testProgramOutput+"'\n",
+	)
+	pathValue := strings.Join(
+		[]string{"custom-bin", os.Getenv(envPathKey)},
+		string(os.PathListSeparator),
+	)
+
+	res, err := rt.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
+		Cmd:  "sh",
+		Args: []string{"-c", "echo process path"},
+		Env: map[string]string{
+			envPathKey: pathValue,
+		},
+		Cwd:     codeexecutor.DirWork,
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, res.ExitCode)
+	require.Contains(t, res.Stdout, testProgramOutput)
+	require.NotContains(t, res.Stdout, "process path")
+}
+
+func TestRuntime_RunProgram_EmptySpecPATHDoesNotUseProcessLookup(
+	t *testing.T,
+) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx, "rt-empty-path", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	res, err := rt.RunProgram(ctx, ws, codeexecutor.RunProgramSpec{
+		Cmd:  "sh",
+		Args: []string{"-c", "echo ok"},
+		Env: map[string]string{
+			envPathKey: "",
+		},
+		Cwd:     codeexecutor.DirWork,
+		Timeout: 5 * time.Second,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, -1, res.ExitCode)
+	require.NotContains(t, res.Stdout, "ok")
+}
+
+func TestRuntime_RunProgram_LayoutError(t *testing.T) {
+	rt := local.NewRuntime("")
+	ws := codeexecutor.Workspace{
+		ID:   "rt-layout-error",
+		Path: t.TempDir(),
+	}
+	require.NoError(t, os.WriteFile(
+		filepath.Join(ws.Path, codeexecutor.DirRuns),
+		[]byte("x"),
+		0o644,
+	))
+
+	_, err := rt.RunProgram(
+		context.Background(),
+		ws,
+		codeexecutor.RunProgramSpec{
+			Cmd:     "sh",
+			Args:    []string{"-lc", "true"},
+			Timeout: 5 * time.Second,
+		},
+	)
+
+	require.Error(t, err)
 }
 
 func TestRuntime_RunProgram_Timeout(t *testing.T) {
@@ -585,6 +759,44 @@ func TestRuntime_Collect_DedupOverlappingGlobs(t *testing.T) {
 	require.Equal(t, 1, countA)
 }
 
+func TestRuntime_Collect_FiltersRootMetadataTempFiles(t *testing.T) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx, "rt-collect-metadata-tmp", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	tmpName := codeexecutor.MetadataTempFileName()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(ws.Path, tmpName), []byte("root"), 0o644,
+	))
+	nestedName := filepath.Join(codeexecutor.DirWork, tmpName)
+	const nonGeneratedRootName = ".metadata.user.tmp"
+	require.NoError(t, os.WriteFile(
+		filepath.Join(ws.Path, nonGeneratedRootName),
+		[]byte("user"),
+		0o644,
+	))
+	require.NoError(t, rt.PutFiles(ctx, ws, []codeexecutor.PutFile{{
+		Path:    nestedName,
+		Content: []byte("nested"),
+		Mode:    0o644,
+	}}))
+
+	files, err := rt.Collect(ctx, ws, []string{"**"})
+	require.NoError(t, err)
+	var names []string
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+
+	require.NotContains(t, names, tmpName)
+	require.Contains(t, names, nonGeneratedRootName)
+	require.Contains(t, names, nestedName)
+}
+
 func TestRuntime_Collect_EnvPrefixes(t *testing.T) {
 	rt := local.NewRuntime("")
 	ctx := context.Background()
@@ -685,21 +897,33 @@ func TestRuntime_RunProgram_InjectsWorkspaceEnvs(t *testing.T) {
 		Cmd: "bash",
 		Args: []string{
 			"-lc",
-			"echo $WORKSPACE_DIR; echo $SKILLS_DIR; echo $WORK_DIR; " +
-				"echo $OUTPUT_DIR; echo $RUN_DIR",
+			"echo WS=$WORKSPACE_DIR; echo SK=$SKILLS_DIR; " +
+				"echo WK=$WORK_DIR; echo OUT=$OUTPUT_DIR; " +
+				"echo RUN=$RUN_DIR",
 		},
 		Timeout: 3 * time.Second,
 	})
 	require.NoError(t, err)
 	// All must be set and point within workspace.
-	out := strings.Split(strings.TrimSpace(res.Stdout), "\n")
-	require.GreaterOrEqual(t, len(out), 5)
-	require.Equal(t, ws.Path, out[0])
-	require.Equal(t, filepath.Join(ws.Path, codeexecutor.DirSkills), out[1])
-	require.Equal(t, filepath.Join(ws.Path, codeexecutor.DirWork), out[2])
-	require.Equal(t, filepath.Join(ws.Path, codeexecutor.DirOut), out[3])
-	require.True(t, strings.HasPrefix(out[4], filepath.Join(ws.Path,
+	out := prefixedOutputValues(res.Stdout)
+	require.Equal(t, ws.Path, out["WS"])
+	require.Equal(t, filepath.Join(ws.Path, codeexecutor.DirSkills), out["SK"])
+	require.Equal(t, filepath.Join(ws.Path, codeexecutor.DirWork), out["WK"])
+	require.Equal(t, filepath.Join(ws.Path, codeexecutor.DirOut), out["OUT"])
+	require.True(t, strings.HasPrefix(out["RUN"], filepath.Join(ws.Path,
 		codeexecutor.DirRuns)))
+}
+
+func prefixedOutputValues(stdout string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func TestRuntime_StageInputs_ArtifactAndLinks(t *testing.T) {
@@ -736,6 +960,24 @@ func TestRuntime_StageInputs_ArtifactAndLinks(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "AX", string(b))
 
+	// Stage artifact ref with explicit version and nested name.
+	ver, err := codeexecutor.SaveArtifactHelper(
+		actx, "uploads/b.txt", []byte("BX"), "text/plain",
+	)
+	require.NoError(t, err)
+	ref := fmt.Sprintf("artifact://uploads/b.txt@%d", ver)
+	err = rt.StageInputs(actx, ws, []codeexecutor.InputSpec{{
+		From: ref,
+		Mode: "copy",
+	}})
+	require.NoError(t, err)
+	target = filepath.Join(
+		ws.Path, codeexecutor.DirWork, "inputs", "b.txt",
+	)
+	b, err = os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "BX", string(b))
+
 	// host:// path with link mode creates a symlink.
 	src := t.TempDir()
 	require.NoError(t, os.WriteFile(
@@ -767,6 +1009,23 @@ func TestRuntime_StageInputs_ArtifactAndLinks(t *testing.T) {
 	))
 	require.NoError(t, err)
 	require.Equal(t, "W", string(b))
+}
+
+func TestRuntime_StageInputs_NoSlash_DefaultNamePath(t *testing.T) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx, "rt-stage-noslash", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	err = rt.StageInputs(ctx, ws, []codeexecutor.InputSpec{{
+		From: "noslash",
+		Mode: "copy",
+	}})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported input")
 }
 
 func TestRuntime_CreateWorkspace_AutoInputsHost(t *testing.T) {
@@ -823,8 +1082,7 @@ func TestRuntime_CollectOutputs_SaveAndInline(t *testing.T) {
 	small := filepath.Join(ws.Path, codeexecutor.DirOut, "a.txt")
 	large := filepath.Join(ws.Path, codeexecutor.DirOut, "b.bin")
 	require.NoError(t, os.WriteFile(small, []byte("ok"), 0o644))
-	// Large file to exercise per-file cap.
-	big := bytes.Repeat([]byte{'x'}, 1024)
+	big := bytes.Repeat([]byte{'x'}, 32)
 	require.NoError(t, os.WriteFile(large, big, 0o644))
 
 	// Attach artifact service to save outputs.
@@ -839,8 +1097,8 @@ func TestRuntime_CollectOutputs_SaveAndInline(t *testing.T) {
 		Save:          true,
 		NameTemplate:  "prefix-",
 		MaxFiles:      2,
-		MaxFileBytes:  16,
-		MaxTotalBytes: 64,
+		MaxFileBytes:  64,
+		MaxTotalBytes: 128,
 	})
 	require.NoError(t, err)
 	require.Len(t, mf.Files, 2)
@@ -854,7 +1112,165 @@ func TestRuntime_CollectOutputs_SaveAndInline(t *testing.T) {
 		}
 	}
 	require.True(t, sawSmall)
-	require.True(t, mf.LimitsHit)
+	require.False(t, mf.LimitsHit)
+}
+
+func TestRuntime_CollectOutputs_SaveTruncatedFileErrors(t *testing.T) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx, "rt-collect-out-truncated-save", codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(ws.Path, codeexecutor.DirOut), 0o755,
+	))
+	large := filepath.Join(ws.Path, codeexecutor.DirOut, "b.bin")
+	require.NoError(t, os.WriteFile(
+		large,
+		bytes.Repeat([]byte{'x'}, 1024),
+		0o644,
+	))
+
+	svc := inmemory.NewService()
+	actx := codeexecutor.WithArtifactService(ctx, svc)
+	actx = codeexecutor.WithArtifactSession(
+		actx, artifact.SessionInfo{AppName: "a", UserID: "u", SessionID: "s"},
+	)
+	_, err = rt.CollectOutputs(actx, ws, codeexecutor.OutputSpec{
+		Globs:         []string{filepath.Join(codeexecutor.DirOut, "*")},
+		Save:          true,
+		MaxFiles:      1,
+		MaxFileBytes:  16,
+		MaxTotalBytes: 64,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cannot save truncated output file")
+}
+
+func TestRuntime_CollectOutputs_RecoversCorruptMetadata(t *testing.T) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx,
+		"rt-collect-out-invalid-metadata",
+		codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	outDir := filepath.Join(ws.Path, codeexecutor.DirOut)
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outDir, "x.txt"),
+		[]byte("ok"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(ws.Path, codeexecutor.MetaFileName),
+		[]byte("not-json"),
+		0o600,
+	))
+	mf, err := rt.CollectOutputs(ctx, ws, codeexecutor.OutputSpec{
+		Globs: []string{filepath.Join(codeexecutor.DirOut, "x.txt")},
+	})
+	require.NoError(t, err)
+	require.Len(t, mf.Files, 1)
+	md, err := codeexecutor.LoadMetadata(ws.Path)
+	require.NoError(t, err)
+	require.Equal(t, 1, md.Version)
+	require.Len(t, md.Outputs, 1)
+}
+
+func TestRuntime_CollectOutputs_MetadataDirectoryPartialError(t *testing.T) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx,
+		"rt-collect-out-metadata-dir",
+		codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	outDir := filepath.Join(ws.Path, codeexecutor.DirOut)
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outDir, "x.txt"),
+		[]byte("ok"),
+		0o644,
+	))
+	require.NoError(t, os.Remove(filepath.Join(
+		ws.Path,
+		codeexecutor.MetaFileName,
+	)))
+	require.NoError(t, os.Mkdir(
+		filepath.Join(ws.Path, codeexecutor.MetaFileName),
+		0o755,
+	))
+	svc := inmemory.NewService()
+	actx := codeexecutor.WithArtifactService(ctx, svc)
+	info := artifact.SessionInfo{
+		AppName:   "a",
+		UserID:    "u",
+		SessionID: "s",
+	}
+	actx = codeexecutor.WithArtifactSession(actx, info)
+
+	mf, err := rt.CollectOutputs(actx, ws, codeexecutor.OutputSpec{
+		Globs: []string{filepath.Join(codeexecutor.DirOut, "x.txt")},
+		Save:  true,
+	})
+
+	require.ErrorIs(t, err, codeexecutor.ErrPartialOutputCommit)
+	require.Len(t, mf.Files, 1)
+	versions, listErr := svc.ListVersions(ctx, info, mf.Files[0].SavedAs)
+	require.NoError(t, listErr)
+	require.Equal(t, []int{0}, versions)
+}
+
+func TestRuntime_CollectOutputs_FiltersRootMetadataTempFiles(
+	t *testing.T,
+) {
+	rt := local.NewRuntime("")
+	ctx := context.Background()
+	ws, err := rt.CreateWorkspace(
+		ctx,
+		"rt-collect-out-metadata-tmp",
+		codeexecutor.WorkspacePolicy{},
+	)
+	require.NoError(t, err)
+	defer rt.Cleanup(ctx, ws)
+
+	tmpName := codeexecutor.MetadataTempFileName()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(ws.Path, tmpName),
+		[]byte("tmp"),
+		0o600,
+	))
+	outDir := filepath.Join(ws.Path, codeexecutor.DirOut)
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outDir, "keep.txt"),
+		[]byte("keep"),
+		0o644,
+	))
+
+	mf, err := rt.CollectOutputs(ctx, ws, codeexecutor.OutputSpec{
+		Globs: []string{
+			tmpName,
+			filepath.Join(codeexecutor.DirOut, "keep.txt"),
+		},
+		Inline: true,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, mf.Files, 1)
+	require.Equal(t, filepath.ToSlash(
+		filepath.Join(codeexecutor.DirOut, "keep.txt"),
+	), mf.Files[0].Name)
 }
 
 func TestRuntime_CollectOutputs_EnvPrefixes(t *testing.T) {
@@ -1223,4 +1639,13 @@ func TestRuntime_StageInputs_HostLink_ReplacesExisting(t *testing.T) {
 	st, lerr := os.Lstat(absDst)
 	require.NoError(t, lerr)
 	require.NotZero(t, st.Mode()&os.ModeSymlink)
+}
+
+func writeExecutable(t *testing.T, name string, content string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(
+		name,
+		[]byte(content),
+		testExecFileMode,
+	))
 }

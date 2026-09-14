@@ -1,11 +1,20 @@
 # Skill-Driven Dynamic Structured Output (JSON Schema)
 
+> This demo is built on top of an older skill execution surface. For
+> the recommended way to wire Agent Skills in new code, see
+> [docs/mkdocs/en/skill.md](../../docs/mkdocs/en/skill.md). The
+> dynamic-schema pattern shown here is orthogonal to skill execution
+> and also applies on top of the recommended setup.
+
 This example demonstrates a **Skill-driven** pattern for selecting a **JSON Schema at runtime**, applying it to the **current invocation**, and returning a final JSON response that is extracted into `event.StructuredOutput`.
 
 Key ideas:
 
 - The agent starts with **no static structured output schema**.
 - The model uses Skills (`skill_load` / `skill_run`) like normal tools.
+- The demo sets `llmagent.WithEnableCodeExecutionResponseProcessor(false)` so
+  fenced code blocks in assistant text do not auto-execute while
+  `skill_run` is available.
 - The model extracts a JSON schema from the chosen Skill and calls a custom tool: `set_output_schema`.
 - `set_output_schema` updates `invocation.StructuredOutput`, which affects **subsequent** model calls in the same invocation.
 - The example sets `WithOutputKey(...)` so `OutputResponseProcessor` is installed and `event.StructuredOutput` is produced (without framework changes).

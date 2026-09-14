@@ -11,19 +11,40 @@ package knowledge
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/internal/loader"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/query"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/reranker"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/retriever"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/source"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
+	"trpc.group/trpc-go/trpc-agent-go/log"
 )
+
+func TestConvertToIntIgnoresNilValues(t *testing.T) {
+	if value, ok := convertToInt(nil); ok || value != 0 {
+		t.Fatalf("convertToInt(nil) = %d, %v; want 0, false", value, ok)
+	}
+	if value, ok := convertToInt("<nil>"); ok || value != 0 {
+		t.Fatalf("convertToInt(\"<nil>\") = %d, %v; want 0, false", value, ok)
+	}
+	var p *int
+	if value, ok := convertToInt(p); ok || value != 0 {
+		t.Fatalf("convertToInt((*int)(nil)) = %d, %v; want 0, false", value, ok)
+	}
+}
 
 // mockSource is a simple mock source for testing.
 type mockSource struct {
@@ -71,6 +92,50 @@ func (m *mockSource) GetMetadata() map[string]any {
 	}
 }
 
+type stableSyncSource struct {
+	name     string
+	docs     []*document.Document
+	metadata map[string]any
+}
+
+func (s *stableSyncSource) Name() string {
+	return s.name
+}
+
+func (s *stableSyncSource) Type() string {
+	return "mock"
+}
+
+func (s *stableSyncSource) ReadDocuments(ctx context.Context) ([]*document.Document, error) {
+	return s.docs, nil
+}
+
+func (s *stableSyncSource) SourceID() string {
+	return s.name
+}
+
+func (s *stableSyncSource) GetMetadata() map[string]any {
+	if s.metadata == nil {
+		return map[string]any{
+			"type": []string{"mock"},
+		}
+	}
+	return s.metadata
+}
+
+func newStableSyncTestDocument(uri string, chunkIndex int, content string) *document.Document {
+	return &document.Document{
+		ID:      fmt.Sprintf("seed-%s-%d", uri, chunkIndex),
+		Name:    uri,
+		Content: content,
+		Metadata: map[string]any{
+			source.MetaSourceName: "stable-source",
+			source.MetaURI:        uri,
+			source.MetaChunkIndex: chunkIndex,
+		},
+	}
+}
+
 // TestBuiltinKnowledge_LoadOptions is redundant with TestLoadOptions, removed
 
 func TestBuiltinKnowledge_LoadNoSources(t *testing.T) {
@@ -88,39 +153,51 @@ func TestBuiltinKnowledge_LoadNoSources(t *testing.T) {
 	}
 }
 
-func TestSizeStatsAddAndAvg(t *testing.T) {
+func TestBuiltinKnowledge_SourcesReturnsShallowClone(t *testing.T) {
+	srcA := &mockSource{name: "source-a"}
+	srcB := &mockSource{name: "source-b"}
+	kb := &BuiltinKnowledge{
+		sources: []source.Source{srcA, srcB},
+	}
+
+	cloned := kb.Sources()
+	if len(cloned) != 2 {
+		t.Fatalf("len(cloned) = %d, want 2", len(cloned))
+	}
+	if cloned[0] != srcA || cloned[1] != srcB {
+		t.Fatalf("Sources() returned unexpected slice contents: %#v", cloned)
+	}
+
+	cloned[0] = &mockSource{name: "mutated"}
+	if kb.sources[0] != srcA {
+		t.Fatalf("mutating cloned slice should not replace original source")
+	}
+}
+
+func TestStatsAddAndAvg(t *testing.T) {
 	buckets := []int{10, 20, 30}
-	ss := newSizeStats(buckets)
+	ss := loader.NewStats(buckets)
 
 	sizes := []int{5, 15, 25, 35}
 	for _, sz := range sizes {
-		ss.add(sz, buckets)
+		ss.Add(sz, buckets)
 	}
 
-	if ss.totalDocs != len(sizes) {
-		t.Fatalf("expected totalDocs %d, got %d", len(sizes), ss.totalDocs)
+	if ss.TotalDocs != len(sizes) {
+		t.Fatalf("expected TotalDocs %d, got %d", len(sizes), ss.TotalDocs)
 	}
 
-	if ss.minSize != 5 {
-		t.Fatalf("expected minSize 5, got %d", ss.minSize)
+	if ss.MinSize != 5 {
+		t.Fatalf("expected MinSize 5, got %d", ss.MinSize)
 	}
 
-	if ss.maxSize != 35 {
-		t.Fatalf("expected maxSize 35, got %d", ss.maxSize)
+	if ss.MaxSize != 35 {
+		t.Fatalf("expected MaxSize 35, got %d", ss.MaxSize)
 	}
 
 	wantAvg := float64(5+15+25+35) / 4
-	if got := ss.avg(); got != wantAvg {
+	if got := ss.Avg(); got != wantAvg {
 		t.Fatalf("unexpected avg: want %.2f, got %.2f", wantAvg, got)
-	}
-
-	// Ensure bucket counts add up.
-	totalBucketed := 0
-	for _, c := range ss.bucketCnts {
-		totalBucketed += c
-	}
-	if totalBucketed != len(sizes) {
-		t.Fatalf("bucket counts mismatch: want %d, got %d", len(sizes), totalBucketed)
 	}
 }
 
@@ -133,13 +210,13 @@ func TestCalcETA(t *testing.T) {
 	}
 }
 
-func TestSizeStatsLog(t *testing.T) {
+func TestStatsLog(t *testing.T) {
 	buckets := []int{10}
-	ss := newSizeStats(buckets)
-	ss.add(5, buckets)
+	ss := loader.NewStats(buckets)
+	ss.Add(5, buckets)
 
-	// Ensure ss.log does not panic.
-	ss.log(buckets)
+	// Ensure Log does not panic.
+	ss.Log(buckets)
 }
 
 // stubEmbedder returns a fixed embedding.
@@ -157,11 +234,11 @@ func (stubEmbedder) GetDimensions() int { return 3 }
 // stubVectorStore stores whether Add was invoked.
 
 type stubVectorStore struct {
-	added bool
+	added atomic.Bool
 }
 
 func (s *stubVectorStore) Add(ctx context.Context, doc *document.Document, emb []float64) error {
-	s.added = true
+	s.added.Store(true)
 	return nil
 }
 func (*stubVectorStore) Get(ctx context.Context, id string) (*document.Document, []float64, error) {
@@ -220,7 +297,7 @@ func TestAddDocument_EmbedderStore(t *testing.T) {
 	if err := kb.addDocument(context.Background(), doc); err != nil {
 		t.Fatalf("addDocument returned error: %v", err)
 	}
-	if !store.added {
+	if !store.added.Load() {
 		t.Fatalf("expected vector store Add to be called")
 	}
 }
@@ -351,6 +428,17 @@ func TestLoadOptions(t *testing.T) {
 				return kb
 			},
 			loadOptions: []LoadOption{WithDocConcurrency(2)},
+			expectError: false,
+		},
+		{
+			name: "WithEmbeddingBatchSize",
+			setupKB: func() *BuiltinKnowledge {
+				kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: 3}}))
+				kb.vectorStore = &stubVectorStore{}
+				kb.embedder = &recordingBatchEmbedder{}
+				return kb
+			},
+			loadOptions: []LoadOption{WithEmbeddingBatchSize(2)},
 			expectError: false,
 		},
 		{
@@ -530,6 +618,121 @@ func TestBuiltinKnowledge_SearchTableDriven(t *testing.T) {
 				if tt.validateResult != nil && !tt.validateResult(result) {
 					t.Errorf("Result validation failed for test case: %s", tt.name)
 				}
+			}
+		})
+	}
+}
+
+func TestBuiltinKnowledge_Search_FilterOnlyDefaultsToFilterMode(t *testing.T) {
+	mockRet := &mockRetriever{
+		result: &retriever.Result{
+			Documents: []*retriever.RelevantDocument{
+				{
+					Document: &document.Document{ID: "doc1", Content: "test content"},
+					Score:    1,
+				},
+			},
+		},
+	}
+	kb := &BuiltinKnowledge{retriever: mockRet}
+
+	_, err := kb.Search(context.Background(), &SearchRequest{
+		SearchFilter: &SearchFilter{
+			Metadata: map[string]any{"category": "test"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if mockRet.lastReq == nil {
+		t.Fatal("expected retriever request to be recorded")
+	}
+	if mockRet.lastReq.SearchMode != vectorstore.SearchModeFilter {
+		t.Fatalf("expected search mode %d, got %d", vectorstore.SearchModeFilter, mockRet.lastReq.SearchMode)
+	}
+	if mockRet.lastReq.Filter == nil || mockRet.lastReq.Filter.Metadata["category"] != "test" {
+		t.Fatal("expected metadata filter to be forwarded to retriever")
+	}
+}
+
+func TestBuiltinKnowledge_Search_WithQueryKeepsExplicitSearchMode(t *testing.T) {
+	mockRet := &mockRetriever{
+		result: &retriever.Result{
+			Documents: []*retriever.RelevantDocument{
+				{
+					Document: &document.Document{ID: "doc1", Content: "test content"},
+					Score:    1,
+				},
+			},
+		},
+	}
+	kb := &BuiltinKnowledge{retriever: mockRet}
+
+	_, err := kb.Search(context.Background(), &SearchRequest{
+		Query:      "test query",
+		SearchMode: vectorstore.SearchModeHybrid,
+		SearchFilter: &SearchFilter{
+			Metadata: map[string]any{"category": "test"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if mockRet.lastReq == nil {
+		t.Fatal("expected retriever request to be recorded")
+	}
+	if mockRet.lastReq.SearchMode != vectorstore.SearchModeHybrid {
+		t.Fatalf("expected search mode %d, got %d", vectorstore.SearchModeHybrid, mockRet.lastReq.SearchMode)
+	}
+}
+
+func TestHasSearchFilter(t *testing.T) {
+	tests := []struct {
+		name   string
+		filter *SearchFilter
+		want   bool
+	}{
+		{
+			name:   "nil filter",
+			filter: nil,
+			want:   false,
+		},
+		{
+			name:   "empty filter",
+			filter: &SearchFilter{},
+			want:   false,
+		},
+		{
+			name: "document ids",
+			filter: &SearchFilter{
+				DocumentIDs: []string{"doc1"},
+			},
+			want: true,
+		},
+		{
+			name: "metadata",
+			filter: &SearchFilter{
+				Metadata: map[string]any{"category": "test"},
+			},
+			want: true,
+		},
+		{
+			name: "filter condition",
+			filter: &SearchFilter{
+				FilterCondition: &searchfilter.UniversalFilterCondition{
+					Field:    "category",
+					Operator: searchfilter.OperatorEqual,
+					Value:    "test",
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasSearchFilter(tt.filter); got != tt.want {
+				t.Fatalf("hasSearchFilter() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -825,9 +1028,11 @@ type mockRetriever struct {
 	result   *retriever.Result
 	err      error
 	closeErr error
+	lastReq  *retriever.Query
 }
 
 func (m *mockRetriever) Retrieve(ctx context.Context, req *retriever.Query) (*retriever.Result, error) {
+	m.lastReq = req
 	return m.result, m.err
 }
 
@@ -980,7 +1185,7 @@ func (s *syncMockVectorStore) DeleteByFilter(
 }
 
 func (s *syncMockVectorStore) GetMetadata(ctx context.Context, opts ...vectorstore.GetMetadataOption) (map[string]vectorstore.DocumentMetadata, error) {
-	s.mu.RLock()
+	s.mu.Lock()
 	s.getMetaCalls++
 	config := &vectorstore.GetMetadataConfig{}
 	for _, opt := range opts {
@@ -999,7 +1204,7 @@ func (s *syncMockVectorStore) GetMetadata(ctx context.Context, opts ...vectorsto
 			result[id] = meta
 		}
 	}
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	return result, nil
 }
 
@@ -1511,6 +1716,64 @@ func TestLoad_WithSync(t *testing.T) {
 	err = kb.Load(ctx)
 	if err != nil {
 		t.Fatalf("Second load failed: %v", err)
+	}
+}
+
+func TestLoad_WithSync_CleansDeletedDocumentsAcrossLoads(t *testing.T) {
+	src := &stableSyncSource{
+		name: "stable-source",
+		docs: []*document.Document{
+			newStableSyncTestDocument("a.md", 0, "content-a"),
+			newStableSyncTestDocument("b.md", 0, "content-b"),
+		},
+		metadata: map[string]any{
+			"type": []string{"mock"},
+		},
+	}
+
+	kb := New(
+		WithSources([]source.Source{src}),
+		WithEnableSourceSync(true),
+	)
+	store := newSyncMockVectorStore()
+	kb.vectorStore = store
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+
+	if err := kb.Load(ctx); err != nil {
+		t.Fatalf("first load failed: %v", err)
+	}
+
+	metas, err := store.GetMetadata(ctx)
+	if err != nil {
+		t.Fatalf("GetMetadata after first load failed: %v", err)
+	}
+	if len(metas) != 2 {
+		t.Fatalf("after first load, got %d documents, want 2", len(metas))
+	}
+
+	src.docs = []*document.Document{
+		newStableSyncTestDocument("a.md", 0, "content-a"),
+	}
+
+	if err := kb.Load(ctx); err != nil {
+		t.Fatalf("second load failed: %v", err)
+	}
+
+	metas, err = store.GetMetadata(ctx)
+	if err != nil {
+		t.Fatalf("GetMetadata after second load failed: %v", err)
+	}
+	if len(metas) != 1 {
+		t.Fatalf("after second load, got %d documents, want 1", len(metas))
+	}
+
+	for _, meta := range metas {
+		uri, _ := meta.Metadata[source.MetaURI].(string)
+		if uri != "a.md" {
+			t.Fatalf("after second load, found unexpected remaining uri %q", uri)
+		}
 	}
 }
 
@@ -2125,5 +2388,1302 @@ func TestBuiltinKnowledge_ShowDocumentInfo(t *testing.T) {
 				t.Errorf("Result validation failed for test case '%s'", tt.name)
 			}
 		})
+	}
+}
+
+// TestWithLoadProgressCallback_Sequential verifies that the progress callback
+// is invoked during sequential loading and receives correct event fields.
+func TestWithLoadProgressCallback_Sequential(t *testing.T) {
+	const docCount = 5
+	const step = 2
+
+	var mu sync.Mutex
+	var events []LoadProgressEvent
+
+	kb := New(WithSources([]source.Source{&mockSource{name: "src1", docCount: docCount}}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithProgressStepSize(step),
+		WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(events) == 0 {
+		t.Fatal("expected at least one progress event, got none")
+	}
+
+	// The final event should be a Done event.
+	if !events[len(events)-1].Done {
+		t.Error("expected last event to have Done=true")
+	}
+
+	// Filter out Done events for source-level assertions.
+	var progressEvents []LoadProgressEvent
+	for _, ev := range events {
+		if !ev.Done && ev.Err == nil {
+			progressEvents = append(progressEvents, ev)
+		}
+	}
+	if len(progressEvents) == 0 {
+		t.Fatal("expected at least one non-Done progress event, got none")
+	}
+
+	// Last progress event must report Processed == Total (final boundary).
+	last := progressEvents[len(progressEvents)-1]
+	if last.SourceProcessed != docCount || last.SourceTotal != docCount {
+		t.Errorf("last event: want Processed=Total=%d, got Processed=%d Total=%d",
+			docCount, last.SourceProcessed, last.SourceTotal)
+	}
+	if last.SourceName != "src1" {
+		t.Errorf("expected SourceName=src1, got %s", last.SourceName)
+	}
+
+	// Every progress event must have Processed in range [1, Total].
+	for _, ev := range progressEvents {
+		if ev.SourceProcessed < 1 || ev.SourceProcessed > ev.SourceTotal {
+			t.Errorf("event out of range: Processed=%d Total=%d", ev.SourceProcessed, ev.SourceTotal)
+		}
+		// Sequential path always populates Elapsed (>= 0; usually > 0 except for
+		// nearly-instant test stubs, so just check it's non-negative).
+		if ev.SourceElapsed < 0 {
+			t.Errorf("Elapsed should be non-negative, got %s", ev.SourceElapsed)
+		}
+	}
+}
+
+// TestWithLoadProgressCallback_Concurrent verifies that the callback is invoked
+// during concurrent loading across multiple sources.
+func TestWithLoadProgressCallback_Concurrent(t *testing.T) {
+	const docCount = 4
+
+	var mu sync.Mutex
+	seenSources := make(map[string]int) // sourceName -> max Processed seen
+
+	kb := New(WithSources([]source.Source{
+		&mockSource{name: "src-a", docCount: docCount},
+		&mockSource{name: "src-b", docCount: docCount},
+	}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(2),
+		WithDocConcurrency(2),
+		WithProgressStepSize(1),
+		WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+			mu.Lock()
+			if ev.SourceProcessed > seenSources[ev.SourceName] {
+				seenSources[ev.SourceName] = ev.SourceProcessed
+			}
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, name := range []string{"src-a", "src-b"} {
+		if seenSources[name] == 0 {
+			t.Errorf("no progress events received for source %s", name)
+		}
+	}
+}
+
+// TestWithLoadProgressCallback_NilCallback verifies that nil callback does not panic.
+func TestWithLoadProgressCallback_NilCallback(t *testing.T) {
+	kb := New(WithSources([]source.Source{&mockSource{name: "src1", docCount: 3}}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithLoadProgressCallback(nil),
+	)
+	if err != nil {
+		t.Fatalf("Load with nil callback failed: %v", err)
+	}
+}
+
+// TestWithLoadProgressCallback_CoexistsWithShowProgress verifies that callback
+// and log-based progress can be used together without conflict.
+func TestWithLoadProgressCallback_CoexistsWithShowProgress(t *testing.T) {
+	var callbackInvoked bool
+
+	kb := New(WithSources([]source.Source{&mockSource{name: "src1", docCount: 2}}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithShowProgress(true),
+		WithProgressStepSize(1),
+		WithLoadProgressCallback(func(_ context.Context, _ LoadProgressEvent) {
+			callbackInvoked = true
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !callbackInvoked {
+		t.Error("expected callback to be invoked alongside ShowProgress, but it was not")
+	}
+}
+
+// TestWithLoadProgressCallback_NilCallback_Concurrent verifies that nil callback
+// does not panic when loading concurrently.
+func TestWithLoadProgressCallback_NilCallback_Concurrent(t *testing.T) {
+	kb := New(WithSources([]source.Source{
+		&mockSource{name: "src-a", docCount: 3},
+		&mockSource{name: "src-b", docCount: 3},
+	}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(2),
+		WithDocConcurrency(2),
+		WithLoadProgressCallback(nil),
+	)
+	if err != nil {
+		t.Fatalf("Load with nil callback (concurrent) failed: %v", err)
+	}
+}
+
+// TestWithLoadProgressCallback_ConcurrentElapsedAndETA verifies that concurrent
+// progress events carry non-zero SourceElapsed and reasonable SourceETA values.
+func TestWithLoadProgressCallback_ConcurrentElapsedAndETA(t *testing.T) {
+	const docCount = 5
+
+	var mu sync.Mutex
+	var progressEvents []LoadProgressEvent
+
+	kb := New(WithSources([]source.Source{&mockSource{name: "src1", docCount: docCount}}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(2),
+		WithDocConcurrency(2),
+		WithProgressStepSize(1),
+		WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+			mu.Lock()
+			if !ev.Done && ev.Err == nil {
+				progressEvents = append(progressEvents, ev)
+			}
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(progressEvents) == 0 {
+		t.Fatal("expected at least one progress event, got none")
+	}
+
+	for _, ev := range progressEvents {
+		if ev.SourceElapsed < 0 {
+			t.Errorf("SourceElapsed should be non-negative, got %s", ev.SourceElapsed)
+		}
+		if ev.SourceETA < 0 {
+			t.Errorf("SourceETA should be non-negative, got %s", ev.SourceETA)
+		}
+	}
+
+	// Concurrent events may arrive in any order; find the maximum.
+	var maxProcessed int
+	for _, ev := range progressEvents {
+		if ev.SourceProcessed > maxProcessed {
+			maxProcessed = ev.SourceProcessed
+		}
+	}
+	if maxProcessed != docCount {
+		t.Errorf("max SourceProcessed: want %d, got %d", docCount, maxProcessed)
+	}
+}
+
+// failAfterNVectorStore fails the Add call after n successful invocations.
+type failAfterNVectorStore struct {
+	stubVectorStore
+	n     int
+	count atomic.Int64
+}
+
+func (f *failAfterNVectorStore) Add(ctx context.Context, doc *document.Document, emb []float64) error {
+	if int(f.count.Add(1)) > f.n {
+		return fmt.Errorf("simulated add failure")
+	}
+	return nil
+}
+
+// TestWithLoadProgressCallback_ConcurrentErrorHasSourceProcessed verifies that
+// the error event in concurrent loading populates SourceProcessed.
+func TestWithLoadProgressCallback_ConcurrentErrorHasSourceProcessed(t *testing.T) {
+	const docCount = 5
+	const failAfter = 2
+
+	var mu sync.Mutex
+	var errorEvents []LoadProgressEvent
+
+	kb := New(WithSources([]source.Source{&mockSource{name: "src1", docCount: docCount}}))
+	kb.vectorStore = &failAfterNVectorStore{n: failAfter}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	_ = kb.Load(ctx,
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithProgressStepSize(1),
+		WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+			mu.Lock()
+			if ev.Err != nil {
+				errorEvents = append(errorEvents, ev)
+			}
+			mu.Unlock()
+		}),
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(errorEvents) == 0 {
+		t.Fatal("expected at least one error event, got none")
+	}
+
+	for _, ev := range errorEvents {
+		if ev.SourceTotal != docCount {
+			t.Errorf("error event: want SourceTotal=%d, got %d", docCount, ev.SourceTotal)
+		}
+		if ev.SourceName != "src1" {
+			t.Errorf("error event: want SourceName=src1, got %s", ev.SourceName)
+		}
+	}
+}
+
+// TestWithLoadProgressCallback_SequentialErrorHasElapsed verifies that the error
+// event in sequential loading populates SourceElapsed.
+func TestWithLoadProgressCallback_SequentialErrorHasElapsed(t *testing.T) {
+	const docCount = 4
+	const failAfter = 2
+
+	var mu sync.Mutex
+	var errorEvents []LoadProgressEvent
+
+	kb := New(WithSources([]source.Source{&mockSource{name: "src1", docCount: docCount}}))
+	kb.vectorStore = &failAfterNVectorStore{n: failAfter}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	_ = kb.Load(ctx,
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithProgressStepSize(1),
+		WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+			mu.Lock()
+			if ev.Err != nil {
+				errorEvents = append(errorEvents, ev)
+			}
+			mu.Unlock()
+		}),
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(errorEvents) == 0 {
+		t.Fatal("expected at least one error event, got none")
+	}
+
+	ev := errorEvents[0]
+	if ev.SourceProcessed != failAfter {
+		t.Errorf("error event: want SourceProcessed=%d, got %d", failAfter, ev.SourceProcessed)
+	}
+	if ev.SourceElapsed <= 0 {
+		t.Errorf("error event: want positive SourceElapsed, got %s", ev.SourceElapsed)
+	}
+}
+
+// TestWithLoadProgressCallback_DoneEventState verifies the Done event is the
+// final event with Done=true and Err=nil.
+func TestWithLoadProgressCallback_DoneEventState(t *testing.T) {
+	const docCount = 3
+
+	var mu sync.Mutex
+	var events []LoadProgressEvent
+
+	kb := New(WithSources([]source.Source{
+		&mockSource{name: "src1", docCount: docCount},
+		&mockSource{name: "src2", docCount: docCount},
+	}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(2),
+		WithDocConcurrency(2),
+		WithProgressStepSize(1),
+		WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(events) == 0 {
+		t.Fatal("expected at least one event, got none")
+	}
+
+	lastEv := events[len(events)-1]
+	if !lastEv.Done {
+		t.Error("last event should have Done=true")
+	}
+	if lastEv.Err != nil {
+		t.Errorf("Done event should have nil Err, got %v", lastEv.Err)
+	}
+
+	// Verify no event has Done=true AND Err!=nil.
+	for i, ev := range events {
+		if ev.Done && ev.Err != nil {
+			t.Errorf("event[%d]: Done=true with Err=%v, this combination should never occur", i, ev.Err)
+		}
+	}
+
+	// Verify Done appears exactly once.
+	doneCount := 0
+	for _, ev := range events {
+		if ev.Done {
+			doneCount++
+		}
+	}
+	if doneCount != 1 {
+		t.Errorf("expected exactly 1 Done event, got %d", doneCount)
+	}
+}
+
+// TestWithLoadProgressCallback_SequentialTotalField verifies that the Total
+// field (global processed count) is populated in sequential progress events.
+func TestWithLoadProgressCallback_SequentialTotalField(t *testing.T) {
+	const docCount = 4
+
+	var mu sync.Mutex
+	var events []LoadProgressEvent
+
+	kb := New(WithSources([]source.Source{
+		&mockSource{name: "src1", docCount: docCount},
+		&mockSource{name: "src2", docCount: docCount},
+	}))
+	kb.vectorStore = &stubVectorStore{}
+	kb.embedder = stubEmbedder{}
+
+	ctx := context.Background()
+	err := kb.Load(ctx,
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithProgressStepSize(1),
+		WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+			mu.Lock()
+			if !ev.Done && ev.Err == nil {
+				events = append(events, ev)
+			}
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(events) == 0 {
+		t.Fatal("expected at least one progress event, got none")
+	}
+
+	// Total should be monotonically non-decreasing.
+	var prevTotal int
+	for _, ev := range events {
+		if ev.Total < prevTotal {
+			t.Errorf("Total decreased from %d to %d", prevTotal, ev.Total)
+		}
+		prevTotal = ev.Total
+	}
+
+	// The last progress event should have Total == 2*docCount.
+	last := events[len(events)-1]
+	if last.Total != 2*docCount {
+		t.Errorf("last event: want Total=%d, got %d", 2*docCount, last.Total)
+	}
+}
+
+// recordingBatchEmbedder implements embedder.BatchEmbedder and records how
+// ingestion groups documents into requests. batchFunc, when set, replaces the
+// well-formed response so tests can inject malformed batches.
+type recordingBatchEmbedder struct {
+	mu          sync.Mutex
+	batchSizes  []int
+	batchTexts  [][]string
+	singleCalls int
+
+	dimensions int
+	batchFunc  func(texts []string) ([][]float64, error)
+}
+
+func (e *recordingBatchEmbedder) GetEmbedding(_ context.Context, text string) ([]float64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.singleCalls++
+	return embeddingForText(text), nil
+}
+
+func (e *recordingBatchEmbedder) GetEmbeddingWithUsage(
+	ctx context.Context,
+	text string,
+) ([]float64, map[string]any, error) {
+	embedding, err := e.GetEmbedding(ctx, text)
+	return embedding, nil, err
+}
+
+func (e *recordingBatchEmbedder) GetDimensions() int {
+	if e.dimensions == 0 {
+		return 3
+	}
+	return e.dimensions
+}
+
+func (e *recordingBatchEmbedder) GetEmbeddings(
+	ctx context.Context,
+	texts []string,
+) ([][]float64, error) {
+	e.mu.Lock()
+	e.batchSizes = append(e.batchSizes, len(texts))
+	e.batchTexts = append(e.batchTexts, slices.Clone(texts))
+	batchFunc := e.batchFunc
+	e.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if batchFunc != nil {
+		return batchFunc(texts)
+	}
+	embeddings := make([][]float64, len(texts))
+	for i, text := range texts {
+		embeddings[i] = embeddingForText(text)
+	}
+	return embeddings, nil
+}
+
+// requestSizes returns the recorded batch sizes in ascending order so that
+// concurrent loads can be asserted without depending on completion order.
+func (e *recordingBatchEmbedder) requestSizes() []int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sizes := slices.Clone(e.batchSizes)
+	sort.Ints(sizes)
+	return sizes
+}
+
+func (e *recordingBatchEmbedder) requestCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.batchSizes)
+}
+
+func (e *recordingBatchEmbedder) singleCallCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.singleCalls
+}
+
+// embeddingForText derives a deterministic vector from the embedded text so
+// that tests can prove each stored vector belongs to its own document.
+func embeddingForText(text string) []float64 {
+	return []float64{float64(len(text)), float64(strings.Count(text, "e")), 1}
+}
+
+// batchRecordingVectorStore records the embedding stored for every document
+// and can fail Add after a given number of successful writes.
+type batchRecordingVectorStore struct {
+	stubVectorStore
+	mu         sync.Mutex
+	embeddings map[string][]float64
+
+	// failAfter fails every Add beyond the first failAfter calls when > 0.
+	failAfter int
+	calls     atomic.Int64
+}
+
+func (s *batchRecordingVectorStore) Add(_ context.Context, doc *document.Document, emb []float64) error {
+	if s.failAfter > 0 && int(s.calls.Add(1)) > s.failAfter {
+		return fmt.Errorf("simulated add failure")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.embeddings == nil {
+		s.embeddings = make(map[string][]float64)
+	}
+	s.embeddings[doc.ID] = emb
+	return nil
+}
+
+func (s *batchRecordingVectorStore) storedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.embeddings)
+}
+
+func (s *batchRecordingVectorStore) storedEmbedding(id string) ([]float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	emb, ok := s.embeddings[id]
+	return emb, ok
+}
+
+// TestLoad_EmbeddingBatch_RequestCount verifies that N documents with an
+// effective batch size of B produce ceil(N/B) embedding requests, including
+// the short trailing batch, on both the sequential and the concurrent path.
+func TestLoad_EmbeddingBatch_RequestCount(t *testing.T) {
+	const docCount = 5
+	const batchSize = 2
+
+	tests := []struct {
+		name        string
+		concurrency []LoadOption
+	}{
+		{
+			name:        "sequential",
+			concurrency: []LoadOption{WithSourceConcurrency(1), WithDocConcurrency(1)},
+		},
+		{
+			name:        "concurrent",
+			concurrency: []LoadOption{WithSourceConcurrency(1), WithDocConcurrency(2)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			emb := &recordingBatchEmbedder{}
+			vs := &batchRecordingVectorStore{}
+			kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}))
+			kb.vectorStore = vs
+			kb.embedder = emb
+
+			opts := append(tt.concurrency,
+				WithEmbeddingBatchSize(batchSize),
+				WithShowProgress(false),
+				WithShowStats(false),
+			)
+			if err := kb.Load(context.Background(), opts...); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			want := []int{1, 2, 2}
+			if got := emb.requestSizes(); !slices.Equal(got, want) {
+				t.Errorf("batch sizes = %v, want %v", got, want)
+			}
+			if got := emb.singleCallCount(); got != 0 {
+				t.Errorf("per-document embedding calls = %d, want 0", got)
+			}
+			if got := vs.storedCount(); got != docCount {
+				t.Errorf("stored documents = %d, want %d", got, docCount)
+			}
+		})
+	}
+}
+
+// TestLoad_EmbeddingBatch_BindsVectorsToDocuments verifies that every document
+// is stored with the vector generated from its own embedding text.
+func TestLoad_EmbeddingBatch_BindsVectorsToDocuments(t *testing.T) {
+	const docCount = 7
+
+	src := &mockSource{name: "test", docCount: docCount}
+	docs, err := src.ReadDocuments(context.Background())
+	if err != nil {
+		t.Fatalf("ReadDocuments() error = %v", err)
+	}
+
+	vs := &batchRecordingVectorStore{}
+	kb := New(WithSources([]source.Source{src}))
+	kb.vectorStore = vs
+	kb.embedder = &recordingBatchEmbedder{}
+
+	if err := kb.Load(context.Background(),
+		WithSourceConcurrency(1),
+		WithDocConcurrency(3),
+		WithEmbeddingBatchSize(3),
+		WithShowProgress(false),
+		WithShowStats(false),
+	); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	for _, doc := range docs {
+		stored, ok := vs.storedEmbedding(doc.ID)
+		if !ok {
+			t.Fatalf("document %s was not stored", doc.ID)
+		}
+		want := embeddingForText(buildEmbeddingText(doc))
+		if !slices.Equal(stored, want) {
+			t.Errorf("document %s stored %v, want %v", doc.ID, stored, want)
+		}
+	}
+}
+
+// recordingEmbedder implements only embedder.Embedder, so ingestion cannot use
+// the batch path with it.
+type recordingEmbedder struct {
+	calls atomic.Int64
+}
+
+func (e *recordingEmbedder) GetEmbedding(_ context.Context, text string) ([]float64, error) {
+	e.calls.Add(1)
+	return embeddingForText(text), nil
+}
+
+func (e *recordingEmbedder) GetEmbeddingWithUsage(
+	ctx context.Context,
+	text string,
+) ([]float64, map[string]any, error) {
+	embedding, err := e.GetEmbedding(ctx, text)
+	return embedding, nil, err
+}
+
+func (*recordingEmbedder) GetDimensions() int { return 3 }
+
+// TestLoad_EmbeddingBatch_FallsBackToSingleRequests verifies that the
+// per-document path stays in effect whenever batching cannot be applied, still
+// issuing one embedding request per document.
+func TestLoad_EmbeddingBatch_FallsBackToSingleRequests(t *testing.T) {
+	const docCount = 4
+
+	tests := []struct {
+		name       string
+		sourceSync bool
+		batchSize  int
+		// plainEmbedder selects an embedder without batch support.
+		plainEmbedder bool
+		// noEmbedder leaves the knowledge base without an embedder, as
+		// configured for a vector store that embeds remotely.
+		noEmbedder bool
+	}{
+		{name: "option not set", batchSize: 0},
+		{name: "batch size one", batchSize: 1},
+		{name: "embedder without batch support", batchSize: 4, plainEmbedder: true},
+		{name: "no embedder configured", batchSize: 4, noEmbedder: true},
+		{name: "source sync enabled", batchSize: 4, sourceSync: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batchCapable := &recordingBatchEmbedder{}
+			plain := &recordingEmbedder{}
+			store := &batchRecordingVectorStore{}
+			kb := New(
+				WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}),
+				WithEnableSourceSync(tt.sourceSync),
+			)
+			kb.vectorStore = store
+			switch {
+			case tt.noEmbedder:
+			case tt.plainEmbedder:
+				kb.embedder = plain
+			default:
+				kb.embedder = batchCapable
+			}
+
+			if err := kb.Load(context.Background(),
+				WithSourceConcurrency(1),
+				WithDocConcurrency(2),
+				WithEmbeddingBatchSize(tt.batchSize),
+				WithShowProgress(false),
+				WithShowStats(false),
+			); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			if got := batchCapable.requestCount(); got != 0 {
+				t.Errorf("batch requests = %d, want 0", got)
+			}
+			if tt.noEmbedder {
+				// The store receives the documents without an embedding, so
+				// there is no embedding request of either shape to count.
+				if got := store.storedCount(); got != docCount {
+					t.Errorf("stored documents = %d, want %d", got, docCount)
+				}
+				return
+			}
+			singleCalls := batchCapable.singleCallCount()
+			if tt.plainEmbedder {
+				singleCalls = int(plain.calls.Load())
+			}
+			if singleCalls != docCount {
+				t.Errorf("per-document embedding calls = %d, want %d", singleCalls, docCount)
+			}
+		})
+	}
+}
+
+// TestLoad_EmbeddingBatch_RejectsInvalidResponse verifies that a batch is
+// validated as a whole, so an invalid response stores none of its documents.
+func TestLoad_EmbeddingBatch_RejectsInvalidResponse(t *testing.T) {
+	const docCount = 3
+
+	tests := []struct {
+		name      string
+		batchFunc func(texts []string) ([][]float64, error)
+	}{
+		{
+			name: "count mismatch",
+			batchFunc: func(texts []string) ([][]float64, error) {
+				return make([][]float64, len(texts)-1), nil
+			},
+		},
+		{
+			name: "empty vector",
+			batchFunc: func(texts []string) ([][]float64, error) {
+				embeddings := validEmbeddings(len(texts))
+				embeddings[len(texts)-1] = nil
+				return embeddings, nil
+			},
+		},
+		{
+			name: "dimension mismatch within batch",
+			batchFunc: func(texts []string) ([][]float64, error) {
+				embeddings := validEmbeddings(len(texts))
+				embeddings[len(texts)-1] = []float64{1, 2}
+				return embeddings, nil
+			},
+		},
+		{
+			name: "not a number",
+			batchFunc: func(texts []string) ([][]float64, error) {
+				embeddings := validEmbeddings(len(texts))
+				embeddings[0][1] = math.NaN()
+				return embeddings, nil
+			},
+		},
+		{
+			name: "infinite value",
+			batchFunc: func(texts []string) ([][]float64, error) {
+				embeddings := validEmbeddings(len(texts))
+				embeddings[0][2] = math.Inf(-1)
+				return embeddings, nil
+			},
+		},
+		{
+			name: "request failure",
+			batchFunc: func(texts []string) ([][]float64, error) {
+				return nil, fmt.Errorf("simulated provider failure")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vs := &batchRecordingVectorStore{}
+			kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}))
+			kb.vectorStore = vs
+			kb.embedder = &recordingBatchEmbedder{batchFunc: tt.batchFunc}
+
+			err := kb.Load(context.Background(),
+				WithSourceConcurrency(1),
+				WithDocConcurrency(1),
+				WithEmbeddingBatchSize(docCount),
+				WithShowProgress(false),
+				WithShowStats(false),
+			)
+			if err == nil {
+				t.Fatal("Load() error = nil, want an error")
+			}
+			if got := vs.storedCount(); got != 0 {
+				t.Errorf("stored documents = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func validEmbeddings(n int) [][]float64 {
+	embeddings := make([][]float64, n)
+	for i := range embeddings {
+		embeddings[i] = []float64{1, 2, 3}
+	}
+	return embeddings
+}
+
+// TestLoad_EmbeddingBatch_KeepsDocumentsStoredBeforeFailure verifies the
+// non-transactional store semantics: a failure part-way through a batch keeps
+// the documents already written and still reports the error.
+func TestLoad_EmbeddingBatch_KeepsDocumentsStoredBeforeFailure(t *testing.T) {
+	const docCount = 3
+	const storedBeforeFailure = 1
+
+	vs := &batchRecordingVectorStore{failAfter: storedBeforeFailure}
+	kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}))
+	kb.vectorStore = vs
+	kb.embedder = &recordingBatchEmbedder{}
+
+	err := kb.Load(context.Background(),
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithEmbeddingBatchSize(docCount),
+		WithShowProgress(false),
+		WithShowStats(false),
+	)
+	if err == nil {
+		t.Fatal("Load() error = nil, want an error")
+	}
+	if got := vs.storedCount(); got != storedBeforeFailure {
+		t.Errorf("stored documents = %d, want %d", got, storedBeforeFailure)
+	}
+}
+
+// TestLoad_EmbeddingBatch_StopsAfterContextCancel verifies that no further
+// batch is submitted and no further document is stored once the caller cancels.
+func TestLoad_EmbeddingBatch_StopsAfterContextCancel(t *testing.T) {
+	const docCount = 8
+	const batchSize = 2
+	const totalBatches = docCount / batchSize
+
+	tests := []struct {
+		name           string
+		docConcurrency int
+		// maxRequests bounds the batches that may already be in flight when
+		// the cancellation is observed.
+		maxRequests int
+	}{
+		{name: "sequential", docConcurrency: 1, maxRequests: 1},
+		{name: "concurrent", docConcurrency: 2, maxRequests: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			emb := &recordingBatchEmbedder{}
+			emb.batchFunc = func(texts []string) ([][]float64, error) {
+				// Cancel while the first batch is in flight.
+				cancel()
+				return validEmbeddings(len(texts)), nil
+			}
+			vs := &batchRecordingVectorStore{}
+			kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}))
+			kb.vectorStore = vs
+			kb.embedder = emb
+
+			err := kb.Load(ctx,
+				WithSourceConcurrency(1),
+				WithDocConcurrency(tt.docConcurrency),
+				WithEmbeddingBatchSize(batchSize),
+				WithShowProgress(false),
+				WithShowStats(false),
+			)
+			if err == nil {
+				t.Fatal("Load() error = nil, want a cancellation error")
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Load() error = %v, want it to wrap context.Canceled", err)
+			}
+			if got := emb.requestCount(); got > tt.maxRequests {
+				t.Errorf("batch requests = %d, want at most %d of %d", got, tt.maxRequests, totalBatches)
+			}
+			if got := vs.storedCount(); got != 0 {
+				t.Errorf("stored documents = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// TestLoad_EmbeddingBatch_ProgressCountsEveryDocument verifies that progress
+// accounting stays per document when the unit of work is a batch.
+func TestLoad_EmbeddingBatch_ProgressCountsEveryDocument(t *testing.T) {
+	const docCount = 6
+	const batchSize = 4
+
+	tests := []struct {
+		name           string
+		docConcurrency int
+	}{
+		{name: "sequential", docConcurrency: 1},
+		{name: "concurrent", docConcurrency: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var events []LoadProgressEvent
+
+			kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}))
+			kb.vectorStore = &batchRecordingVectorStore{}
+			kb.embedder = &recordingBatchEmbedder{}
+
+			if err := kb.Load(context.Background(),
+				WithSourceConcurrency(1),
+				WithDocConcurrency(tt.docConcurrency),
+				WithEmbeddingBatchSize(batchSize),
+				WithProgressStepSize(1),
+				WithShowProgress(false),
+				WithShowStats(false),
+				WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+					mu.Lock()
+					events = append(events, ev)
+					mu.Unlock()
+				}),
+			); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			var maxProcessed int
+			for _, ev := range events {
+				if ev.Done || ev.Err != nil {
+					continue
+				}
+				if ev.SourceTotal != docCount {
+					t.Errorf("SourceTotal = %d, want %d", ev.SourceTotal, docCount)
+				}
+				maxProcessed = max(maxProcessed, ev.SourceProcessed)
+			}
+			if maxProcessed != docCount {
+				t.Errorf("max SourceProcessed = %d, want %d", maxProcessed, docCount)
+			}
+		})
+	}
+}
+
+// TestLoad_EmbeddingBatch_ProgressReportsAtMostOneUpdatePerBatch verifies that
+// a batch whose count does not land on a progress step boundary is still
+// reported, and that a batch crossing several boundaries is reported once with
+// the number of documents actually processed. Reporting only counts that are an
+// exact multiple of the step size would drop those updates, because a batch
+// advances the count by its own size rather than by one document.
+func TestLoad_EmbeddingBatch_ProgressReportsAtMostOneUpdatePerBatch(t *testing.T) {
+	const docCount = 24
+
+	tests := []struct {
+		name           string
+		docConcurrency int
+		batchSize      int
+		stepSize       int
+		want           []int
+	}{
+		// Batches end at 4, 8, 12, 16, 20 and 24 while the boundaries are at
+		// 10 and 20, so only the update at 20 is an exact multiple.
+		{name: "unaligned batch sequential", docConcurrency: 1, batchSize: 4, stepSize: 10, want: []int{12, 20, docCount}},
+		{name: "unaligned batch concurrent", docConcurrency: 2, batchSize: 4, stepSize: 10, want: []int{12, 20, docCount}},
+		// A batch of twelve crosses the boundaries at 5 and 10 at once and is
+		// reported by a single update carrying the twelve documents it really
+		// processed, not one update per boundary.
+		{name: "batch larger than step sequential", docConcurrency: 1, batchSize: 12, stepSize: 5, want: []int{12, docCount}},
+		{name: "batch larger than step concurrent", docConcurrency: 2, batchSize: 12, stepSize: 5, want: []int{12, docCount}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var processed []int
+
+			kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}))
+			kb.vectorStore = &batchRecordingVectorStore{}
+			kb.embedder = &recordingBatchEmbedder{}
+
+			if err := kb.Load(context.Background(),
+				WithSourceConcurrency(1),
+				WithDocConcurrency(tt.docConcurrency),
+				WithEmbeddingBatchSize(tt.batchSize),
+				WithProgressStepSize(tt.stepSize),
+				WithShowProgress(false),
+				WithShowStats(false),
+				WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+					if ev.Done || ev.Err != nil {
+						return
+					}
+					mu.Lock()
+					processed = append(processed, ev.SourceProcessed)
+					mu.Unlock()
+				}),
+			); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			sort.Ints(processed)
+
+			if !slices.Equal(processed, tt.want) {
+				t.Errorf("reported document counts = %v, want %v", processed, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoad_EmbeddingBatch_ErrorProgressCountsPartialWrites pins that a store
+// failure inside a batch reports the documents that batch already wrote. A
+// batch writes one document at a time and keeps the completed writes, so an
+// event reporting the batch start would disagree with what is persisted.
+func TestLoad_EmbeddingBatch_ErrorProgressCountsPartialWrites(t *testing.T) {
+	tests := []struct {
+		name           string
+		docCount       int
+		batchSize      int
+		docConcurrency int
+		failAfter      int
+		want           int
+		// wantStats is the document count of the statistics summary. The
+		// sequential path records the size of every document it read before
+		// storing any of them, so its summary counts the whole source. The
+		// concurrent path records each unit of work as it completes, so it
+		// must still describe the documents a failed batch left persisted.
+		wantStats int
+	}{
+		// The first batch stores three documents, then the second document of
+		// the second batch fails, leaving four documents persisted.
+		{name: "sequential", docCount: 6, batchSize: 3, docConcurrency: 1, failAfter: 4, want: 4, wantStats: 6},
+		// One batch keeps the failing write deterministic under concurrency:
+		// the second write of the only batch fails after one document.
+		{name: "concurrent", docCount: 3, batchSize: 3, docConcurrency: 2, failAfter: 1, want: 1, wantStats: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := &statsCapturingLogger{Logger: log.Default}
+			originalLogger := log.Default
+			log.Default = logger
+			defer func() { log.Default = originalLogger }()
+
+			store := &batchRecordingVectorStore{failAfter: tt.failAfter}
+			kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: tt.docCount}}))
+			kb.vectorStore = store
+			kb.embedder = &recordingBatchEmbedder{}
+
+			var mu sync.Mutex
+			var reported []int
+			var reportedTotals []int
+
+			err := kb.Load(context.Background(),
+				WithSourceConcurrency(1),
+				WithDocConcurrency(tt.docConcurrency),
+				WithEmbeddingBatchSize(tt.batchSize),
+				WithShowProgress(false),
+				WithShowStats(true),
+				WithLoadProgressCallback(func(_ context.Context, ev LoadProgressEvent) {
+					if ev.Err == nil {
+						return
+					}
+					mu.Lock()
+					reported = append(reported, ev.SourceProcessed)
+					reportedTotals = append(reportedTotals, ev.Total)
+					mu.Unlock()
+				}),
+			)
+			if err == nil {
+				t.Fatal("Load() error = nil, want the simulated store failure")
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			// The concurrent path reports the failing unit of work and then
+			// the failing source, so every error event must agree.
+			if len(reported) == 0 {
+				t.Fatal("no error event was reported")
+			}
+			for _, got := range reported {
+				if got != tt.want {
+					t.Errorf("SourceProcessed on failure = %v, want every error event to report %d",
+						reported, tt.want)
+					break
+				}
+			}
+			// The single source of this load holds every document, so the
+			// load total must not lag behind the source count.
+			for _, got := range reportedTotals {
+				if got != tt.want {
+					t.Errorf("Total on failure = %v, want every error event to report %d",
+						reportedTotals, tt.want)
+					break
+				}
+			}
+			if got := store.storedCount(); got != tt.want {
+				t.Errorf("documents persisted = %d, want %d, so the event disagrees with the store",
+					got, tt.want)
+			}
+			// The statistics are reported once the load closes, and only when
+			// at least one document was recorded, so dropping the partial
+			// writes of a failed first batch would remove the summary.
+			total, ok := logger.lastStatsTotal()
+			if !ok {
+				t.Fatalf("no statistics summary was logged, want one reporting %d document(s)",
+					tt.wantStats)
+			}
+			if total != tt.wantStats {
+				t.Errorf("statistics document count = %d, want %d", total, tt.wantStats)
+			}
+		})
+	}
+}
+
+// statsCapturingLogger records the document count of every statistics summary
+// the loader logs, so a test can assert what the summary describes.
+type statsCapturingLogger struct {
+	log.Logger
+
+	mu     sync.Mutex
+	totals []int
+}
+
+func (l *statsCapturingLogger) Infof(format string, args ...any) {
+	if strings.HasPrefix(format, "Document statistics - total:") && len(args) > 0 {
+		if total, ok := args[0].(int); ok {
+			l.mu.Lock()
+			l.totals = append(l.totals, total)
+			l.mu.Unlock()
+		}
+	}
+	l.Logger.Infof(format, args...)
+}
+
+// lastStatsTotal returns the document count of the most recent summary, which
+// is the one reported for the whole load.
+func (l *statsCapturingLogger) lastStatsTotal() (int, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.totals) == 0 {
+		return 0, false
+	}
+	return l.totals[len(l.totals)-1], true
+}
+
+// TestLoad_EmbeddingBatch_DoesNotBatchAcrossSources pins the documented
+// per-source request count: a batch never spans sources, so k sources issue
+// the sum of ceil(Ni/B) requests rather than ceil(N/B).
+func TestLoad_EmbeddingBatch_DoesNotBatchAcrossSources(t *testing.T) {
+	const docsPerSource = 2
+	const batchSize = 4
+
+	tests := []struct {
+		name        string
+		concurrency []LoadOption
+	}{
+		{
+			name:        "sequential",
+			concurrency: []LoadOption{WithSourceConcurrency(1), WithDocConcurrency(1)},
+		},
+		{
+			name:        "concurrent",
+			concurrency: []LoadOption{WithSourceConcurrency(2), WithDocConcurrency(2)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			emb := &recordingBatchEmbedder{}
+			kb := New(WithSources([]source.Source{
+				&mockSource{name: "src-a", docCount: docsPerSource},
+				&mockSource{name: "src-b", docCount: docsPerSource},
+				&mockSource{name: "src-c", docCount: docsPerSource},
+			}))
+			kb.vectorStore = &batchRecordingVectorStore{}
+			kb.embedder = emb
+
+			opts := append(tt.concurrency,
+				WithEmbeddingBatchSize(batchSize),
+				WithShowProgress(false),
+				WithShowStats(false),
+			)
+			if err := kb.Load(context.Background(), opts...); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			// Six documents would fit two requests of four if batches spanned
+			// sources; each source instead contributes its own request.
+			want := []int{docsPerSource, docsPerSource, docsPerSource}
+			if got := emb.requestSizes(); !slices.Equal(got, want) {
+				t.Errorf("batch sizes = %v, want %v", got, want)
+			}
+			if got := emb.singleCallCount(); got != 0 {
+				t.Errorf("per-document embedding calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// TestLoad_EmbeddingBatch_AllowsDeclaredDimensionMismatch documents that
+// batches whose dimension differs from the embedder's declared dimension are
+// stored rather than rejected. An embedder may report a configured default that
+// the selected model does not honour, and the per-document path stores those
+// vectors today. Every batch of the load meets the same mismatch, which is why
+// the warning is emitted once per load rather than once per batch.
+func TestLoad_EmbeddingBatch_AllowsDeclaredDimensionMismatch(t *testing.T) {
+	const docCount = 4
+	const batchSize = 2
+
+	var warnings atomic.Int64
+	originalWarnf := log.WarnfContext
+	log.WarnfContext = func(_ context.Context, format string, _ ...any) {
+		if strings.Contains(format, "declared by the embedder") {
+			warnings.Add(1)
+		}
+	}
+	defer func() { log.WarnfContext = originalWarnf }()
+
+	store := &batchRecordingVectorStore{}
+	kb := New(WithSources([]source.Source{&mockSource{name: "test", docCount: docCount}}))
+	kb.vectorStore = store
+	// embeddingForText returns three components, so the declared dimension
+	// below is the one the model does not honour.
+	kb.embedder = &recordingBatchEmbedder{dimensions: 1536}
+
+	if err := kb.Load(context.Background(),
+		WithSourceConcurrency(1),
+		WithDocConcurrency(1),
+		WithEmbeddingBatchSize(batchSize),
+		WithShowProgress(false),
+		WithShowStats(false),
+	); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if got := store.storedCount(); got != docCount {
+		t.Errorf("documents persisted = %d, want %d", got, docCount)
+	}
+	// The load embeds docCount/batchSize batches, each meeting the mismatch.
+	if got := warnings.Load(); got != 1 {
+		t.Errorf("dimension warnings = %d, want 1 for the whole load", got)
 	}
 }

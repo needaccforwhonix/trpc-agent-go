@@ -54,6 +54,12 @@ genConfig := model.GenerationConfig{
 }
 ```
 
+如果没有显式传入 `llmagent.WithGenerationConfig(...)`，`LLMAgent`
+默认会透传零值 `model.GenerationConfig{}`，因此默认是非流式
+（`Stream=false`）。如果你需要流式输出，请显式设置
+`Stream: true`，或在单次请求上使用 `agent.WithStream(true)`。
+某些上层封装可能会自行设置不同的默认值，例如 OpenClaw 会显式开启流式。
+
 ### 创建 LLMAgent
 
 使用模型实例和配置创建 LLMAgent，同时设置 Agent 的 Description 与 Instruction。
@@ -72,19 +78,52 @@ llmAgent := llmagent.New(
 )
 ```
 
-### 占位符变量（会话状态注入）
+### Session 历史中的合成错误文案
 
-LLMAgent 会自动在 `Instruction` 和可选的 `SystemPrompt` 中注入会话状态。支持的占位符语法：
+错误事件没有 assistant content 时，Runner 可能补充通用文案，使事件仍可展示，
+并能作为完整的 user/assistant 轮次持久化。ErrorMessage 插件也可以为同一目的
+提供自定义文案。这类内容是框架合成的展示数据，并不是模型输出。
+
+默认情况下，LLMAgent 不会删除或改写对外发送及持久化事件中的 assistant content
+与结构化错误，但在构造后续模型请求时会省略框架合成的错误文案。如果省略后出现
+相邻 user 消息，请求投影层会在本地合并它们，以维持模型服务可接受的消息序列。
+升级前的 Session 会通过一组尽力而为的特征识别：事件带有结构化错误、Runner
+完全一致的通用兜底文案及其 `"error"` finish reason，并且没有其他消息载荷。
+无标记事件不具备确定的来源信息，因此，与这组旧版特征完全一致的真实响应无法
+区分；如果这类响应必须继续对模型可见，请启用下方兼容选项。
+
+如果应用明确依赖旧版上下文行为，可以显式恢复：
+
+```go
+llmAgent := llmagent.New(
+    "demo-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithIncludeSyntheticErrorMessages(true),
+)
+```
+
+GraphAgent 从 Session 历史初始化图消息状态时采用相同默认行为，并提供对应的
+`graphagent.WithIncludeSyntheticErrorMessages` 兼容选项。详见
+[Graph 指南](./graph.md#synthetic-error-content-in-session-history)。
+
+<a id="placeholder-variables-session-state-injection"></a>
+
+### 占位符变量（状态注入）
+
+LLMAgent 会自动在 `Instruction` 和可选的 `SystemPrompt` 中注入状态。支持的占位符语法：
 
 - `{key}`：替换为会话状态中键 `key` 对应的字符串值（可通过 `invocation.Session.SetState("key", ...)` 或 SessionService 写入）
 - `{key?}`：可选；如果不存在，替换为空字符串
 - `{user:subkey}` / `{app:subkey}` / `{temp:subkey}`：访问用户/应用/临时命名空间（SessionService 会把 app/user 作用域的状态合并进 session，并带上前缀）
 - `{invocation:subkey}` ：替换为 fmt.Sprintf("%+v",`invocation.state["subkey"]`) 的值，（可以通过 invocation.SetState(k,v) 来设置）。
+- `{runtime:subkey}`：读取 `RunOptions.RuntimeState` 中的请求级状态（通过 `agent.WithRuntimeState` 或 `agent.MergeRuntimeState` 设置）
 
 注意：
 
 - 对于非可选的 `{key}`，若找不到则保留原样（便于 LLM 感知缺失上下文）
-- 值读取自会话状态（Runner + SessionService 会自动设置/合并）
+- 所有受支持的占位符都可以在右花括号前添加 `?` 表示可选，例如 `{runtime:document?}`
+- 无前缀及 app/user/temp 前缀读取会话状态；`invocation:` 和 `runtime:` 只读取各自的状态，不会回退到会话状态
+- RuntimeState 中的字符串按原文注入，基本类型使用 JSON 文本表示，对象和数组以 JSON 注入
 
 示例：
 
@@ -95,12 +134,16 @@ llm := llmagent.New(
   llmagent.WithInstruction(
     "You are a research assistant. Focus: {research_topics}. " +
     "User interests: {user:topics?}. App banner: {app:banner?}." +
-    "Invocation case: {invocation:case}",
+    "Invocation case: {invocation:case}. Draft: {runtime:document?}",
   ),
 )
 
-inv := agent.NewInvoction()
+inv := agent.NewInvocation()
 inv.SetState("case", "case-1")
+
+runOptions := []agent.RunOption{
+  agent.WithRuntimeState(map[string]any{"document": "Current draft"}),
+}
 
 // 通过 SessionService 初始化状态（用户态/应用态 + 会话本地键）
 _ = sessionService.UpdateUserState(ctx, session.UserKey{AppName: app, UserID: user}, session.StateMap{
@@ -118,7 +161,7 @@ _, _ = sessionService.CreateSession(ctx, session.Key{AppName: app, UserID: user,
 进一步阅读：
 
 - 示例：`examples/placeholder`、`examples/outputkey`
-- Session API：`docs/mkdocs/zh/session.md`
+- Session API：`docs/mkdocs/zh/session/index.md`
 
 ### 使用 Runner 执行 Agent
 
@@ -271,10 +314,12 @@ if err != nil {
   - `TimelineFilterAll`: 包含历史消息以及当前请求中所生成的消息
   - `TimelineFilterCurrentRequest`: 仅包含当前请求 (一次 runner.Run 为一次请求) 中所生成的消息
   - `TimelineFilterCurrentInvocation`: 仅包含当前 invocation 上下文中生成的消息
-- `WithMessageBranchFilterMode`: 分支维度可见性控制（用于控制对其他 agent 生成消息的可见性）
-  - `BranchFilterModePrefix`: 通过 Event.FilterKey 与 Invocation.eventFilterKey 做前缀匹配
-  - `BranchFilterModeAll`: 所有 agent 的均消息
-  - `BranchFilterModeExact`: 仅自己生成的消息可见
+- `WithMessageBranchFilterMode`: 按 FilterKey 层级控制可见性
+  - `BranchFilterModePrefix`（默认）：层级匹配（祖先/自己/子孙都算匹配）
+  - `BranchFilterModeSubtree`：仅包含当前 key 及其子孙（不含父级，更适合严格隔离）
+  - `BranchFilterModeExact`：仅包含
+    `Event.FilterKey == Invocation.eventFilterKey`
+  - `BranchFilterModeAll`：忽略 FilterKey，包含全部消息
   
 ```go
 llmAgent := llmagent.New(
@@ -295,9 +340,11 @@ llmAgent := llmagent.New(
     // 分支维度过滤条件
     // 默认值：llmagent.BranchFilterModePrefix
     // 可选值：
-    //  - llmagent.BranchFilterModeAll: 包含所有 agent 的消息，当前 agent 与模型交互时，如需将所有 agent 生成的有效内容消息同步给模型时可设置该值
-    //  - llmagent.BranchFilterModePrefix: 通过 Event.FilterKey 与 Invocation.eventFilterKey 做前缀匹配过滤消息，期望将与当前 agent 以及相关上下游 agent 生成的消息传递给模型时，可设置该值
-    //  - llmagent.BranchFilterModeExact: 通过 Event.FilterKey==Invocation.eventFilterKey 过滤消息，当前 agent 与模型交互时，仅需使用当前 agent 生成的消息时可设置该值
+    //  - llmagent.BranchFilterModePrefix: 层级匹配（祖先/自己/子孙都算匹配）
+    //  - llmagent.BranchFilterModeSubtree: 仅包含当前 key 及其子孙（不含父级）
+    //  - llmagent.BranchFilterModeExact: 仅包含
+    //    Event.FilterKey == Invocation.eventFilterKey
+    //  - llmagent.BranchFilterModeAll: 忽略 FilterKey，包含全部消息
     llmagent.WithMessageBranchFilterMode(llmagent.BranchFilterModePrefix),
 )
 ```
@@ -337,6 +384,45 @@ agent := llmagent.New(
 
 **注意：** 此选项仅影响发送给模型之前对历史消息的处理方式。当前响应的 `reasoning_content` 始终会被捕获并存储在会话事件中。
 
+### 工具调用记录历史模式
+
+默认情况下，LLMAgent 会在后续请求中继续把历史工具调用及其对应工具结果发送给模型。这是最保守、兼容性最强的行为；但在包含大量已完成工具调用轮次的长会话中，这些历史 tool transcript 可能会占用不必要的上下文。
+
+LLMAgent 提供 `WithToolTranscriptMode` 来控制已完成历史工具调用/工具结果对在模型请求中的投影方式：
+
+| 模式 | 常量 | 描述 |
+|------|------|------|
+| 保留全部 | `ToolTranscriptModeKeepAll` | 在模型请求中保留所有历史工具调用和工具结果记录。**（默认）** |
+| 省略之前已完成记录 | `ToolTranscriptModeOmitPreviousCompleted` | 省略之前请求中已完成的工具调用/工具结果对，同时保留当前请求或未完成的工具轮次。 |
+
+**使用示例：**
+
+```go
+agent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithInstruction("You are a helpful assistant."),
+    // 省略之前请求中已完成的工具调用记录，降低 prompt 大小。
+    llmagent.WithToolTranscriptMode(llmagent.ToolTranscriptModeOmitPreviousCompleted),
+)
+```
+
+**工作原理：**
+
+- **`keep_all`**：所有历史工具调用和工具结果都会保留在模型请求中。
+- **`omit_previous_completed`**：构建新请求的消息列表时，之前请求中已经完整闭环的工具调用/工具结果对会从投影出的历史消息中省略。
+
+省略模式会保守处理以下情况：
+
+- 当前请求内的工具调用循环会保留，确保模型仍能看到正在处理的工具调用。
+- 未完成的历史工具调用会保留，避免生成无效的 tool-call transcript。
+- 如果被省略的工具调用事件里带有普通 assistant 文本，这部分文本会保留；只移除工具调用及其匹配的工具结果。
+- session event 不会被删除。该模式只影响发送给模型请求的消息投影。
+
+当历史中已完成的工具调用记录不再需要被模型逐字读取、且希望降低 prompt 大小时，可以启用 `ToolTranscriptModeOmitPreviousCompleted`。如果后续回答仍需要精确查看之前的原始工具调用或工具结果，请保留默认的 `ToolTranscriptModeKeepAll`。
+
+它和 context compaction 不同：tool transcript mode 可以在请求投影中省略完整的历史工具调用/工具结果对；context compaction 则保留 tool result 消息形态，只压缩较大的工具结果内容。
+
 ### 委托可见性选项
 
 在构建多 Agent（智能体）系统（Agent 之间的任务委托）时，LLMAgent 提供“默认占位消息”的统一配置。转移（transfer）事件始终包含提示文本，并统一打上 `transfer` 标签，前端（UI, User Interface）可按标签过滤。
@@ -362,6 +448,113 @@ coordinator := llmagent.New(
 
 - 这些选项不会改变真实的委托/切换逻辑，只影响“对外可见的提示文本”或“是否注入默认占位消息”。
 - 转移提示事件统一以 `Response.Object == "agent.transfer"` 输出；如需在 UI 层隐藏系统级提示，可直接过滤该对象类型的事件。
+
+### 工具后提示词注入（Post-tool Prompt）
+
+当模型调用工具时，工具输出会以 `role=tool` 消息追加到对话中。某些模型在看到工具结果后，可能会输出“基于工具结果……”这类元说明，或暴露内部过程。
+
+为了让工具调用后的回复更自然，LLMAgent 会在启用该功能时，向系统消息注入一段“工具后（post-tool）”提示词。这段提示词会从第一次模型请求起稳定存在，后续工具调用轮次不会再改写靠前的 prompt 前缀，因此更利于复用服务端 prompt cache。
+
+- 默认：开启，使用框架内置提示词。
+- 自定义注入文本：`llmagent.WithPostToolPrompt("...")`。
+- 完全禁用注入：`llmagent.WithEnablePostToolPrompt(false)`。
+
+示例：
+
+```go
+agent := llmagent.New(
+  "assistant",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithTools([]tool.Tool{myTool}),
+  // 禁用框架默认的工具后提示词注入。
+  llmagent.WithEnablePostToolPrompt(false),
+)
+```
+
+### 调用次数限制（安全机制）
+
+为防止 Agent 陷入无限循环或过度消耗资源，LLMAgent 提供了两个可选的调用次数限制配置：
+
+**可用配置：**
+
+| 配置项 | 说明 |
+|--------|------|
+| `llmagent.WithMaxLLMCalls(n)` | 限制每次调用的 LLM 调用次数上限。当 `n > 0` 时生效，`n <= 0` 时不限制（默认）。 |
+| `llmagent.WithMaxToolIterations(n)` | 限制每次调用的工具迭代次数上限。当 `n > 0` 时生效，`n <= 0` 时不限制（默认）。 |
+| `llmagent.WithLLMCallLimitFinalization(instruction)` | 将 `WithMaxLLMCalls` 允许的最后一次调用用于不带工具的最终回复。 |
+| `llmagent.WithToolIterationLimitFinalization(instruction)` | 在 `WithMaxToolIterations` 允许的最后一轮完全由框架执行的工具调用之后请求一次不带工具的最终回复，前提是当前 invocation 和 LLM 调用预算仍允许下一次调用。 |
+
+**使用示例：**
+
+```go
+agent := llmagent.New(
+  "safe-agent",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithTools([]tool.Tool{myTool}),
+  // 限制最多调用 10 次 LLM。
+  llmagent.WithMaxLLMCalls(10),
+  // 限制最多进行 5 轮工具调用迭代。
+  llmagent.WithMaxToolIterations(5),
+  // 选择在两类上限处生成不带工具的收尾回复。
+  // 空字符串表示使用框架默认 instruction。
+  llmagent.WithLLMCallLimitFinalization(""),
+  llmagent.WithToolIterationLimitFinalization(""),
+)
+```
+
+**行为说明：**
+
+- 未配置 finalization option 时，现有行为保持不变：
+  - **`WithMaxLLMCalls`**：调用次数超过限制时返回 `StopError`。
+  - **`WithMaxToolIterations`**：工具迭代次数超过限制时发送 `flow_error` 响应事件。
+- 两个 finalization option 相互独立，且都需要显式选择。传入 `""` 时使用框架默认的收尾 instruction；传入非空字符串时使用调用方提供的 instruction。
+- LLM 上限收尾会占用 `MaxLLMCalls` 内的最后一次调用；工具迭代上限收尾会在最后一轮允许的工具调用后使用下一次 LLM 调用。
+- 工具迭代上限收尾要求达到上限的这一轮中所有工具调用都由框架执行。如果其中任何调用是 external tool，或被 `WithToolExecutionFilter` 延后给调用方执行，该回复仍会计入 `MaxToolIterations`，但当前运行会沿用 caller-executed tool 的既有生命周期并直接结束，不再发起收尾调用。调用方后续继续执行时会创建新的 invocation，并使用独立的限制计数。
+- `MaxLLMCalls` 始终是严格的外层硬预算，收尾调用也计入其中。因此组合使用工具上限收尾和 `WithMaxLLMCalls` 时，需要预留一次 LLM 调用。
+- 最后一次模型请求会在消息尾部追加一条临时 user instruction，而不会修改已有 system prompt。`BeforeModel` callback 可以看到该消息，但它不会作为真实 user event 发送或持久化。
+- 收尾期间，框架会在 `BeforeModel` callback 前移除工具及强制工具选择字段，并在 callback 后再次清理。如果模型仍然返回工具调用，框架会拒绝该调用且不会执行工具。
+- 如果两个收尾策略在同一次 LLM 调用上同时满足条件，优先使用 LLM 上限对应的 instruction。
+- 两个限制相互独立，可以单独使用或组合使用。
+- 这些限制是每次调用级别的，不同的 `runner.Run()` 调用会各自独立计数。
+- `(*agent.Invocation).ToolIterationCount()` 提供工具迭代上限执行计数器的只读访问。`MaxToolIterations` 非正数时该值始终为 0；超过上限且未执行工具的那次 tool-call response 也会计入；`Clone()` 从 0 重新开始，`View()` 则保留当前值。它不是通用的工具使用量指标。
+
+**推荐用法：**
+
+- 在生产环境中，建议设置合理的限制以防止意外情况。
+- 根据任务的复杂度和预期行为设置限制值。
+- 可以在 [examples/max_limits](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/max_limits) 查看完整示例。
+
+### Tool 调用重试
+
+如果你希望 LLMAgent 在工具调用失败后自动补一次或多次重试，可以配置 `llmagent.WithToolCallRetryPolicy(...)`。
+
+```go
+policy := &tool.RetryPolicy{
+    MaxAttempts:     2,
+    InitialInterval: 200 * time.Millisecond,
+    BackoffFactor:   2.0,
+    MaxInterval:     time.Second,
+}
+
+agent := llmagent.New(
+    "assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithTools([]tool.Tool{myTool}),
+    llmagent.WithToolCallRetryPolicy(policy),
+)
+```
+
+说明：
+
+- 默认关闭；未配置时行为与历史版本保持一致。
+- 当前仅对 `CallableTool` 生效；`StreamableTool` 暂不支持。
+- 重试只作用于当前这次工具调用，不会重跑整个 Agent。
+- 默认判定只重试常见瞬时 raw error，如 `io.EOF`、`io.ErrUnexpectedEOF`、网络超时。
+- 如果需要把结果级失败也纳入重试，可通过 `tool.RetryPolicy.RetryOn` 自定义。
+
+可运行示例：
+
+- [examples/llmagent_tool_call_retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/llmagent_tool_call_retry)
 
 ### 处理事件流
 
@@ -401,13 +594,18 @@ for event := range eventChan {
         }
     }
 
-    // 检查是否完成（注意：工具调用完成时不应该 break）
+    // 检查当前这条响应是否已完整结束
     if event.IsFinalResponse() {
         fmt.Println()
         break
     }
 }
 ```
+
+上面的示例使用 `event.IsFinalResponse()`，是因为它只关心“当前这条回复何时
+完整输出完”。如果你需要等待整次 `Runner.Run` 真正结束，例如
+`tool.response` 后可能还有后续处理，或在 GraphAgent 中还要等待图上其他节点
+完成，请改用 `event.IsRunnerCompletion()` 作为退出条件。
 
 该示例的完整代码可见 [examples/runner](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/runner)
 
@@ -701,13 +899,33 @@ llmagent := llmagent.New("llmagent", llmagent.WithAgentCallbacks(callbacks))
 | **数据位置** | Event.StructuredOutput | Event.StructuredOutput | 模型响应内容 | Session State |
 | **主要用途** | 灵活 schema + 工具 | 类型安全的结构化输出 | 简单的结构化响应 | 状态存储和流程控制 |
 
+### Provider 兼容性
+
+框架允许同时配置工具与 `WithStructuredOutputJSONSchema` 或
+`WithStructuredOutputJSON`，但模型服务也必须支持组合使用工具调用与原生结构化输出。
+部分 OpenAI 兼容端点会接受 `tools` 和 `response_format: json_schema`，
+却把 JSON 约束应用于整个生成过程。在这种情况下，约束解码可能会抑制模型专用的
+工具调用语法，最终返回符合 schema 的 JSON，却没有实际发起任何工具调用。
+
+因此，HTTP 请求成功且 JSON 校验通过，并不能证明所需工具已执行。当结果正确性依赖
+工具执行时，应同时检查工具调用与工具结果事件。如果端点不能可靠支持该组合，
+可将操作拆成两次调用：先在不启用原生结构化输出的情况下调用工具，再禁用工具并
+生成结构化的最终答复。第二次调用必须通过延续相同的 session 或消息历史来获取
+第一次调用的证据，或者显式包含第一次调用的工具调用与工具结果消息。
+
+相关后端讨论包括
+[vLLM #39929](https://github.com/vllm-project/vllm/issues/39929)，该 issue
+跟踪 `response_format` 抑制自动工具调用的问题；以及
+[SGLang #21593](https://github.com/sgl-project/sglang/pull/21593)，该 PR
+修复了约束解码与模型专用工具调用格式之间的冲突。
+
 ### WithStructuredOutputJSONSchema
 
 提供用户自定义的 JSON schema 用于结构化输出，同时**允许使用工具**。这是需要结构化输出和工具能力的 Agent 的最灵活选项。
 
 **注意：**
 - “允许使用工具”表示 Agent 仍可发起工具调用（包括 Skills 的
-  `skill_load` / `skill_run`）。
+  `skill_load` 与 `workspace_exec`）。
 - 当模型需要调用工具时，可能会先返回工具调用事件而不是最终 JSON；
   只有最终答复才需要满足 schema，并且必须是单个 JSON 对象。
 
@@ -905,8 +1123,47 @@ Memory Service 用于记录用户的偏好信息，支持个性化体验。
 **推荐阅读顺序：**
 
 1. [Runner](runner.md) - 学习推荐的使用方式
-2. [Session](session.md) - 了解会话管理
+2. [Session](session/index.md) - 了解会话管理
 3. [Multi-Agent](multiagent.md) - 学习多 Agent 系统
+
+## 提示词脚手架（“Rules”/ 上下文注入模式）
+
+很多 Agent 产品会把“rules”做成一个显式功能（项目记忆、按回合约束、按路径匹配的规则等）。但在工程上，“rules”并不是一个稳定、统一的框架层概念：不同产品对它的语义选择差异很大（system vs user role、放在历史前还是贴近最新 user、是否持久化、如何做文件范围选择、对 prompt cache 的影响等）。
+
+tRPC‑Agent‑Go 选择不在 core 引入一等 `Rules` 抽象，而是提供更通用的 **提示词/上下文注入原语**，让你用组合方式实现自己产品想要的 “rules” 语义。
+
+### 如何选择合适的原语
+
+- 稳定的全局约束（常见的“全局规则”，推荐）：
+  - Agent 级配置：`llmagent.WithGlobalInstruction(...)` / `llmagent.WithInstruction(...)`
+  - 单次请求覆盖（不修改 agent 实例）：`agent.WithGlobalInstruction(...)` / `agent.WithInstruction(...)`
+- 单次请求、非持久化上下文，注入在 **session history 之前**（更适合作为背景 seed/context）：
+  - `agent.WithInjectedContextMessages([]model.Message{...})`
+- 单次请求、非持久化上下文，注入在 **贴近最新用户回合**（适合作为本轮“rules/动态约束”）：
+  - `agent.WithLateContextMessages([]model.Message{...})`
+- 需要完全控制最终消息序列：
+  - 用结构化 `BeforeModel` 回调重写 `request.Messages`（见 `docs/mkdocs/zh/callbacks.md`）。
+
+### 消息位置（高层语义）
+
+Content request processor 组装最终请求消息大致遵循下面顺序：
+
+1. System prompt / instructions（稳定前缀）
+2. Few-shot 示例（如果配置，会插入到前导 system block 之后）
+3. Injected context messages（`WithInjectedContextMessages`）—— **在历史之前**
+4. Session history（会话的 canonical transcript）
+5. Late context messages（`WithLateContextMessages`）—— **插入到最后一个 user message 之前**（如果当前请求里没有 user message，则会插入到前导 system block 之后）
+6.（如果当前回合已有）属于当前回合的 tool/assistant tail
+
+这种 “late” 放置方式适合动态、每轮变化的规则：它能让规则贴近本轮用户请求，同时尽量保持前缀稳定（更利于 prompt cache）。
+
+### 注意事项与最佳实践
+
+- 建议 late context 使用 `role=user`。在消息序列中间插入 `role=system` 并非所有 provider 都支持，也可能与消息校验/修复逻辑产生不兼容。
+- `WithInjectedContextMessages` 与 `WithLateContextMessages` 都 **不会持久化** 到 session transcript（只影响本次模型请求）。
+- 在 multi-agent 场景中，这些选项属于 `RunOptions`，会随 invocation clone 传播到子调用；如果需要“只对某个 agent 生效”，推荐用回调按 `invocation.AgentName` 过滤实现。
+
+可运行示例：`examples/prompt/late_context_messages`。
 
 ## 运行时动态更新 Instruction
 
@@ -1071,3 +1328,232 @@ llm := llmagent.New(
 - 内存版 `UpdateUserState` 出于安全设计禁止写 `temp:*`；需要会话内
   临时值时，通过 `invocation.Session.SetState` 写入（例如通过回调）。
 - 占位符是在“请求时”解析；只要你换了存储的值，下一次模型请求就会用新值，无需重建 Agent。
+
+## 静态结构导出
+
+框架提供了 Agent 的静态结构导出能力，可用于结构检查、可视化、配置工具和结构诊断等需要稳定节点图与 surface 基线的场景。
+
+可以通过 `agent/structure` 导出规范化快照：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/agent/structure"
+
+snapshot, err := structure.Export(ctx, llmAgent)
+if err != nil {
+    log.Fatalf("导出结构失败: %v", err)
+}
+
+fmt.Println(snapshot.StructureID)
+fmt.Println(snapshot.EntryNodeID)
+fmt.Println(len(snapshot.Nodes), len(snapshot.Edges), len(snapshot.Surfaces))
+```
+
+导出的快照包含：
+
+- `Nodes`：当前 Agent 结构中的稳定静态节点
+- `Edges`：节点之间静态上可能出现的连接
+- `Surfaces`：稳定可编辑的基线面，例如 `instruction`、`model`、`tool`、`skill`
+
+完整示例见 [examples/graph/structure_export](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/structure_export)。
+
+## 按 `nodeID` 覆盖运行时 surface
+
+除了 `agent.WithInstruction(...)`、`agent.WithGlobalInstruction(...)` 这种“整次
+`runner.Run(...)` 调用级”的覆盖方式之外，框架还支持在一次运行中按稳定
+`nodeID` 精确覆盖指定节点的运行时 surface。
+
+这个能力适合这些场景：
+
+- 只想临时改某个 graph 节点的指令，不影响整棵 Agent。
+- 同一次 `runner.Run(...)` 里，同时给多个节点设置不同的 instruction、few-shot 或 tools。
+- 在 `chain`、`parallel`、`cycle`、`graph`、`team`、`swarm` 等嵌套结构中，精确命中某个子节点。
+
+入口 API：
+
+```go
+var patch agent.SurfacePatch
+patch.SetInstruction("Answer in one short paragraph.")
+patch.SetFewShot([][]model.Message{
+    {
+        model.NewUserMessage("Summarize this report."),
+        model.NewAssistantMessage("Provide a short executive summary first."),
+    },
+})
+
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Please analyze the latest findings."),
+    agent.WithSurfacePatchForNode(nodeID, patch),
+)
+```
+
+### 使用步骤
+
+推荐按下面的顺序使用：
+
+1. 先通过 `structure.Export(...)` 导出静态结构快照。
+2. 从 `snapshot.EntryNodeID` 或 `snapshot.Nodes` 中找到目标节点的稳定 `nodeID`。
+3. 构造 `agent.SurfacePatch`，只设置这次运行需要覆盖的 surface。
+4. 在 `runner.Run(...)` 中传入一个或多个 `agent.WithSurfacePatchForNode(...)`。
+
+示例：
+
+```go
+snapshot, err := structure.Export(ctx, workflowAgent)
+if err != nil {
+    return err
+}
+
+var plannerNodeID string
+for _, node := range snapshot.Nodes {
+    if node.Name == "planner" {
+        plannerNodeID = node.NodeID
+        break
+    }
+}
+if plannerNodeID == "" {
+    return errors.New("planner node not found")
+}
+
+var patch agent.SurfacePatch
+patch.SetInstruction("Plan in at most three steps.")
+
+_, err = r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Arrange a trip to Hangzhou next Friday."),
+    agent.WithSurfacePatchForNode(plannerNodeID, patch),
+)
+```
+
+注意事项：
+
+- 调用方应优先使用 `structure.Export(...)` 导出的 `nodeID`，不要依赖手写路径。
+- 这个能力只对当前这一次 `runner.Run(...)` 生效，不会修改 Agent 的静态定义。
+- `agent.WithInstruction(...)` / `agent.WithGlobalInstruction(...)` 仍然保留，适合“整次运行统一覆盖根 Agent 提示词”的场景；需要按节点精确控制时，再使用 `WithSurfacePatchForNode(...)`。
+
+### 可覆盖的 surface
+
+`SurfacePatch` 目前提供这些 setter：
+
+- `SetInstruction(string)`：覆盖该节点本次运行的 instruction。
+- `SetGlobalInstruction(string)`：覆盖该节点本次运行的 global instruction。
+- `SetFewShot([][]model.Message)`：覆盖该节点本次运行的 few-shot 示例。
+- `SetModel(model.Model)`：覆盖该节点本次运行使用的模型实例。
+- `SetTools([]tool.Tool)`：覆盖该节点本次运行的工具 surface。它表达的是“替换本次运行可见的工具集合”，不是只改工具描述文本。
+- `AppendTools([]tool.Tool)`：给该节点本次运行的工具 surface 增量追加工具。它会保留节点已有工具，并把传入的工具追加到后面。
+- `SetSkillRepository(skill.Repository)`：覆盖该节点本次运行的 skill repository；传 `nil` 可显式禁用该节点的 skill surface。
+
+不是每种节点都支持全部 surface，常见情况如下：
+
+- 根 `LLMAgent`：支持 `instruction`、`global_instruction`、`few_shot`、`model`、`tool`、`skill`。
+- graph 的 LLM 节点：支持 `instruction`、`few_shot`、`model`、`tool`。
+- graph 的 Tools 节点：支持 `tool`。
+- graph 子 Agent、`chain`、`parallel`、`cycle`、`team`、`swarm` 中的子节点：是否可覆盖，取决于命中的那个具体子节点本身支持哪些 surface。
+
+### 在同一次运行中覆盖多个节点
+
+如果要在同一次 `runner.Run(...)` 里同时覆盖多个节点，直接重复传多个
+`agent.WithSurfacePatchForNode(...)` 即可，不需要额外的批量 API。
+
+```go
+snapshot, err := structure.Export(ctx, workflowAgent)
+if err != nil {
+    return err
+}
+
+nodeIDs := make(map[string]string)
+for _, node := range snapshot.Nodes {
+    nodeIDs[node.Name] = node.NodeID
+}
+
+var plannerPatch agent.SurfacePatch
+plannerPatch.SetInstruction("Produce no more than three candidate plans.")
+
+var reviewerPatch agent.SurfacePatch
+reviewerPatch.SetInstruction("Reject any plan that lacks cost analysis.")
+
+var toolsPatch agent.SurfacePatch
+toolsPatch.AppendTools([]tool.Tool{priceTool})
+
+_, err = r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Plan a team offsite in Suzhou next month."),
+    agent.WithSurfacePatchForNode(nodeIDs["planner"], plannerPatch),
+    agent.WithSurfacePatchForNode(nodeIDs["reviewer"], reviewerPatch),
+    agent.WithSurfacePatchForNode(nodeIDs["search_tools"], toolsPatch),
+)
+```
+
+对同一 `nodeID` 多次传 `WithSurfacePatchForNode(...)` 时，框架会按 surface 类型合并：
+
+- 不同 surface 类型彼此合并。
+- 同一种 surface 类型后传入的值覆盖先传入的值。
+- 工具追加 patch 是增量语义。重复调用 `AppendTools(...)` 会继续追加到
+  有效工具集合；后续再调用 `SetTools(...)` 会替换该节点之前追加的工具。
+
+### 组合结构与嵌套结构
+
+这套能力不只适用于单个 `LLMAgent`。在这些结构里也建议使用同样的方法：
+
+- `graph`：可覆盖图中的 LLM 节点、Tools 节点，以及图中挂载的子 Agent 根节点。
+- `chain`、`parallel`、`cycle`：可覆盖任意导出出来的子节点。
+- `team` / `swarm`：可覆盖 `coordinator`、成员节点，以及 transfer 后到达的成员节点。
+
+在这些场景里，最稳妥的做法仍然是：
+
+- 先 `structure.Export(...)`
+- 再使用导出的 `nodeID`
+- 最后在 `runner.Run(...)` 中传入 patch
+
+这样用户只需要记住一套规则：`nodeID` 由结构导出提供，运行时 patch 由 `WithSurfacePatchForNode(...)` 提供。
+
+## 执行图导出
+
+框架可以为单次 `runner.Run` 调用导出执行图，用来观察这次运行里哪些节点真的执行了、各个步骤之间如何依赖，以及每个步骤看到的输入和输出快照。
+
+需要在运行时显式开启：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+r := runner.NewRunner("demo-app", ag)
+events, err := r.Run(
+    ctx,
+    "user-1",
+    "session-1",
+    model.NewUserMessage("hello"),
+    agent.WithExecutionTraceEnabled(true),
+)
+if err != nil {
+    log.Fatalf("运行失败: %v", err)
+}
+for evt := range events {
+    if evt != nil && evt.IsRunnerCompletion() && evt.ExecutionTrace != nil {
+        fmt.Println(evt.ExecutionTrace.RootAgentName)
+        fmt.Println(evt.ExecutionTrace.Status)
+        fmt.Println(len(evt.ExecutionTrace.Steps))
+    }
+}
+```
+
+执行图挂在 runner completion event 上，属于进程内工件，默认不会参与序列化。
+
+每个步骤都会带上这些稳定字段：
+
+- `NodeID`：本次执行对应的静态节点路径
+- `NodeType`：节点的语义类型（`function`、`llm`、`tool` 或 `agent`），与静态结构中的节点类型一致；`agent` 表示 Agent 执行单元（包括 `LLMAgent`），`llm` 表示显式 LLM 操作节点
+- `PredecessorStepIDs`：这次运行里该步骤的直接前驱步骤
+- `Input` 和 `Output`：步骤输入输出的稳定文本快照
+- `Error`：步骤失败时记录的终态错误
+
+完整示例见 [examples/graph/execution_trace](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/execution_trace)。

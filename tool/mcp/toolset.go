@@ -13,8 +13,10 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -40,6 +42,16 @@ var sessionReconnectErrorPatterns = []string{
 	"session not found",      // Explicit session not found error
 }
 
+const processAlreadyFinishedText = "process already finished"
+
+func isBenignMCPClientCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, os.ErrProcessDone) ||
+		strings.Contains(err.Error(), processAlreadyFinishedText)
+}
+
 // ToolSet implements the ToolSet interface for MCP tools.
 type ToolSet struct {
 	config         toolSetConfig
@@ -50,9 +62,9 @@ type ToolSet struct {
 }
 
 // NewMCPToolSet creates a new MCP tool set with the given configuration.
-// Use WithName option to set a custom name for the toolset to avoid name conflicts
-// for tools with the same name under different tool sets when using multiple MCP toolsets.
-// Example: NewMCPToolSet(config, WithName("your-mcp-toolset"))
+// The default ToolSet name is "mcp". When attached to an LLMAgent, tools are
+// exposed to the model as {name}_{remoteToolName}; pass WithName with a unique
+// value per MCP server to avoid prefix collisions across multiple ToolSets.
 func NewMCPToolSet(config ConnectionConfig, opts ...ToolSetOption) *ToolSet {
 	// Apply default configuration.
 	cfg := toolSetConfig{
@@ -221,7 +233,8 @@ func (m *mcpSessionManager) connect(ctx context.Context) error {
 	// Initialize the session.
 	if err := m.initialize(ctx); err != nil {
 		m.connected = false
-		if closeErr := client.Close(); closeErr != nil {
+		if closeErr := client.Close(); closeErr != nil &&
+			!isBenignMCPClientCloseError(closeErr) {
 			log.ErrorContext(ctx, "Failed to close client after initialization failure",
 				"client_close_error", closeErr, "error", err)
 		}
@@ -257,44 +270,42 @@ func (m *mcpSessionManager) createClient() (mcp.Connector, error) {
 		return mcp.NewStdioClient(config, clientInfo)
 
 	case transportSSE:
-		var options []mcp.ClientOption
-
-		if len(m.config.Headers) > 0 {
-			headers := http.Header{}
-			for k, v := range m.config.Headers {
-				headers.Set(k, v)
-			}
-			options = append(options, mcp.WithHTTPHeaders(headers))
-		}
-
-		// Add MCP options if configured.
-		if len(m.mcpOptions) > 0 {
-			options = append(options, m.mcpOptions...)
-		}
-
+		options := m.buildHTTPOptions()
 		return mcp.NewSSEClient(m.config.ServerURL, clientInfo, options...)
 
 	case transportStreamable:
-		var options []mcp.ClientOption
-
-		if len(m.config.Headers) > 0 {
-			headers := http.Header{}
-			for k, v := range m.config.Headers {
-				headers.Set(k, v)
-			}
-			options = append(options, mcp.WithHTTPHeaders(headers))
-		}
-
-		// Add MCP options if configured.
-		if len(m.mcpOptions) > 0 {
-			options = append(options, m.mcpOptions...)
-		}
-
+		options := m.buildHTTPOptions()
 		return mcp.NewClient(m.config.ServerURL, clientInfo, options...)
 
 	default:
 		return nil, fmt.Errorf("unsupported transport: %s", m.config.Transport)
 	}
+}
+
+// buildHTTPOptions builds MCP client options for HTTP-based transports (SSE, Streamable).
+//
+// Static headers from ConnectionConfig.Headers are applied first via
+// WithHTTPHeaders, followed by any user-provided options from WithMCPOptions
+// in registration order. For per-request dynamic headers (e.g. user-specific
+// auth tokens), pass mcp.WithHTTPBeforeRequest to WithMCPOptions and read the
+// required values from context inside the hook. See the package-level
+// documentation for an example.
+func (m *mcpSessionManager) buildHTTPOptions() []mcp.ClientOption {
+	var options []mcp.ClientOption
+
+	if len(m.config.Headers) > 0 {
+		headers := http.Header{}
+		for k, v := range m.config.Headers {
+			headers.Set(k, v)
+		}
+		options = append(options, mcp.WithHTTPHeaders(headers))
+	}
+
+	if len(m.mcpOptions) > 0 {
+		options = append(options, m.mcpOptions...)
+	}
+
+	return options
 }
 
 // createTimeoutContext creates a context with timeout if configured and no existing deadline.
@@ -367,8 +378,9 @@ func (m *mcpSessionManager) listTools(ctx context.Context) ([]mcp.Tool, error) {
 }
 
 // callTool executes a tool call on the MCP server.
-func (m *mcpSessionManager) callTool(ctx context.Context, name string, arguments map[string]any) ([]mcp.Content, error) {
-	var result []mcp.Content
+// Returns the full CallToolResult including Meta field for metadata access.
+func (m *mcpSessionManager) callTool(ctx context.Context, name string, arguments map[string]any) (*mcp.CallToolResult, error) {
+	var result *mcp.CallToolResult
 
 	// Execute with session reconnection support
 	operationErr := m.executeWithSessionReconnect(ctx, func() error {
@@ -396,18 +408,30 @@ func (m *mcpSessionManager) callTool(ctx context.Context, name string, arguments
 		}
 
 		log.DebugContext(ctx, "Tool call completed", "name", name, "content_count", len(callResp.Content))
-		result = callResp.Content
-		if len(result) == 0 && callResp.StructuredContent != nil {
+		// Handle structured content if present
+		if len(callResp.Content) == 0 && callResp.StructuredContent != nil {
 			structuredBytes, err := json.Marshal(callResp.StructuredContent)
 			if err != nil {
 				return fmt.Errorf("marshal structured content: %w", err)
 			}
-			result = append(result, mcp.NewTextContent(string(structuredBytes)))
+			// Create a copy with the marshaled content
+			result = &mcp.CallToolResult{
+				Result:            callResp.Result,
+				Content:           append([]mcp.Content(nil), mcp.NewTextContent(string(structuredBytes))),
+				StructuredContent: callResp.StructuredContent,
+				IsError:           callResp.IsError,
+			}
+		} else {
+			result = callResp
 		}
 		return nil
 	})
 
-	return result, operationErr
+	// Ensure result is nil on error
+	if operationErr != nil {
+		return nil, operationErr
+	}
+	return result, nil
 }
 
 // close closes the MCP session and client connection.
@@ -427,6 +451,10 @@ func (m *mcpSessionManager) close() error {
 	m.client = nil
 
 	if err != nil {
+		if isBenignMCPClientCloseError(err) {
+			log.Debug("MCP client already finished during close", "error", err)
+			return nil
+		}
 		log.Error("Failed to close MCP client", "error", err)
 		return fmt.Errorf("failed to close MCP client: %w", err)
 	}
@@ -565,8 +593,14 @@ func (m *mcpSessionManager) doRecreateSession(ctx context.Context) error {
 
 	// Close existing client if any.
 	if m.client != nil {
-		if closeErr := m.client.Close(); closeErr != nil {
-			log.WarnContext(ctx, "Failed to close old client during session recreation", "error", closeErr)
+		if closeErr := m.client.Close(); closeErr != nil &&
+			!isBenignMCPClientCloseError(closeErr) {
+			log.WarnContext(
+				ctx,
+				"Failed to close old client during session recreation",
+				"error",
+				closeErr,
+			)
 		}
 		m.client = nil
 	}
@@ -587,7 +621,8 @@ func (m *mcpSessionManager) doRecreateSession(ctx context.Context) error {
 	// Re-initialize the session.
 	if err := m.initialize(ctx); err != nil {
 		m.connected = false
-		if closeErr := client.Close(); closeErr != nil {
+		if closeErr := client.Close(); closeErr != nil &&
+			!isBenignMCPClientCloseError(closeErr) {
 			log.ErrorContext(ctx, "Failed to close client after re-initialization failure",
 				"close_error", closeErr, "init_error", err)
 		}

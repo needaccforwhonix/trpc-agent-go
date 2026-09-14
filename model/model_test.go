@@ -13,6 +13,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestModelInterface tests the Model interface definition.
@@ -28,12 +30,57 @@ func TestModelInterface(t *testing.T) {
 	ctx := context.Background()
 	responseChan, err := mock.GenerateContent(ctx, nil)
 
-	if err == nil {
-		t.Error("Model.GenerateContent() with nil request should return error")
-	}
-	if responseChan != nil {
-		t.Error("Model.GenerateContent() with nil request should return nil channel")
-	}
+	require.Error(t, err)
+	require.Nil(t, responseChan)
+}
+
+type requestStructuredOutputPayload struct {
+	Answer   string `json:"answer"`
+	Optional *int   `json:"optional,omitempty"`
+}
+
+func TestRequestOptions_WithStructuredOutputJSON(t *testing.T) {
+	req := NewRequest(
+		[]Message{NewUserMessage("hello")},
+		WithStructuredOutputJSON(
+			new(requestStructuredOutputPayload),
+			true,
+			"Return a typed payload.",
+		),
+	)
+
+	require.Len(t, req.Messages, 1)
+	require.NotNil(t, req.StructuredOutput)
+	require.Equal(t, StructuredOutputJSONSchema, req.StructuredOutput.Type)
+	require.NotNil(t, req.StructuredOutput.JSONSchema)
+	require.Equal(t, "requestStructuredOutputPayload", req.StructuredOutput.JSONSchema.Name)
+	require.True(t, req.StructuredOutput.JSONSchema.Strict)
+	require.Equal(t, "Return a typed payload.", req.StructuredOutput.JSONSchema.Description)
+
+	schema := req.StructuredOutput.JSONSchema.Schema
+	require.Equal(t, "object", schema["type"])
+	properties, ok := schema["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, properties, "answer")
+	require.Contains(t, properties, "optional")
+	required, ok := schema["required"].([]string)
+	require.True(t, ok)
+	require.Contains(t, required, "answer")
+	require.Contains(t, required, "optional")
+}
+
+func TestRequestOptions_IgnoresNilStructuredOutputInputs(t *testing.T) {
+	req := NewRequest(
+		nil,
+		WithStructuredOutputJSON(nil, true, "ignored"),
+	)
+
+	require.Nil(t, req.StructuredOutput)
+}
+
+func TestThinkingKeys(t *testing.T) {
+	require.Equal(t, "enable_thinking", EnableThinkingKey)
+	require.Equal(t, "enabled_thinking", EnabledThinkingKey)
 }
 
 // mockModel is a simple mock implementation for testing the interface.

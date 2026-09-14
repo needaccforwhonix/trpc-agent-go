@@ -9,6 +9,8 @@
 
 package json
 
+import "encoding/json"
+
 // defaultNumberTolerance is the default number tolerance.
 const defaultNumberTolerance = 1e-6
 
@@ -19,7 +21,10 @@ type options struct {
 	onlyTree        map[string]any
 	matchStrategy   JSONMatchStrategy
 	numberTolerance *float64
-	compare         func(actual, expected any) (bool, error)
+	valid           bool
+	schema          json.RawMessage
+	compareName     string
+	compare         CompareFunc
 }
 
 // newOptions creates a Options with the provided options.
@@ -69,8 +74,29 @@ func WithNumberTolerance(tolerance float64) Option {
 	}
 }
 
+// WithValid sets the raw JSON validity flag.
+func WithValid(valid bool) Option {
+	return func(o *options) {
+		o.valid = valid
+	}
+}
+
+// WithSchema sets the JSON Schema from serialized JSON text.
+func WithSchema(schema string) Option {
+	return func(o *options) {
+		o.schema = json.RawMessage(schema)
+	}
+}
+
+// WithCompareName sets the name of the registered compare function.
+func WithCompareName(compareName string) Option {
+	return func(o *options) {
+		o.compareName = compareName
+	}
+}
+
 // WithCompare sets the compare function.
-func WithCompare(compare func(actual, expected any) (bool, error)) Option {
+func WithCompare(compare CompareFunc) Option {
 	return func(o *options) {
 		o.compare = compare
 	}

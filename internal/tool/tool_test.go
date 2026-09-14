@@ -58,6 +58,89 @@ func (s *skipperTool) Declaration() *tool.Declaration {
 
 func (s *skipperTool) SkipSummarization() bool { return s.skip }
 
+type metadataPolicyTool struct {
+	name             string
+	metadata         tool.ToolMetadata
+	deferTool        bool
+	decision         tool.PermissionDecision
+	permissionCalled bool
+}
+
+func (m *metadataPolicyTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: m.name}
+}
+
+func (m *metadataPolicyTool) ToolMetadata() tool.ToolMetadata {
+	return m.metadata
+}
+
+func (m *metadataPolicyTool) ShouldDefer(context.Context) bool {
+	return m.deferTool
+}
+
+func (m *metadataPolicyTool) CheckPermission(
+	_ context.Context,
+	_ *tool.PermissionRequest,
+) (tool.PermissionDecision, error) {
+	m.permissionCalled = true
+	return m.decision, nil
+}
+
+type declarationWrapperTool struct {
+	base tool.Tool
+}
+
+func (d *declarationWrapperTool) Declaration() *tool.Declaration {
+	return &tool.Declaration{Name: "wrapped"}
+}
+
+func (d *declarationWrapperTool) originalTool() tool.Tool {
+	return d.base
+}
+
+type callableOnlyTool struct {
+	decl       *tool.Declaration
+	callResult any
+}
+
+func (c *callableOnlyTool) Declaration() *tool.Declaration {
+	return c.decl
+}
+
+func (c *callableOnlyTool) Call(context.Context, []byte) (any, error) {
+	return c.callResult, nil
+}
+
+type streamOnlyTool struct {
+	decl   *tool.Declaration
+	stream *tool.Stream
+}
+
+func (s *streamOnlyTool) Declaration() *tool.Declaration {
+	return s.decl
+}
+
+func (s *streamOnlyTool) StreamableCall(context.Context, []byte) (*tool.StreamReader, error) {
+	if s.stream == nil {
+		s.stream = tool.NewStream(1)
+	}
+	return s.stream.Reader, nil
+}
+
+type nonStreamInnerTool struct {
+	*fakeTool
+}
+
+func (n *nonStreamInnerTool) StreamInner() bool {
+	return false
+}
+
+type nilDeclarationTool struct{}
+
+func (nilDeclarationTool) Declaration() *tool.Declaration {
+	return nil
+}
+
 // fakeToolSet implements tool.ToolSet.
 type fakeToolSet struct {
 	name   string
@@ -75,6 +158,19 @@ func TestNamedToolSet_Idempotent(t *testing.T) {
 	// Calling again with an already wrapped toolset should return the same instance.
 	nts2 := NewNamedToolSet(nts)
 	require.Same(t, nts, nts2, "idempotent wrapper should be same instance")
+}
+
+func TestNamedToolSet_ModeOverride(t *testing.T) {
+	base := &fakeToolSet{
+		name:  "github",
+		tools: []tool.Tool{&simpleTool{name: "search", desc: "search"}},
+	}
+	qualified := NewNamedToolSet(base)
+	original := NewNamedToolSetWithMode(qualified, tool.ToolSetToolNameModeOriginal)
+	require.NotSame(t, qualified, original)
+	require.Equal(t, "search", original.Tools(context.Background())[0].Declaration().Name)
+	require.Same(t, qualified, NewNamedToolSetWithMode(qualified, tool.ToolSetToolNameModeQualified))
+	require.Same(t, original, NewNamedToolSet(original))
 }
 
 func TestNamedToolSet_Tools_PrefixingAndPassthrough(t *testing.T) {
@@ -95,6 +191,20 @@ func TestNamedToolSet_Tools_PrefixingAndPassthrough(t *testing.T) {
 	require.Equal(t, "write", got2[0].Declaration().Name)
 }
 
+func TestNamedToolSet_Tools_OriginalNames(t *testing.T) {
+	base := &fakeToolSet{
+		name:  "github",
+		tools: []tool.Tool{&simpleTool{name: "search", desc: "search"}},
+	}
+
+	got := NewNamedToolSetWithMode(base, tool.ToolSetToolNameModeOriginal).Tools(context.Background())
+	require.Len(t, got, 1)
+	require.Equal(t, "search", got[0].Declaration().Name)
+	named, ok := got[0].(*NamedTool)
+	require.True(t, ok)
+	require.Equal(t, "github", named.ToolSetName())
+}
+
 func TestNamedTool_OriginalAndCloseAndName(t *testing.T) {
 	base := &fakeToolSet{name: "fs"}
 	nts := NewNamedToolSet(base)
@@ -105,6 +215,7 @@ func TestNamedTool_OriginalAndCloseAndName(t *testing.T) {
 	nt, ok := got[0].(*NamedTool)
 	require.True(t, ok, "expected NamedTool, got %T", got[0])
 	require.Equal(t, t1, nt.Original())
+	require.Equal(t, "fs", nt.ToolSetName())
 	require.Equal(t, "fs", nts.Name())
 	require.NoError(t, nts.Close())
 	require.True(t, base.closed, "underlying Close() not called")
@@ -157,6 +268,168 @@ func TestNamedTool_SkipSummarizationDelegation(t *testing.T) {
 	})
 	t2 := nts2.Tools(context.Background())[0].(*NamedTool)
 	require.False(t, t2.SkipSummarization())
+}
+
+func TestNamedTool_MetadataAndPermissionDelegation(t *testing.T) {
+	const denyReason = "blocked"
+	ctx := context.Background()
+	original := &metadataPolicyTool{
+		name: "raw",
+		metadata: tool.ToolMetadata{
+			ReadOnly:        true,
+			ConcurrencySafe: true,
+			SearchOrRead:    true,
+			MaxResultSize:   128,
+		},
+		deferTool: true,
+		decision:  tool.DenyPermission(denyReason),
+	}
+	nts := NewNamedToolSet(&fakeToolSet{
+		name:  "fs",
+		tools: []tool.Tool{original},
+	})
+	nt := nts.Tools(ctx)[0].(*NamedTool)
+
+	require.Equal(t, original.metadata, nt.ToolMetadata())
+	require.True(t, nt.IsConcurrencySafe())
+	require.True(t, nt.ShouldDefer(ctx))
+	decision, err := nt.CheckPermission(ctx, &tool.PermissionRequest{})
+	require.NoError(t, err)
+	require.Equal(t, tool.PermissionActionDeny, decision.Action)
+	require.Equal(t, denyReason, decision.Reason)
+	require.True(t, original.permissionCalled)
+
+	plain := NewNamedToolSet(&fakeToolSet{
+		name:  "fs",
+		tools: []tool.Tool{&simpleTool{name: "plain"}},
+	}).Tools(ctx)[0].(*NamedTool)
+	require.Equal(t, tool.ToolMetadata{}, plain.ToolMetadata())
+	require.False(t, plain.IsConcurrencySafe())
+	require.False(t, plain.ShouldDefer(ctx))
+	decision, err = plain.CheckPermission(ctx, &tool.PermissionRequest{})
+	require.NoError(t, err)
+	require.Equal(t, tool.PermissionActionAllow, decision.Action)
+}
+
+func TestNewUnprefixedNamedTool(t *testing.T) {
+	base := &simpleTool{name: "raw", desc: "raw tool"}
+	named := NewUnprefixedNamedTool(base)
+	require.Same(t, base, named.Original())
+	require.Equal(t, "raw", named.Declaration().Name)
+	require.Equal(t, "", named.ToolSetName())
+	require.Same(t, base, ResolveSemantic(named))
+}
+
+func TestResolveDeclarationAndSemantic(t *testing.T) {
+	base := &simpleTool{name: "raw"}
+	named := NewNamedToolSet(&fakeToolSet{
+		name:  "set",
+		tools: []tool.Tool{base},
+	}).Tools(context.Background())[0]
+	wrapped := &declarationWrapperTool{base: named}
+	require.Same(t, named, ResolveDeclaration(wrapped))
+	require.Same(t, base, ResolveSemantic(wrapped))
+	require.Nil(t, ResolveDeclaration(nil))
+	require.Nil(t, ResolveSemantic(nil))
+}
+
+func TestApplyDeclarationsOverlaysMatchingTools(t *testing.T) {
+	base := []tool.Tool{
+		&simpleTool{name: "plain", desc: "plain description"},
+		nilDeclarationTool{},
+		nil,
+	}
+	declarations := []tool.Declaration{
+		{Name: ""},
+		{Name: "plain", Description: "patched description"},
+		{Name: "missing", Description: "missing description"},
+	}
+	got := ApplyDeclarations(base, declarations)
+	require.Len(t, got, 3)
+	require.Equal(t, "patched description", got[0].Declaration().Description)
+	require.Same(t, base[0], ResolveDeclaration(got[0]))
+	require.Same(t, base[0], ResolveSemantic(got[0]))
+	require.Equal(t, base[1], got[1])
+	require.Nil(t, got[2])
+	require.Equal(t, base, ApplyDeclarations(base, nil))
+	require.Equal(t, base, ApplyDeclarations(base, []tool.Declaration{{Name: ""}}))
+	require.Nil(t, ApplyDeclarations(nil, declarations))
+}
+
+func TestApplyDeclarationsPreservesCallableAndStreamableCapabilities(t *testing.T) {
+	ctx := context.Background()
+	callableBase := &callableOnlyTool{
+		decl:       &tool.Declaration{Name: "callable", Description: "old"},
+		callResult: "called",
+	}
+	streamBase := &streamOnlyTool{
+		decl: &tool.Declaration{Name: "streamable", Description: "old"},
+	}
+	bothBase := &fakeTool{
+		decl:       &tool.Declaration{Name: "both", Description: "old"},
+		callResult: "both-called",
+	}
+	base := []tool.Tool{callableBase, streamBase, bothBase}
+	got := ApplyDeclarations(base, []tool.Declaration{
+		{Name: "callable", Description: "new callable"},
+		{Name: "streamable", Description: "new streamable"},
+		{Name: "both", Description: "new both"},
+	})
+	require.Equal(t, "new callable", got[0].Declaration().Description)
+	callable, ok := got[0].(tool.CallableTool)
+	require.True(t, ok)
+	callResult, err := callable.Call(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, "called", callResult)
+	_, ok = got[0].(tool.StreamableTool)
+	require.False(t, ok)
+	streamable, ok := got[1].(tool.StreamableTool)
+	require.True(t, ok)
+	reader, err := streamable.StreamableCall(ctx, nil)
+	require.NoError(t, err)
+	streamBase.stream.Writer.Send(tool.StreamChunk{Content: "streamed"}, nil)
+	chunk, err := reader.Recv()
+	require.NoError(t, err)
+	require.Equal(t, "streamed", chunk.Content)
+	streamBase.stream.Writer.Close()
+	_, ok = got[1].(tool.CallableTool)
+	require.False(t, ok)
+	bothCallable, ok := got[2].(tool.CallableTool)
+	require.True(t, ok)
+	bothResult, err := bothCallable.Call(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, "both-called", bothResult)
+	bothStreamable, ok := got[2].(tool.StreamableTool)
+	require.True(t, ok)
+	bothReader, err := bothStreamable.StreamableCall(ctx, nil)
+	require.NoError(t, err)
+	bothBase.stream.Writer.Send(tool.StreamChunk{Content: "both-streamed"}, nil)
+	bothChunk, err := bothReader.Recv()
+	require.NoError(t, err)
+	require.Equal(t, "both-streamed", bothChunk.Content)
+	bothBase.stream.Writer.Close()
+}
+
+func TestApplyDeclarationsHonorsStreamInnerPreference(t *testing.T) {
+	base := &nonStreamInnerTool{
+		fakeTool: &fakeTool{
+			decl:       &tool.Declaration{Name: "search", Description: "old"},
+			callResult: "called",
+		},
+	}
+	got := ApplyDeclarations([]tool.Tool{NewUnprefixedNamedTool(base)}, []tool.Declaration{
+		{Name: "search", Description: "new"},
+	})
+	require.Len(t, got, 1)
+	require.Equal(t, "new", got[0].Declaration().Description)
+	_, streamable := got[0].(tool.StreamableTool)
+	require.False(t, streamable)
+	callable, ok := got[0].(tool.CallableTool)
+	require.True(t, ok)
+	result, err := callable.Call(context.Background(), nil)
+	require.NoError(t, err)
+	require.Equal(t, "called", result)
+	require.Same(t, base, ResolveSemantic(got[0]))
 }
 
 func TestGenerateJSONSchema_Primitives(t *testing.T) {
@@ -431,6 +704,43 @@ func TestGenerateJSONSchema_JSONSchemaTag_StringEnum(t *testing.T) {
 	for i, expected := range expectedEnums {
 		require.Equal(t, expected, statusSchema.Enum[i])
 	}
+}
+
+func TestGenerateJSONSchema_JSONSchemaTag_Pattern(t *testing.T) {
+	type TestStruct struct {
+		UserID string `json:"user_id" jsonschema:"description=User ID,pattern=^[a-z0-9_-]+$"`
+	}
+
+	result := GenerateJSONSchema(reflect.TypeOf(TestStruct{}))
+
+	userIDSchema := result.Properties["user_id"]
+	require.Equal(t, "string", userIDSchema.Type)
+	require.Equal(t, "User ID", userIDSchema.Description)
+	require.Equal(t, "^[a-z0-9_-]+$", userIDSchema.Pattern)
+}
+
+func TestGenerateJSONSchema_JSONSchemaTag_PatternPointerString(t *testing.T) {
+	type TestStruct struct {
+		UserID *string `json:"user_id,omitempty" jsonschema:"pattern=^[a-z0-9_-]+$"`
+	}
+
+	result := GenerateJSONSchema(reflect.TypeOf(TestStruct{}))
+
+	userIDSchema := result.Properties["user_id"]
+	require.Equal(t, "string", userIDSchema.Type)
+	require.Equal(t, "^[a-z0-9_-]+$", userIDSchema.Pattern)
+}
+
+func TestGenerateJSONSchema_JSONSchemaTag_PatternNonStringIgnored(t *testing.T) {
+	type TestStruct struct {
+		Count int `json:"count" jsonschema:"pattern=^[0-9]+$"`
+	}
+
+	result := GenerateJSONSchema(reflect.TypeOf(TestStruct{}))
+
+	countSchema := result.Properties["count"]
+	require.Equal(t, "integer", countSchema.Type)
+	require.Empty(t, countSchema.Pattern)
 }
 
 func TestGenerateJSONSchema_JSONSchemaTag_IntEnum(t *testing.T) {

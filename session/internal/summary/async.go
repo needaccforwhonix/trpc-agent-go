@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/summary"
@@ -40,11 +41,24 @@ type AsyncSummaryWorker struct {
 
 // AsyncSummaryConfig contains configuration for async summary worker.
 type AsyncSummaryConfig struct {
-	Summarizer        summary.SessionSummarizer
-	AsyncSummaryNum   int
-	SummaryQueueSize  int
-	SummaryJobTimeout time.Duration
-	CreateSummaryFunc func(context.Context, *session.Session, string, bool) error
+	Summarizer            summary.SessionSummarizer
+	AsyncSummaryNum       int
+	SummaryQueueSize      int
+	SummaryJobTimeout     time.Duration
+	SummaryDispatchPolicy SummaryDispatchPolicy
+	CreateSummaryFunc     func(context.Context, *session.Session, string, bool) error
+}
+
+// DetachContext clones ctx and strips cancellation for asynchronous summary work.
+func DetachContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithoutCancel(agent.CloneContext(ctx))
+}
+
+func (c AsyncSummaryConfig) hasSummarizer() bool {
+	return HasSummarizer(c.Summarizer)
 }
 
 // NewAsyncSummaryWorker creates a new async summary worker.
@@ -61,7 +75,7 @@ func (w *AsyncSummaryWorker) Start() {
 	if w.started {
 		return
 	}
-	if w.config.Summarizer == nil {
+	if !w.config.hasSummarizer() {
 		return
 	}
 	num := w.config.AsyncSummaryNum
@@ -110,7 +124,7 @@ func (w *AsyncSummaryWorker) EnqueueJob(
 	filterKey string,
 	force bool,
 ) error {
-	if w.config.Summarizer == nil {
+	if !w.config.hasSummarizer() {
 		return nil
 	}
 
@@ -125,7 +139,7 @@ func (w *AsyncSummaryWorker) EnqueueJob(
 
 	// Create job with detached context.
 	job := &summaryJob{
-		ctx:       context.WithoutCancel(ctx),
+		ctx:       DetachContext(ctx),
 		filterKey: filterKey,
 		force:     force,
 		session:   sess,
@@ -136,9 +150,10 @@ func (w *AsyncSummaryWorker) EnqueueJob(
 		return nil
 	}
 
-	// Fall back to synchronous processing.
+	// Fall back to synchronous processing using the same detached context that
+	// async workers would consume.
 	log.DebugfContext(ctx, "summary job queue full, processing synchronously")
-	return CreateSessionSummaryWithCascade(ctx, sess, filterKey, force, w.config.CreateSummaryFunc)
+	return w.runJob(job)
 }
 
 // tryEnqueueJob attempts to enqueue a summary job.
@@ -170,10 +185,20 @@ func (w *AsyncSummaryWorker) tryEnqueueJob(ctx context.Context, job *summaryJob)
 func (w *AsyncSummaryWorker) processJob(job *summaryJob) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.ErrorfContext(context.Background(), "panic in summary worker: %v", r)
+			log.ErrorfContext(context.Background(), log.PanicPrefix+" panic in summary worker: %v", r)
 		}
 	}()
 
+	if err := w.runJob(job); err != nil {
+		logCtx := job.ctx
+		if logCtx == nil {
+			logCtx = context.Background()
+		}
+		log.WarnfContext(logCtx, "summary worker failed to create session summary: %v", err)
+	}
+}
+
+func (w *AsyncSummaryWorker) runJob(job *summaryJob) error {
 	ctx := job.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -185,8 +210,6 @@ func (w *AsyncSummaryWorker) processJob(job *summaryJob) {
 		defer cancel()
 	}
 
-	if err := CreateSessionSummaryWithCascade(ctx, job.session, job.filterKey,
-		job.force, w.config.CreateSummaryFunc); err != nil {
-		log.WarnfContext(ctx, "summary worker failed to create session summary: %v", err)
-	}
+	return CreateSessionSummaryWithCascade(ctx, job.session, job.filterKey,
+		job.force, w.config.SummaryDispatchPolicy, w.config.CreateSummaryFunc)
 }

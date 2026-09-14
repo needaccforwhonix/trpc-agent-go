@@ -38,6 +38,16 @@ type Event struct {
     // Branch is a branch identifier for multi-Agent collaboration.
     Branch string `json:"branch,omitempty"`
 
+    // ParentMetadata describes the immediate parent edge that triggered this
+    // event's invocation. It carries the parent's toolCallId so that
+    // sub-agent events can be correlated to the specific parent tool call
+    // that spawned them. See the section on RequestID/ParentInvocationID/
+    // InvocationID/ParentMetadata for details.
+    ParentMetadata *ParentInvocationMetadata `json:"parentMetadata,omitempty"`
+
+    // Tag uses tags to annotate events with business-specific labels.
+    Tag string `json:"tag,omitempty"`
+
     // RequiresCompletion indicates whether this event requires a completion signal.
     RequiresCompletion bool `json:"requiresCompletion,omitempty"`
 
@@ -49,11 +59,17 @@ type Event struct {
     // StateDelta contains state changes to be written to the session.
     StateDelta map[string][]byte `json:"stateDelta,omitempty"`
 
+    // Extensions stores optional event metadata.
+    Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
+
     // StructuredOutput carries a typed, in-memory structured payload (not serialized).
     StructuredOutput any `json:"-"`
 
     // Actions carry flow-level hints (e.g., skip post-tool summarization).
     Actions *EventActions `json:"actions,omitempty"`
+
+    // FilterKey is an identifier for hierarchical event filtering.
+    FilterKey string `json:"filterKey,omitempty"`
 }
 
 // EventActions provides optional behavior hints attached to the event.
@@ -63,6 +79,31 @@ type EventActions struct {
     SkipSummarization bool `json:"skipSummarization,omitempty"`
 }
 ```
+
+`SkipSummarization` is a flow-control hint. It does not mean the current
+`tool.response` is a final assistant response. If you need the true terminal
+event for the run, continue consuming until `runner.completion`.
+
+#### FilterKey (hierarchical scope key)
+
+`FilterKey` is an optional string field on each event. Think of it as a
+path-like label, mainly used for:
+
+- Filtering which historical events are visible to the model when building the
+  next prompt (`WithMessageBranchFilterMode`).
+- Generating / retrieving per-scope session summaries (`WithSummaryFilterKey`).
+
+Keys are hierarchical paths separated by `/`, for example:
+
+- `my-app/user-messages`
+- `my-app/auth/role_admin`
+
+In `prefix` mode, matching is **hierarchical**: two keys match if one is an
+ancestor of the other (for example, `my-app` matches `my-app/auth/...`).
+
+For strict isolation (do not inherit ancestors), use `BranchFilterModeSubtree`.
+For a beginner-friendly explanation, see Session docs:
+`FilterKey, EventFilterKey, and BranchFilterMode`.
 
 `model.Response` is the basic response structure of Event, carrying LLM responses, tool calls, and error information, defined as follows:
 
@@ -153,8 +194,30 @@ type Usage struct {
     // Total number of tokens used in response.
     TotalTokens int `json:"total_tokens"`
 
+    // Details of prompt token usage.
+    PromptTokensDetails PromptTokensDetails `json:"prompt_tokens_details"`
+
+    // Details of completion token usage.
+    CompletionTokensDetails CompletionTokensDetails `json:"completion_tokens_details"`
+
     // Timing statistics (optional).
     TimingInfo *TimingInfo `json:"timing_info,omitempty"`
+}
+
+type PromptTokensDetails struct {
+    // Number of cached tokens in the prompt.
+    CachedTokens int `json:"cached_tokens"`
+
+    // Number of tokens used to create the cache (Anthropic).
+    CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
+
+    // Number of tokens read from cache (Anthropic).
+    CacheReadTokens int `json:"cache_read_tokens,omitempty"`
+}
+
+type CompletionTokensDetails struct {
+    // Number of tokens generated for reasoning.
+    ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 type TimingInfo struct {
@@ -181,6 +244,8 @@ type TimingInfo struct {
     ReasoningDuration time.Duration `json:"reasoning_duration,omitempty"`
 }
 ```
+
+`CompletionTokensDetails.ReasoningTokens` corresponds to OpenAI-compatible `completion_tokens_details.reasoning_tokens`. It can be `0` when the model does not use reasoning tokens or the provider does not report them.
 
 ### Event Types
 
@@ -255,6 +320,24 @@ if e.IsRunnerCompletion() {
 }
 ```
 
+Do not confuse `event.IsFinalResponse()` with
+`event.IsRunnerCompletion()`:
+
+- `event.IsFinalResponse()` reuses the embedded `Response` semantics. It only
+  says the current response payload has finished: it is not partial, not a
+  tool-call response, and `Response.Done == true`. This can be an assistant
+  message, a `tool.response`, or a terminal error response.
+- `event.IsRunnerCompletion()` asks whether Runner has emitted the terminal
+  `runner.completion` event. Only this signal means the entire `Runner.Run`
+  has finished and no more runtime events should be expected.
+
+Rule of thumb:
+
+- Use `IsFinalResponse()` when you only care whether the current payload is
+  complete.
+- Use `IsRunnerCompletion()` when deciding to stop consuming the event stream,
+  read final state, or treat the whole run as finished.
+
 ### Event Creation
 
 When developing custom Agent types or Processors, you need to create Events.
@@ -319,6 +402,9 @@ When AgentTool enables `WithStreamInner(true)`, it also forwards the child Agent
 
 - Forwarded child events are standard `event.Event` items; incremental text appears in `choice.Delta.Content`.
 - To avoid duplicate display, the child’s final full message is not forwarded; it is aggregated into the final `tool.response` content so the next LLM turn has tool messages as required by some providers.
+- If you only want inner progress and not the child assistant prose, combine
+  `WithStreamInner(true)` with
+  `WithInnerTextMode(agenttool.InnerTextModeExclude)`.
 
 Runner automatically sends completion signals for events requiring them (`RequiresCompletion=true`), so manual handling is not needed.
 
@@ -341,6 +427,37 @@ if evt.Response != nil && evt.Object == model.ObjectTypeToolResponse && len(evt.
 ```
 
 Tip: For custom events, always use `event.New(...)` with `WithResponse`, `WithBranch`, etc., to ensure IDs and timestamps are set consistently.
+
+### Tool Call Arguments on Tool Responses
+
+Tool response events can carry the final tool-call arguments in
+`Event.Extensions`. This is useful when an event consumer needs to render a
+business-specific display name for a tool result, but that name depends on the
+arguments used for the original tool call.
+
+Use `event.ToolCallArgsExtensionKey` to read a `map[string]string`, where the
+key is the tool call ID and the value is the JSON argument string:
+
+```go
+argsByID, ok, err := event.GetExtension[map[string]string](
+    evt,
+    event.ToolCallArgsExtensionKey,
+)
+if err != nil {
+    // Extension payload had an unexpected shape.
+    return err
+}
+if ok {
+    argsJSON := argsByID[toolCallID]
+    // Use argsJSON to compute a display name, e.g. "Query game time".
+}
+```
+
+The stored arguments are the final arguments used by the framework after
+`BeforeTool` callbacks and argument repair. When parallel tool calls are merged
+into one `tool.response` event, the same extension map can contain entries for
+multiple tool call IDs. Treat this extension as optional so older or custom
+events without it remain compatible.
 
 ### GraphAgent Node-emitted Events (non-LLM output)
 
@@ -487,8 +604,8 @@ func (c *multiTurnChat) processResponse(eventChan <-chan *event.Event) error {
         if err := c.handleEvent(event, &toolCallsDetected, &assistantStarted, &fullContent); err != nil {
             return err
         }
-        // Check if it's the final event.
-        if event.IsFinalResponse() {
+        // Check if the run-completion event has arrived.
+        if event.IsRunnerCompletion() {
             fmt.Printf("\n")
             break
         }
@@ -614,6 +731,12 @@ func (c *multiTurnChat) displayContent(
 - `RequestID string`​​: Used to identify and distinguish multiple user interaction requests within the same session. It can be bound to the business layer's own request ID via runner.Runu agent.WithRequestID. This ensures unique identification for each request cycle, similar to how request IDs are employed to guarantee idempotency and de-duplication in API interactions.
 - `​​ParentInvocationID string`​​: Used to associate the parent execution context. This ID can link to related events in the parent execution, enabling hierarchical tracking of nested operations. This mirrors concepts where a parent request ID groups multiple sub-requests, each with distinct identifiers but shared parent context for cohesive management.
 - `​​InvocationID string`​​: The current execution context ID. This ID associates related events within the same execution context, allowing precise correlation of actions and outcomes for a specific invocation. It functions similarly to child request IDs in systems where individual operations are tracked under a parent scope.
+- `ParentMetadata *ParentInvocationMetadata`: Describes how this invocation was triggered by its **immediate** parent. While `ParentInvocationID` only points to the parent execution, `ParentMetadata` adds the join key needed to attach the child to the exact tool call inside the parent:
+    - `TriggerType`: `tool_call` for AgentTool, `transfer` for `transfer_to_agent`.
+    - `TriggerID`: the parent's `toolCallId`. Use this to correlate the child's events with the parent's `TOOL_CALL_START`.
+    - `TriggerName`: human-readable name (AgentTool name, or `transfer_to_agent`).
+
+  This field is the disambiguator for parallel AgentTool calls: when a model issues multiple parallel calls to the same sub-agent in one turn, all spawned invocations share the same `ParentInvocationID`; only `ParentMetadata.TriggerID` distinguishes which `TOOL_CALL_START` each child belongs to. When the invocation was not triggered through a parent tool call (e.g., a top-level run), this field is `nil`.
 
 Using these three IDs, the event flow can be organized in a hierarchical structure as follows:
 - requestID-1:

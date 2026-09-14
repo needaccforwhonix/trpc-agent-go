@@ -162,12 +162,13 @@ type BeforeToolArgs struct {
     ToolCallID   string               // The ID of tool call issued by the model
     ToolName     string               // The name of the tool
     Declaration  *tool.Declaration    // Tool declaration metadata
-    Arguments    []byte               // JSON arguments (can be modified)
+    Arguments    []byte               // Current JSON arguments
 }
 
 type BeforeToolResult struct {
     Context           context.Context  // Optional context for subsequent operations
     CustomResult      any              // If non-nil, skips tool execution and returns this result
+    SkipStateDelta    bool             // Skip state-delta provider for CustomResult
     ModifiedArguments []byte           // Optional modified arguments for tool execution
 }
 
@@ -175,14 +176,17 @@ type AfterToolArgs struct {
     ToolCallID   string               // The ID of tool call issued by the model
     ToolName     string               // The name of the tool
     Declaration  *tool.Declaration    // Tool declaration metadata
-    Arguments    []byte               // Original JSON arguments
+    Arguments    []byte               // Final JSON arguments after before-tool callbacks
     Result       any                  // Result from tool execution (may be nil)
     Error        error                // Any error that occurred during tool execution
 }
 
 type AfterToolResult struct {
-    Context      context.Context  // Optional context for subsequent operations
-    CustomResult any              // If non-nil, replaces the original result
+    Context             context.Context  // Optional context for subsequent operations
+    CustomResult        any              // If non-nil, replaces the original result
+    SkipResultFormatter bool             // Use default JSON for CustomResult
+    SkipStateDelta      bool             // Skip state-delta provider for CustomResult
+    SkipSummarization   bool             // If true, end the turn after tool.response
 }
 ```
 
@@ -198,9 +202,21 @@ Key points:
 - Structured parameters provide better type safety and clearer intent.
 - `BeforeToolResult.ModifiedArguments` allows modifying tool arguments.
 - `BeforeToolResult.Context` and `AfterToolResult.Context` can pass context between operations.
-- Arguments can be modified directly via `args.Arguments`.
+- To make tool execution use updated arguments, return `BeforeToolResult.ModifiedArguments`;
+  assigning `args.Arguments` only affects later logic that reads that field in the same callback chain.
 - If BeforeToolCallbackStructured returns a non-nil custom result, the tool is skipped and that result is used directly.
 - `ToolCallID` is available in `BeforeToolArgs` and `AfterToolArgs`.
+- `AfterToolResult.SkipResultFormatter` keeps a non-nil `CustomResult` out of
+  the tool's configured result formatter and uses default JSON serialization.
+  This is useful when the replacement is a protocol or error envelope rather
+  than a value of the tool's declared output type.
+- `BeforeToolResult.SkipStateDelta` and `AfterToolResult.SkipStateDelta` keep
+  a non-nil `CustomResult` from invoking the tool's state-delta provider. This
+  is useful when the replacement did not produce a successful tool result.
+- `AfterToolResult.SkipSummarization` lets a callback end the turn after
+  `tool.response` when the tool result should be surfaced directly.
+- `SkipSummarization` only skips the extra summarization LLM call. The true
+  end-of-run marker is still `runner.completion` / `event.IsRunnerCompletion()`.
 
 ### Callback Execution Control
 
@@ -248,10 +264,20 @@ Example:
 toolCallbacks := tool.NewCallbacks().
   RegisterBeforeTool(func(ctx context.Context, args *tool.BeforeToolArgs) (*tool.BeforeToolResult, error) {
     if args.Arguments != nil && args.ToolName == "calculator" {
-      // Enrich arguments.
-      original := string(args.Arguments)
-      enriched := []byte(fmt.Sprintf(`{"original":%s,"ts":%d}`, original, time.Now().Unix()))
-      args.Arguments = enriched
+      // Normalize the operation while preserving the calculator schema.
+      var payload map[string]any
+      if err := json.Unmarshal(args.Arguments, &payload); err != nil {
+        return nil, err
+      }
+      if op, ok := payload["operation"].(string); ok {
+        payload["operation"] = strings.ToLower(op)
+      }
+      modifiedJSON, err := json.Marshal(payload)
+      if err != nil {
+        return nil, err
+      }
+      args.Arguments = modifiedJSON
+      return &tool.BeforeToolResult{ModifiedArguments: modifiedJSON}, nil
     }
     return nil, nil
   }).
@@ -267,6 +293,27 @@ toolCallbacks := tool.NewCallbacks().
     return nil, nil
   })
 ```
+
+Dynamic skip-summarization example:
+
+```go
+toolCallbacks.RegisterAfterTool(func(ctx context.Context, args *tool.AfterToolArgs) (*tool.AfterToolResult, error) {
+  if args.Error != nil {
+    return nil, nil
+  }
+  out, ok := args.Result.(map[string]any)
+  if ok && out["action"] != nil {
+    return &tool.AfterToolResult{
+      SkipSummarization: true,
+    }, nil
+  }
+  return nil, nil
+})
+```
+
+This ends the turn after the tool response. It does not turn `tool.response`
+into a final assistant message, so consumers that need the real terminal
+signal should keep reading until `runner.completion`.
 
 **Usage**: After creating callbacks, pass them to the LLM Agent when creating it using the `llmagent.WithToolCallbacks()` option:
 
@@ -564,7 +611,7 @@ translateCallbacks := translator.NewCallbacks().
   })
 ```
 
-For more details on TranslateCallbacks, see [agui](./agui.md).
+For more details on TranslateCallbacks, see [agui](./agui/index.md).
 
 ---
 
@@ -757,6 +804,13 @@ For a complete timing example with OpenTelemetry integration, see:
 For an authentication and authorization example using Invocation State for permission checks and audit logging, see:
 [examples/callbacks/auth](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/callbacks/auth)
 
+Note: `BeforeToolCallback` only runs when the model actually calls a tool. If
+you persist tool results into session history and permissions can change within
+the same session, the model may answer from history and skip the tool call,
+effectively bypassing tool callbacks. In those cases, you should also isolate
+or filter history at prompt-build time (see the “Permission Changes and History
+Isolation” section in the Session docs).
+
 ---
 
 ## Global Callbacks and Chain Registration
@@ -819,9 +873,19 @@ Modify arguments prior to execution (and telemetry/event reporting):
 toolCallbacks := tool.NewCallbacks().
   RegisterBeforeTool(func(ctx context.Context, args *tool.BeforeToolArgs) (*tool.BeforeToolResult, error) {
     if args.Arguments != nil && args.ToolName == "calculator" {
-      originalArgs := string(args.Arguments)
-      modifiedArgs := fmt.Sprintf(`{"original":%s,"timestamp":"%d"}`, originalArgs, time.Now().Unix())
-      args.Arguments = []byte(modifiedArgs)
+      var payload map[string]any
+      if err := json.Unmarshal(args.Arguments, &payload); err != nil {
+        return nil, err
+      }
+      if op, ok := payload["operation"].(string); ok {
+        payload["operation"] = strings.ToLower(op)
+      }
+      modifiedJSON, err := json.Marshal(payload)
+      if err != nil {
+        return nil, err
+      }
+      args.Arguments = modifiedJSON
+      return &tool.BeforeToolResult{ModifiedArguments: modifiedJSON}, nil
     }
     return nil, nil
   })

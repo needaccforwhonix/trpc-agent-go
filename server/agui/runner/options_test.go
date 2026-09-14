@@ -17,6 +17,7 @@ import (
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
@@ -48,6 +49,11 @@ func TestNewOptionsDefaults(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Same(t, input, modified)
 
+	assert.NotNil(t, opts.AppNameResolver)
+	appName, err := opts.AppNameResolver(context.Background(), input)
+	assert.NoError(t, err)
+	assert.Empty(t, appName)
+
 	assert.NotNil(t, opts.StateResolver)
 	resolvedState, err := opts.StateResolver(context.Background(), input)
 	assert.NoError(t, err)
@@ -65,11 +71,48 @@ func TestNewOptionsDefaults(t *testing.T) {
 	assert.Equal(t, rootCtx, ctx)
 	assert.NotNil(t, span)
 
+	assert.Equal(t, 5*time.Second, opts.PostRunFinalizationTimeout)
+	assert.Equal(t, 5*time.Second, opts.TrackPersistenceTimeout)
 	assert.Equal(t, time.Hour, opts.Timeout)
 	assert.False(t, opts.CancelOnContextDoneEnabled)
 	assert.False(t, opts.GraphNodeLifecycleActivityEnabled)
 	assert.False(t, opts.GraphNodeInterruptActivityEnabled)
 	assert.False(t, opts.GraphNodeInterruptActivityTopLevelOnly)
+	assert.False(t, opts.ReasoningContentEnabled)
+	assert.False(t, opts.EventSourceMetadataEnabled)
+	assert.False(t, opts.ToolResultInputTranslationEnabled)
+	assert.False(t, opts.ToolCallDeltaStreamingEnabled)
+	assert.False(t, opts.StreamingToolResultActivityEnabled)
+	assert.True(t, opts.ConcurrentMessageStreamsEnabled)
+	assert.False(t, opts.MessagesSnapshotRunLifecycleEventsEnabled)
+	assert.False(t, opts.MessagesSnapshotBestEffortEnabled)
+	assert.False(t, opts.DistributedCancelEnabled)
+	assert.Equal(t, time.Second, opts.DistributedCancelPollInterval)
+}
+
+func TestDefaultStateResolver(t *testing.T) {
+	t.Run("object state", func(t *testing.T) {
+		state := map[string]any{"document": "hello"}
+		resolved, err := defaultStateResolver(context.Background(), &adapter.RunAgentInput{
+			State: state,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, state, resolved)
+	})
+
+	t.Run("non-object state", func(t *testing.T) {
+		resolved, err := defaultStateResolver(context.Background(), &adapter.RunAgentInput{
+			State: "hello",
+		})
+		require.NoError(t, err)
+		assert.Nil(t, resolved)
+	})
+
+	t.Run("nil input", func(t *testing.T) {
+		resolved, err := defaultStateResolver(context.Background(), nil)
+		require.NoError(t, err)
+		assert.Nil(t, resolved)
+	})
 }
 
 func TestWithUserIDResolver(t *testing.T) {
@@ -124,6 +167,55 @@ func TestWithGraphNodeInterruptActivityTopLevelOnly(t *testing.T) {
 	assert.True(t, opts.GraphNodeInterruptActivityTopLevelOnly)
 }
 
+func TestWithReasoningContentEnabled(t *testing.T) {
+	opts := NewOptions(WithReasoningContentEnabled(true))
+	assert.True(t, opts.ReasoningContentEnabled)
+}
+
+func TestWithEventSourceMetadataEnabled(t *testing.T) {
+	opts := NewOptions(WithEventSourceMetadataEnabled(true))
+	assert.True(t, opts.EventSourceMetadataEnabled)
+}
+
+func TestWithToolResultInputTranslationEnabled(t *testing.T) {
+	opts := NewOptions(WithToolResultInputTranslationEnabled(true))
+	assert.True(t, opts.ToolResultInputTranslationEnabled)
+}
+
+func TestWithToolCallDeltaStreamingEnabled(t *testing.T) {
+	opts := NewOptions(WithToolCallDeltaStreamingEnabled(true))
+	assert.True(t, opts.ToolCallDeltaStreamingEnabled)
+}
+
+func TestWithStreamingToolResultActivityEnabled(t *testing.T) {
+	opts := NewOptions(WithStreamingToolResultActivityEnabled(true))
+	assert.True(t, opts.StreamingToolResultActivityEnabled)
+}
+
+func TestWithConcurrentMessageStreamsEnabled(t *testing.T) {
+	opts := NewOptions(WithConcurrentMessageStreamsEnabled(false))
+	assert.False(t, opts.ConcurrentMessageStreamsEnabled)
+	run := New(nil, WithConcurrentMessageStreamsEnabled(false))
+	impl, ok := run.(*runner)
+	require.True(t, ok)
+	assert.False(t, impl.concurrentMessageStreamsEnabled)
+}
+
+func TestWithMessagesSnapshotRunLifecycleEventsEnabled(t *testing.T) {
+	opts := NewOptions(WithMessagesSnapshotRunLifecycleEventsEnabled(true))
+	assert.True(t, opts.MessagesSnapshotRunLifecycleEventsEnabled)
+}
+
+func TestWithMessagesSnapshotBestEffortEnabled(t *testing.T) {
+	opts := NewOptions(WithMessagesSnapshotBestEffortEnabled(true))
+	assert.True(t, opts.MessagesSnapshotBestEffortEnabled)
+}
+
+func TestWithPostRunFinalizationTimeout(t *testing.T) {
+	opts := NewOptions(WithPostRunFinalizationTimeout(2 * time.Second))
+	assert.Equal(t, 2*time.Second, opts.PostRunFinalizationTimeout)
+}
+
 func TestWithTranslateCallbacks(t *testing.T) {
 	cb := translator.NewCallbacks()
 	opts := NewOptions(WithTranslateCallbacks(cb))
@@ -151,6 +243,20 @@ func TestWithRunAgentInputHook(t *testing.T) {
 func TestWithAppName(t *testing.T) {
 	opts := NewOptions(WithAppName("custom-app"))
 	assert.Equal(t, "custom-app", opts.AppName)
+}
+
+func TestWithAppNameResolver(t *testing.T) {
+	called := false
+	resolver := func(ctx context.Context, input *adapter.RunAgentInput) (string, error) {
+		called = true
+		return "custom-app", nil
+	}
+	opts := NewOptions(WithAppNameResolver(resolver))
+	assert.NotNil(t, opts.AppNameResolver)
+	appName, err := opts.AppNameResolver(context.Background(), nil)
+	assert.NoError(t, err)
+	assert.Equal(t, "custom-app", appName)
+	assert.True(t, called)
 }
 
 func TestWithSessionService(t *testing.T) {
@@ -221,9 +327,24 @@ func TestWithTimeout(t *testing.T) {
 	assert.Equal(t, 2*time.Second, opts.Timeout)
 }
 
+func TestWithTrackPersistenceTimeout(t *testing.T) {
+	opts := NewOptions(WithTrackPersistenceTimeout(2 * time.Second))
+	assert.Equal(t, 2*time.Second, opts.TrackPersistenceTimeout)
+}
+
 func TestWithCancelOnContextDoneEnabled(t *testing.T) {
 	opts := NewOptions(WithCancelOnContextDoneEnabled(true))
 	assert.True(t, opts.CancelOnContextDoneEnabled)
+}
+
+func TestWithDistributedCancelEnabled(t *testing.T) {
+	opts := NewOptions(WithDistributedCancelEnabled(true))
+	assert.True(t, opts.DistributedCancelEnabled)
+}
+
+func TestWithDistributedCancelPollInterval(t *testing.T) {
+	opts := NewOptions(WithDistributedCancelPollInterval(2 * time.Second))
+	assert.Equal(t, 2*time.Second, opts.DistributedCancelPollInterval)
 }
 
 func TestWithMessagesSnapshotFollowEnabled(t *testing.T) {

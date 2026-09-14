@@ -14,12 +14,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"math"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/spaolacci/murmur3"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/log"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 // StateMap is a map of state key-value pairs.
@@ -34,6 +37,22 @@ var (
 	ErrSessionIDRequired = errors.New("sessionID is required")
 	// ErrNilSession is the error for session is nil.
 	ErrNilSession = errors.New("session is nil")
+	// ErrEventPageOnlyForGetSession indicates event paging is not supported by ListSessions.
+	ErrEventPageOnlyForGetSession = errors.New("event page is only supported by GetSession")
+	// ErrEventPageUnsupported indicates the backend does not support event paging.
+	ErrEventPageUnsupported = errors.New("event page is only supported by postgres/mysql GetSession")
+	// ErrInvalidEventPage indicates event paging arguments are invalid.
+	ErrInvalidEventPage = errors.New("event page requires offset >= 0 and limit > 0")
+	// ErrEventPageConflictsWithEventFilters indicates paging cannot be mixed with context filters.
+	ErrEventPageConflictsWithEventFilters = errors.New("event page cannot be combined with EventNum or EventTime")
+	// ErrInvalidListSessionPage indicates list-session paging arguments are invalid.
+	ErrInvalidListSessionPage = errors.New("list session page requires offset >= 0 and limit >= 0")
+	// ErrTracksEmpty indicates the session has no track data.
+	ErrTracksEmpty = errors.New("tracks is empty")
+	// ErrTrackEventsNotFound indicates the requested track has no events.
+	ErrTrackEventsNotFound = errors.New("track events not found")
+	// ErrEventWindowAnchorNotFound indicates an event-window anchor was missing.
+	ErrEventWindowAnchorNotFound = errors.New("anchor event not found")
 )
 
 // SummaryFilterKeyAllContents is the filter key representing
@@ -57,10 +76,15 @@ type Session struct {
 	CreatedAt   time.Time           `json:"createdAt"`           // CreatedAt is the creation time.
 
 	// Hash is the pre-computed slot hash value for asynchronous task dispatching.
-	// It is calculated once during session creation using murmur3 hash of
+	// It is calculated once during session creation by hashing
 	// "appName:userID:sessionID" and remains immutable throughout the session's lifecycle.
 	// This field is computed once during session creation and never modified.
 	Hash int `json:"-"`
+
+	// ServiceMeta stores service-layer metadata (memory only, not persisted).
+	// Used internally by session service implementations for version routing, etc.
+	// Users should not access or modify this field directly.
+	ServiceMeta map[string]string `json:"-"`
 
 	stateMu sync.RWMutex `json:"-"` // stateMu is the read-write mutex for State.
 }
@@ -119,15 +143,20 @@ func (sess *Session) Clone() *Session {
 	if sess.Summaries != nil {
 		copiedSess.Summaries = make(map[string]*Summary, len(sess.Summaries))
 		for b, sum := range sess.Summaries {
-			if sum == nil {
-				continue
+			if copied := sum.Clone(); copied != nil {
+				copiedSess.Summaries[b] = copied
 			}
-			// Shallow copy is fine since Summary is immutable after write.
-			copied := *sum
-			copiedSess.Summaries[b] = &copied
 		}
 	}
 	sess.SummariesMu.RUnlock()
+
+	// Copy service metadata.
+	if sess.ServiceMeta != nil {
+		copiedSess.ServiceMeta = make(map[string]string, len(sess.ServiceMeta))
+		for k, v := range sess.ServiceMeta {
+			copiedSess.ServiceMeta[k] = v
+		}
+	}
 
 	return copiedSess
 }
@@ -189,10 +218,19 @@ func WithSessionUpdatedAt(updatedAt time.Time) SessionOptions {
 	}
 }
 
+// HashString computes a non-negative deterministic hash for the given string.
+// It is used for slot-based dispatching of sessions and track events.
+// The result is always >= 0, safe for use as a slice index after modulus.
+func HashString(s string) int {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return int(h.Sum32()) & math.MaxInt
+}
+
 // NewSession creates a new session.
 func NewSession(appName, userID, sessionID string, options ...SessionOptions) *Session {
 	hashKey := fmt.Sprintf("%s:%s:%s", appName, userID, sessionID)
-	hash := int(murmur3.Sum32([]byte(hashKey)))
+	hash := HashString(hashKey)
 
 	sess := &Session{
 		ID:        sessionID,
@@ -281,6 +319,53 @@ func (sess *Session) SnapshotState() StateMap {
 	return out
 }
 
+// HasStateKeyWithPrefix reports whether the session state contains at least one
+// key with the provided prefix and a non-empty value.
+//
+// Nil or empty values are treated as absent.
+func (sess *Session) HasStateKeyWithPrefix(prefix string) bool {
+	if sess == nil {
+		return false
+	}
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return false
+	}
+
+	sess.stateMu.RLock()
+	defer sess.stateMu.RUnlock()
+	if len(sess.State) == 0 {
+		return false
+	}
+	for k, v := range sess.State {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		if len(v) == 0 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// SnapshotTracksState returns a copy of the tracks state value (State["tracks"]).
+// Returns nil if no tracks are registered.
+func (sess *Session) SnapshotTracksState() []byte {
+	sess.stateMu.RLock()
+	defer sess.stateMu.RUnlock()
+	if sess.State == nil {
+		return nil
+	}
+	v, ok := sess.State[tracksStateKey]
+	if !ok || len(v) == 0 {
+		return nil
+	}
+	out := make([]byte, len(v))
+	copy(out, v)
+	return out
+}
+
 // GetEvents returns the session events.
 func (sess *Session) GetEvents() []event.Event {
 	sess.EventMu.RLock()
@@ -337,11 +422,11 @@ func (sess *Session) GetTrackEvents(track Track) (*TrackEvents, error) {
 	sess.TracksMu.RLock()
 	defer sess.TracksMu.RUnlock()
 	if sess.Tracks == nil {
-		return nil, fmt.Errorf("tracks is empty")
+		return nil, ErrTracksEmpty
 	}
 	trackEvents, ok := sess.Tracks[track]
 	if !ok || trackEvents == nil {
-		return nil, fmt.Errorf("track events not found: %s", track)
+		return nil, fmt.Errorf("%w: %s", ErrTrackEventsNotFound, track)
 	}
 	copied := &TrackEvents{Track: trackEvents.Track}
 	if len(trackEvents.Events) > 0 {
@@ -386,15 +471,14 @@ func (sess *Session) UpdateUserSession(event *event.Event, opts ...Option) {
 		log.Info("session or event is nil")
 		return
 	}
+	sess.EventMu.Lock()
 	if event.Response != nil && !event.IsPartial && event.IsValidContent() {
-		sess.EventMu.Lock()
 		sess.Events = append(sess.Events, *event)
 		// Apply filtering options.
 		sess.ApplyEventFiltering(opts...)
-		sess.EventMu.Unlock()
 	}
-
 	sess.UpdatedAt = time.Now()
+	sess.EventMu.Unlock()
 	sess.ApplyEventStateDelta(event)
 }
 
@@ -501,15 +585,216 @@ func applyOptions(opts ...Option) *Options {
 // Summary represents a concise, structured summary of a conversation branch.
 // It is stored on the session object rather than in the StateMap.
 type Summary struct {
-	Summary   string    `json:"summary"`          // Summary is the concise conversation summary.
-	Topics    []string  `json:"topics,omitempty"` // Topics is the optional topics list.
-	UpdatedAt time.Time `json:"updated_at"`       // UpdatedAt is the update timestamp in UTC.
+	Summary   string           `json:"summary"`            // Summary is the concise conversation summary.
+	Topics    []string         `json:"topics,omitempty"`   // Topics is the optional topics list.
+	UpdatedAt time.Time        `json:"updated_at"`         // UpdatedAt is the legacy cutoff timestamp in UTC.
+	Boundary  *SummaryBoundary `json:"boundary,omitempty"` // Boundary records the summarized history cutoff.
 }
 
-// Options is the options for getting a session.
+const (
+	// SummaryBoundaryVersion is the current summary boundary metadata version.
+	SummaryBoundaryVersion = 1
+	// SummaryLastIncludedTimestampStateKey stores the last summarized event timestamp.
+	SummaryLastIncludedTimestampStateKey = "summary:last_included_ts"
+	// SummaryLastIncludedEventIDStateKey stores the last summarized event ID.
+	SummaryLastIncludedEventIDStateKey = "summary:last_included_event_id"
+)
+
+// SummaryBoundary records the history cutoff represented by a summary.
+// Summary keeps semantic content; Boundary keeps the structural cutoff used by
+// request builders and storage backends. CutoffAt keeps compatibility with the
+// existing timestamp-based summary model, and LastEventID disambiguates events
+// that share the same timestamp when the writer can identify the last covered
+// transcript event.
+type SummaryBoundary struct {
+	Version     int       `json:"version"`
+	FilterKey   string    `json:"filter_key,omitempty"`
+	CutoffAt    time.Time `json:"cutoff_at,omitempty"`
+	LastEventID string    `json:"last_event_id,omitempty"`
+}
+
+// NewSummaryBoundary creates boundary metadata for a generated summary.
+func NewSummaryBoundary(filterKey string, cutoffAt time.Time) *SummaryBoundary {
+	return NewSummaryBoundaryWithEventID(filterKey, cutoffAt, "")
+}
+
+// NewSummaryBoundaryWithEventID creates boundary metadata anchored to a
+// specific last summarized event.
+func NewSummaryBoundaryWithEventID(
+	filterKey string,
+	cutoffAt time.Time,
+	lastEventID string,
+) *SummaryBoundary {
+	return &SummaryBoundary{
+		Version:     SummaryBoundaryVersion,
+		FilterKey:   filterKey,
+		CutoffAt:    cutoffAt.UTC(),
+		LastEventID: lastEventID,
+	}
+}
+
+// CutoffTime returns the timestamp cutoff represented by the boundary.
+func (b *SummaryBoundary) CutoffTime() time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	return b.CutoffAt.UTC()
+}
+
+// Clone returns a deep copy of the summary boundary.
+func (b *SummaryBoundary) Clone() *SummaryBoundary {
+	if b == nil {
+		return nil
+	}
+	copied := *b
+	return &copied
+}
+
+// CutoffBoundary returns normalized cutoff metadata represented by the summary.
+// Summaries written before boundary metadata existed fall back to UpdatedAt.
+func (s *Summary) CutoffBoundary() *SummaryBoundary {
+	if s == nil {
+		return nil
+	}
+	if boundary := s.Boundary.Clone(); boundary != nil {
+		if boundary.Version == 0 {
+			boundary.Version = SummaryBoundaryVersion
+		}
+		if boundary.CutoffAt.IsZero() {
+			boundary.CutoffAt = s.UpdatedAt.UTC()
+		} else {
+			boundary.CutoffAt = boundary.CutoffAt.UTC()
+		}
+		if !boundary.CutoffAt.IsZero() {
+			return boundary
+		}
+	}
+	if s.UpdatedAt.IsZero() {
+		return nil
+	}
+	return NewSummaryBoundary("", s.UpdatedAt)
+}
+
+// CutoffTime returns the event cutoff represented by the summary.
+// Summaries written before boundary metadata existed fall back to UpdatedAt.
+func (s *Summary) CutoffTime() time.Time {
+	boundary := s.CutoffBoundary()
+	if boundary == nil {
+		return time.Time{}
+	}
+	return boundary.CutoffTime()
+}
+
+// SummaryFilterKeyMatchesPrefix reports whether key belongs to prefix's
+// hierarchical summary scope.
+func SummaryFilterKeyMatchesPrefix(key, prefix string) bool {
+	filterPrefix := prefix + event.FilterKeyDelimiter
+	keyWithDelim := key + event.FilterKeyDelimiter
+	return key == prefix || strings.HasPrefix(keyWithDelim, filterPrefix)
+}
+
+// SummaryPrefixCutoff returns the effective cutoff for summaries matching a
+// hierarchical prefix. It returns ok=false when no non-empty summaries match.
+// The effective cutoff is Summary.CutoffTime: boundary cutoff when present,
+// otherwise legacy UpdatedAt. When any matching summary has a zero effective
+// cutoff, the returned cutoff is zero so callers keep raw history instead of
+// dropping potentially uncovered events.
+// Callers must hold the session summaries read lock when passing a live session
+// summary map.
+func SummaryPrefixCutoff(
+	summaries map[string]*Summary,
+	prefix string,
+) (time.Time, bool) {
+	boundary, ok := SummaryPrefixBoundary(summaries, prefix)
+	if !ok || boundary == nil {
+		return time.Time{}, ok
+	}
+	return boundary.CutoffTime(), true
+}
+
+// SummaryPrefixBoundary returns the effective boundary for summaries matching
+// a hierarchical prefix. Prefix aggregation clears LastEventID because one
+// branch-local event ID cannot represent the whole prefix scope.
+func SummaryPrefixBoundary(
+	summaries map[string]*Summary,
+	prefix string,
+) (*SummaryBoundary, bool) {
+	var boundary *SummaryBoundary
+	var matched bool
+	var hasMissingCutoff bool
+	for key, sum := range summaries {
+		if sum == nil || strings.TrimSpace(sum.Summary) == "" {
+			continue
+		}
+		if !SummaryFilterKeyMatchesPrefix(key, prefix) {
+			continue
+		}
+		matched = true
+		sumBoundary := sum.CutoffBoundary()
+		if sumBoundary == nil || sumBoundary.CutoffTime().IsZero() {
+			hasMissingCutoff = true
+			continue
+		}
+		sumBoundary.FilterKey = key
+		if boundary == nil || sumBoundary.CutoffAt.Before(boundary.CutoffAt) {
+			boundary = sumBoundary
+			continue
+		}
+		if sumBoundary.CutoffAt.Equal(boundary.CutoffAt) {
+			boundary.LastEventID = ""
+		}
+	}
+	if !matched {
+		return nil, false
+	}
+	if hasMissingCutoff {
+		return NewSummaryBoundary(prefix, time.Time{}), true
+	}
+	if boundary == nil {
+		return NewSummaryBoundary(prefix, time.Time{}), true
+	}
+	boundary.FilterKey = prefix
+	boundary.LastEventID = ""
+	return boundary, true
+}
+
+// Clone returns a deep copy of the summary.
+func (s *Summary) Clone() *Summary {
+	if s == nil {
+		return nil
+	}
+	copied := *s
+	if s.Topics != nil {
+		copied.Topics = make([]string, len(s.Topics))
+		copy(copied.Topics, s.Topics)
+	}
+	copied.Boundary = s.Boundary.Clone()
+	return &copied
+}
+
+// Options contains shared session-service options.
+// Not every field applies to every service method.
 type Options struct {
-	EventNum  int       // EventNum is the number of recent events.
-	EventTime time.Time // EventTime is the after time.
+	EventNum            int              // EventNum is the number of recent events (context-window mode).
+	EventTime           time.Time        // EventTime is the after time.
+	EventPage           *EventPage       // EventPage enables GetSession-only offset pagination when non-nil.
+	ListSessionOnlyMeta bool             // ListSessionOnlyMeta is only honored by ListSessions.
+	ListSessionPage     *ListSessionPage // ListSessionPage enables ListSessions offset pagination when non-nil.
+}
+
+// ListSessionPage specifies offset-based pagination for ListSessions.
+// When non-nil in Options, the backend applies LIMIT/OFFSET to the session list.
+type ListSessionPage struct {
+	Offset int // Offset is the number of sessions to skip.
+	Limit  int // Limit is the maximum number of sessions to return per page.
+}
+
+// EventPage specifies GetSession-only offset-based pagination for session events.
+// When set, the backend returns a strict event page and skips ApplyEventFiltering.
+// Offset counts from the most recent event (0 = most recent page).
+type EventPage struct {
+	Offset int // Offset is the number of most-recent events to skip.
+	Limit  int // Limit is the maximum number of events to return per page.
 }
 
 // Option is the option for a session.
@@ -527,6 +812,66 @@ func WithEventTime(time time.Time) Option {
 	return func(o *Options) {
 		o.EventTime = time
 	}
+}
+
+// WithListSessionOnlyMeta requests ListSessions to return only session metadata
+// without events or tracks. Callers should only use this option with ListSessions.
+func WithListSessionOnlyMeta() Option {
+	return func(o *Options) {
+		o.ListSessionOnlyMeta = true
+	}
+}
+
+// WithListSessionPage enables offset/limit pagination for ListSessions.
+// This option is orthogonal to WithEventNum/WithEventTime: those control event-level
+// filtering within each session, while this controls session-level pagination.
+func WithListSessionPage(offset, limit int) Option {
+	return func(o *Options) {
+		o.ListSessionPage = &ListSessionPage{Offset: offset, Limit: limit}
+	}
+}
+
+// WithGetSessionEventPage enables strict offset/limit pagination for GetSession events.
+// offset counts backwards from the most recent event (0 = most recent page).
+// limit is the page size. This option is only supported by postgres/mysql GetSession.
+func WithGetSessionEventPage(offset, limit int) Option {
+	return func(o *Options) {
+		o.EventPage = &EventPage{
+			Offset: offset,
+			Limit:  limit,
+		}
+	}
+}
+
+// ValidateGetSessionOptions validates GetSession-only option semantics.
+func ValidateGetSessionOptions(opts *Options, supportsEventPage bool) error {
+	if opts == nil || opts.EventPage == nil {
+		return nil
+	}
+	if !supportsEventPage {
+		return ErrEventPageUnsupported
+	}
+	if opts.EventPage.Offset < 0 || opts.EventPage.Limit <= 0 {
+		return ErrInvalidEventPage
+	}
+	if opts.EventNum != 0 || !opts.EventTime.IsZero() {
+		return ErrEventPageConflictsWithEventFilters
+	}
+	return nil
+}
+
+// ValidateListSessionsOptions validates ListSessions-only option semantics.
+func ValidateListSessionsOptions(opts *Options) error {
+	if opts == nil {
+		return nil
+	}
+	if opts.EventPage != nil {
+		return ErrEventPageOnlyForGetSession
+	}
+	if opts.ListSessionPage != nil && (opts.ListSessionPage.Offset < 0 || opts.ListSessionPage.Limit <= 0) {
+		return ErrInvalidListSessionPage
+	}
+	return nil
 }
 
 // SummaryOption is the option for getting session summary.
@@ -548,6 +893,220 @@ func WithSummaryFilterKey(filterKey string) SummaryOption {
 	}
 }
 
+// SearchMode selects the retrieval strategy for session
+// event search.
+type SearchMode string
+
+const (
+	// SearchModeDense uses embedding similarity only.
+	SearchModeDense SearchMode = "dense"
+	// SearchModeHybrid combines dense similarity and
+	// keyword search using rank fusion.
+	SearchModeHybrid SearchMode = "hybrid"
+)
+
+// EventSearchRequest describes a session event search.
+type EventSearchRequest struct {
+	// Query is the user query to search against.
+	Query string
+	// UserKey scopes the search namespace. It is
+	// required for all searches.
+	UserKey UserKey
+	// SessionIDs optionally restricts the search to
+	// specific sessions under UserKey. When empty, all
+	// sessions for the user are considered.
+	SessionIDs []string
+	// ExcludeSessionIDs removes specific sessions from
+	// the search scope.
+	ExcludeSessionIDs []string
+	// MaxResults overrides the backend default result
+	// count when > 0.
+	MaxResults int
+	// MinScore filters out low-confidence matches.
+	MinScore float64
+	// FilterKey restricts events using hierarchical
+	// session/event branch semantics.
+	FilterKey string
+	// Roles restricts matches to specific message roles.
+	Roles []model.Role
+	// CreatedAfter restricts matches to events created on
+	// or after this time.
+	CreatedAfter *time.Time
+	// CreatedBefore restricts matches to events created on
+	// or before this time.
+	CreatedBefore *time.Time
+	// SearchMode selects the retrieval strategy. Empty
+	// means SearchModeDense.
+	SearchMode SearchMode
+	// HybridRRFK controls the Reciprocal Rank Fusion
+	// constant when SearchModeHybrid is used. When <= 0,
+	// the backend default is used.
+	HybridRRFK int
+	// HybridCandidateRatio controls how many candidates
+	// each hybrid branch fetches before fusion. When <= 0,
+	// the backend default is used.
+	HybridCandidateRatio int
+}
+
+// EventSearchResult wraps a recalled session event with
+// its search metadata.
+type EventSearchResult struct {
+	// SessionKey identifies the matched session.
+	SessionKey Key
+	// SessionCreatedAt is the matched session creation
+	// time, when available.
+	SessionCreatedAt time.Time
+	// EventCreatedAt is the persisted event row creation
+	// time.
+	EventCreatedAt time.Time
+	// Event is the matched event payload.
+	Event event.Event
+	// Role is the normalized message role used for
+	// indexing/search.
+	Role model.Role
+	// Text is the indexed text returned for prompt
+	// injection or debugging.
+	Text string
+	// Score is the backend relevance score. For dense
+	// search this is cosine similarity; for hybrid search
+	// this is the fused rank score.
+	Score float64
+	// DenseScore is the dense retrieval contribution when
+	// available.
+	DenseScore float64
+	// SparseScore is the sparse retrieval contribution
+	// when available.
+	SparseScore float64
+}
+
+// SearchableService extends session.Service with
+// vector-based semantic search over session events.
+// Session backends that support embedding-based retrieval
+// should implement this interface.
+// Non-vector backends (sqlite, mysql, redis, etc.) do not
+// need to implement this interface.
+type SearchableService interface {
+	// SearchEvents returns the most relevant events for
+	// the given request. Results are ordered by
+	// descending relevance score.
+	// Only events with meaningful text content
+	// (user/assistant messages and tool results) are
+	// searchable; tool calls and partial events are
+	// excluded.
+	SearchEvents(
+		ctx context.Context,
+		req EventSearchRequest,
+	) ([]EventSearchResult, error)
+}
+
+// EventWindowRequest describes a request to load a
+// small event window around one anchor event.
+type EventWindowRequest struct {
+	// Key identifies the target session.
+	Key Key
+	// AnchorEventID identifies the center event.
+	AnchorEventID string
+	// Before controls how many events before the anchor
+	// are included. Negative values are rejected.
+	Before int
+	// After controls how many events after the anchor are
+	// included. Negative values are rejected.
+	After int
+	// Roles optionally restrict the window to specific
+	// message roles.
+	Roles []model.Role
+}
+
+// EventWindowEntry stores one event plus its persisted
+// creation timestamp.
+type EventWindowEntry struct {
+	Event     event.Event
+	CreatedAt time.Time
+}
+
+// EventWindow contains the events loaded around one
+// anchor event.
+type EventWindow struct {
+	SessionKey    Key
+	AnchorEventID string
+	Entries       []EventWindowEntry
+}
+
+// WindowService extends session.Service with precise
+// anchor-based window loading.
+type WindowService interface {
+	// GetEventWindow returns a small ordered event window
+	// around one anchor event.
+	GetEventWindow(
+		ctx context.Context,
+		req EventWindowRequest,
+	) (*EventWindow, error)
+}
+
+// StateInitializationProjection derives one related session-state value that
+// must be committed atomically with a newly initialized primary value.
+// Projections are evaluated before the commit only for a valid initialize
+// callback result; they are not evaluated when an existing value is returned.
+type StateInitializationProjection struct {
+	// StateKey is the static session-scoped key receiving the projected value.
+	// It must be non-empty, differ from the primary and other projection keys,
+	// and not use the app: or user: prefixes.
+	StateKey string
+	// Project derives the value stored at StateKey. Its input is caller-owned
+	// and its result is copied before persistence. A nil result persists an
+	// explicit null state value. Project must not perform blocking or externally
+	// visible work.
+	Project func(value []byte) ([]byte, error)
+}
+
+// StateInitializationService extends Service with coordinated initialization
+// of individual session-state values and their atomic projections.
+//
+// Implementations coordinate callers that share the same backing service. The
+// coordination mechanism and its lifecycle are owned by the implementation;
+// callers provide only value validation and initialization behavior.
+type StateInitializationService interface {
+	// LoadOrInitializeSessionState returns a valid persisted value for stateKey.
+	//
+	// If the current value is absent or validate rejects it, only the current
+	// owner invokes initialize. Other callers wait for a committed value or
+	// compete for ownership after the owner fails. initialize runs outside
+	// physical storage locks and is invoked at most once by each method call.
+	//
+	// validate may be called more than once with caller-owned copies and must not
+	// retain or mutate its argument. initialize receives a context that is
+	// canceled when ctx is canceled or the backend confirms that ownership was
+	// lost. A callback panic may propagate, but implementations must release
+	// their gate or lease before doing so.
+	//
+	// A successful return guarantees that value was observed in, or atomically
+	// committed to, the session generation first observed by this method call.
+	// When initialize produces the committed value, every projection is evaluated
+	// before the commit and all returned state is committed atomically with value.
+	// Projection failures abort the commit and remain inspectable with errors.Is.
+	// The call must not cross a deletion and recreation of the same key while
+	// waiting for or holding ownership. A recreated session is a different
+	// generation and must not accept the old call's callback result.
+	// didInitialize reports whether this call committed its callback result.
+	// Returned bytes are caller-owned. An invalid callback result, an ownership
+	// loss, an ambiguous commit, or a session-generation change returns an error
+	// and must not report didInitialize=true. Callback errors remain inspectable
+	// with errors.Is.
+	//
+	// A nil ctx is treated as context.Background. The session must already exist.
+	// stateKey must be non-empty and must not use the app: or user: prefixes.
+	// Projection keys must satisfy the same restrictions and be unique. validate,
+	// initialize, and every projection function must be non-nil.
+	LoadOrInitializeSessionState(
+		ctx context.Context,
+		key Key,
+		stateKey string,
+		validate func([]byte) bool,
+		initialize func(context.Context) ([]byte, error),
+		projections ...StateInitializationProjection,
+	) (value []byte, didInitialize bool, err error)
+}
+
 // Service is the interface that all session services must implement.
 type Service interface {
 	// CreateSession creates a new session.
@@ -557,6 +1116,8 @@ type Service interface {
 	GetSession(ctx context.Context, key Key, options ...Option) (*Session, error)
 
 	// ListSessions lists all sessions by user scope of session key.
+	// When WithListSessionOnlyMeta is provided, supported implementations omit events
+	// and tracks and only return session metadata plus merged state.
 	ListSessions(ctx context.Context, userKey UserKey, options ...Option) ([]*Session, error)
 
 	// DeleteSession deletes a session.

@@ -38,6 +38,15 @@ type Event struct {
     // Branch 是分支标识符，用于多 Agent 协作
     Branch string `json:"branch,omitempty"`
 
+    // ParentMetadata 描述触发本次事件所属 invocation 的「直接父级触发边」，
+    // 携带父级的 toolCallId，使子 Agent 的事件能够与具体的父级 tool call
+    // 关联。详见后文 RequestID/ParentInvocationID/InvocationID/ParentMetadata
+    // 关系章节。
+    ParentMetadata *ParentInvocationMetadata `json:"parentMetadata,omitempty"`
+
+    // Tag 使用 tags 为事件打业务标签
+    Tag string `json:"tag,omitempty"`
+
     // RequiresCompletion 表示此事件是否需要完成信号
     RequiresCompletion bool `json:"requiresCompletion,omitempty"`
 
@@ -49,11 +58,17 @@ type Event struct {
     // StateDelta 是需要写入会话状态的增量（例如 Processor 产出的状态变更）
     StateDelta map[string][]byte `json:"stateDelta,omitempty"`
 
+    // Extensions 存放事件上的可选元数据
+    Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
+
     // StructuredOutput 携带类型化的内存内结构化输出，不参与序列化
     StructuredOutput any `json:"-"`
 
     // Actions 携带对 Flow 的行为提示（例如：跳过工具后的总结）
     Actions *EventActions `json:"actions,omitempty"`
+
+    // FilterKey 是用于事件层级过滤的标识
+    FilterKey string `json:"filterKey,omitempty"`
 }
 
 // EventActions 为事件附带的可选行为提示
@@ -62,6 +77,29 @@ type EventActions struct {
     SkipSummarization bool `json:"skipSummarization,omitempty"`
 }
 ```
+
+`SkipSummarization` 是一个流程控制提示，不表示当前这条
+`tool.response` 已经变成 assistant final response。若你需要整次运行真正的
+终止事件，仍应持续消费直到 `runner.completion`。
+
+#### FilterKey（层级作用域 key）
+
+`FilterKey` 是每条事件上的可选字段。你可以把它理解成“像路径一样的标签”，主要用在：
+
+- 构建下一次 Prompt 时，筛选哪些历史事件允许进入上下文（`WithMessageBranchFilterMode`）。
+- 生成/读取按作用域拆分的会话摘要（`WithSummaryFilterKey`）。
+
+FilterKey 通过 `/` 做层级分隔，例如：
+
+- `my-app/user-messages`
+- `my-app/auth/role_admin`
+
+在 `prefix` 模式下，匹配规则是**层级匹配**：只要两者存在祖先/后代关系就算匹配
+（例如 `my-app` 会匹配 `my-app/auth/...`）。
+
+如果你需要严格隔离（不希望继承父级内容），请使用 `BranchFilterModeSubtree`。
+更详细的入门说明见 Session 文档：
+`FilterKey、EventFilterKey 与 BranchFilterMode`。
 
 `model.Response` 是 Event 的基础响应结构，承载了 LLM 的响应、工具调用以及错误等信息，定义如下：
 
@@ -152,8 +190,30 @@ type Usage struct {
     // 响应中使用的总 Token 数量.
     TotalTokens int `json:"total_tokens"`
 
+    // 提示词 token 用量详情.
+    PromptTokensDetails PromptTokensDetails `json:"prompt_tokens_details"`
+
+    // 补全 token 用量详情.
+    CompletionTokensDetails CompletionTokensDetails `json:"completion_tokens_details"`
+
     // 时间统计信息（可选）
     TimingInfo *TimingInfo `json:"timing_info,omitempty"`
+}
+
+type PromptTokensDetails struct {
+    // 提示词中的缓存 token 数量.
+    CachedTokens int `json:"cached_tokens"`
+
+    // 创建缓存使用的 token 数量（Anthropic）.
+    CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
+
+    // 从缓存读取的 token 数量（Anthropic）.
+    CacheReadTokens int `json:"cache_read_tokens,omitempty"`
+}
+
+type CompletionTokensDetails struct {
+    // 推理过程生成的 token 数量.
+    ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 type TimingInfo struct {
@@ -180,6 +240,8 @@ type TimingInfo struct {
     ReasoningDuration time.Duration `json:"reasoning_duration,omitempty"`
 }
 ```
+
+`CompletionTokensDetails.ReasoningTokens` 对应 OpenAI-compatible 返回中的 `completion_tokens_details.reasoning_tokens`。当模型没有使用 reasoning tokens 或服务方未上报时，该值可能为 `0`。
 
 ### Event 类型
 
@@ -255,6 +317,22 @@ if e.IsRunnerCompletion() {
 }
 ```
 
+不要混淆 `event.IsFinalResponse()` 与 `event.IsRunnerCompletion()`：
+
+- `event.IsFinalResponse()` 复用的是嵌入 `Response` 的判断逻辑。它只说明
+  当前这条响应已经结束：不是 partial、不是 tool-call response，且
+  `Response.Done == true`。这可能对应 assistant 文本、`tool.response`，
+  也可能是终止错误响应。
+- `event.IsRunnerCompletion()` 判断的是 Runner 是否发出了终止
+  `runner.completion` 事件。只有它返回 true，才表示整次 `Runner.Run`
+  已真正结束，后续不会再有新的运行事件。
+
+经验上：
+
+- 想判断“当前这条输出是否已经完整”，可使用 `IsFinalResponse()`
+- 想停止消费事件流、读取最终状态或把本次运行视为结束，应使用
+  `IsRunnerCompletion()`
+
 ### Event 创建
 
 在开发自定义 Agent 类型或 Processor 时，需要创建 Event。
@@ -318,6 +396,9 @@ evt := event.NewResponseEvent("invoke-123", "agent", response)
 
 - 子 Agent 转发事件依然是 `event.Event`，其中增量内容同样在 `choice.Delta.Content`
 - 为避免重复打印，子 Agent 最终整段文本不会再次作为转发事件出现，但会被聚合到最终的 `tool.response` 内容中，供下一轮 LLM 使用
+- 如果你只想保留内部进度、不想转发子 Agent 的 assistant 正文，可以把
+  `WithStreamInner(true)` 和
+  `WithInnerTextMode(agenttool.InnerTextModeExclude)` 搭配使用
 
 Runner 会自动针对需要完成信号的事件（`RequiresCompletion=true`）发送完成信号，使用者无需额外处理。
 
@@ -339,6 +420,35 @@ if evt.Response != nil && evt.Object == model.ObjectTypeToolResponse && len(evt.
 ```
 
 提示：自定义事件时，优先使用 `event.New(...)` 搭配 `WithResponse`、`WithBranch` 等，以保证 ID 和时间戳等元数据一致。
+
+### 工具响应中的工具调用参数
+
+工具响应事件可以通过 `Event.Extensions` 携带最终的工具调用参数。这个能力适合
+事件消费方根据工具调用参数计算业务展示名称，例如同一个 `gametime` 工具根据
+`query` 或 `set` 参数显示为“查询游戏时长”或“设置游戏时长”。
+
+使用 `event.ToolCallArgsExtensionKey` 可以读取一个 `map[string]string`，
+其中 key 是 tool call ID，value 是 JSON 参数字符串：
+
+```go
+argsByID, ok, err := event.GetExtension[map[string]string](
+    evt,
+    event.ToolCallArgsExtensionKey,
+)
+if err != nil {
+    // 扩展数据结构不符合预期
+    return err
+}
+if ok {
+    argsJSON := argsByID[toolCallID]
+    // 使用 argsJSON 计算展示名称，例如“查询游戏时长”
+}
+```
+
+这里保存的是框架最终执行工具时使用的参数，已经包含 `BeforeTool` 回调或参数
+修复后的结果。当多个并行工具调用被合并到同一个 `tool.response` 事件时，
+这个扩展 map 中可能同时包含多个 tool call ID。消费方应把该扩展视为可选，
+以兼容旧事件或自定义事件。
 
 ### GraphAgent 节点自定义事件（非 LLM 输出）
 
@@ -485,8 +595,8 @@ func (c *multiTurnChat) processResponse(eventChan <-chan *event.Event) error {
             return err
         }
 
-        // 检查是否为最终事件
-        if event.IsFinalResponse() {
+        // 检查是否为整次运行完成事件
+        if event.IsRunnerCompletion() {
             fmt.Printf("\n")
             break
         }
@@ -612,6 +722,12 @@ func (c *multiTurnChat) displayContent(
 - `RequestID string`：用于标识区分同一session会话下的多次用户交互请求，可由runner.Run通过agent.WithRequestID绑定业务层自己的请求ID。
 - `ParentInvocationID string`：用于关联父级执行上下文，可通过此ID关联到父级执行中的相关事件
 - `InvocationID string`：当前执行上下文ID。可通过此ID关联同一个执行上下文中的相关事件
+- `ParentMetadata *ParentInvocationMetadata`：描述本次 invocation 由**直接父级**通过哪条触发边产生。`ParentInvocationID` 只能指向父级执行，而 `ParentMetadata` 进一步给出关联到父级内部具体某次 tool call 的 join key：
+    - `TriggerType`：`tool_call` 表示 AgentTool 调用，`transfer` 表示 `transfer_to_agent` 转交。
+    - `TriggerID`：父级的 `toolCallId`，用于把子 invocation 的事件挂回到父级的具体 `TOOL_CALL_START`。
+    - `TriggerName`：人类可读名称（AgentTool 名字，或 `transfer_to_agent`）。
+
+  该字段是并行 AgentTool 调用的关键消歧器：当模型在一轮里对同一子 Agent 发起多个并行调用时，所有派生 invocation 共享同一个 `ParentInvocationID`，只有 `ParentMetadata.TriggerID` 才能区分每个子 invocation 对应的是哪一次 `TOOL_CALL_START`。当本次 invocation 不是经由父级工具调用触发（如顶层 run），该字段为 `nil`。
 
 可通过以上三个ID，将事件流按照层级结构组织，如下：
 - requestID-1:

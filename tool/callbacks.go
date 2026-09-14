@@ -20,7 +20,7 @@ import (
 
 const (
 	callbackPanicErrFmt = "%s: %v"
-	callbackPanicLogFmt = "%s (tool_call_id: %s, tool: %s): " +
+	callbackPanicLogFmt = log.PanicPrefix + " %s (tool_call_id: %s, tool: %s): " +
 		"%v\n%s"
 
 	beforeToolCallbackPanic         = "before tool callback panic"
@@ -76,6 +76,9 @@ type BeforeToolResult struct {
 	Context context.Context
 	// CustomResult if not nil, will skip tool execution and return this result.
 	CustomResult any
+	// SkipStateDelta requests skipping the tool's state-delta provider for
+	// CustomResult. It is ignored when CustomResult is nil.
+	SkipStateDelta bool
 	// ModifiedArguments if not nil, will use these modified arguments.
 	ModifiedArguments []byte
 }
@@ -85,6 +88,8 @@ type BeforeToolResult struct {
 // - result: contains optional custom result and context for subsequent operations.
 //   - CustomResult: if not nil, this result will be returned and tool execution will be skipped.
 //   - Context: if not nil, will be used by the framework for subsequent operations.
+//   - SkipStateDelta: if true and CustomResult is non-nil, the framework will
+//     not invoke the tool's state-delta provider for that result.
 //   - ModifiedArguments: if not nil, will use these modified arguments for tool execution.
 //
 // - error: if not nil, tool execution will be stopped with this error.
@@ -107,6 +112,9 @@ type AfterToolArgs struct {
 	Result any
 	// Error is the error occurred during tool execution (may be nil).
 	Error error
+	// Meta contains optional metadata from the tool result.
+	// For MCP tools, this includes the _meta field from CallToolResult.
+	Meta map[string]any
 }
 
 // AfterToolResult contains the return value for after tool callback.
@@ -114,7 +122,17 @@ type AfterToolResult struct {
 	// Context if not nil, will be used by the framework for subsequent operations.
 	Context context.Context
 	// CustomResult if not nil, will replace the original result.
+	// Empty maps, slices, and strings are still replacements.
 	CustomResult any
+	// SkipResultFormatter requests default JSON serialization for CustomResult
+	// instead of applying the tool's configured result formatter. It is ignored
+	// when CustomResult is nil.
+	SkipResultFormatter bool
+	// SkipStateDelta requests skipping the tool's state-delta provider for
+	// CustomResult. It is ignored when CustomResult is nil.
+	SkipStateDelta bool
+	// SkipSummarization requests ending the turn after the tool response.
+	SkipSummarization bool
 }
 
 // AfterToolCallbackStructured is called after a tool is executed.
@@ -122,6 +140,13 @@ type AfterToolResult struct {
 // - result: contains optional custom result and context for subsequent operations.
 //   - CustomResult: if not nil, this result will be used instead of the actual tool result.
 //   - Context: if not nil, will be used by the framework for subsequent operations.
+//   - SkipResultFormatter: if true and CustomResult is non-nil, the framework
+//     serializes CustomResult with its default JSON representation instead of
+//     applying the tool's configured result formatter.
+//   - SkipStateDelta: if true and CustomResult is non-nil, the framework will
+//     not invoke the tool's state-delta provider for that result.
+//   - SkipSummarization: if true, the framework will skip the extra
+//     post-tool LLM summarization step.
 //
 // - error: if not nil, this error will be returned.
 type AfterToolCallbackStructured = func(
@@ -211,6 +236,22 @@ func NewCallbacks(opts ...CallbacksOption) *Callbacks {
 		opt(c)
 	}
 	return c
+}
+
+// Clone returns an independent copy of c, including callback lists,
+// ToolResultMessages and execution options.
+func (c *Callbacks) Clone() *Callbacks {
+	if c == nil {
+		return nil
+	}
+	out := &Callbacks{
+		BeforeTool:         append([]BeforeToolCallbackStructured(nil), c.BeforeTool...),
+		AfterTool:          append([]AfterToolCallbackStructured(nil), c.AfterTool...),
+		ToolResultMessages: c.ToolResultMessages,
+		continueOnError:    c.continueOnError,
+		continueOnResponse: c.continueOnResponse,
+	}
+	return out
 }
 
 // RegisterToolResultMessages registers a ToolResultMessages callback.
@@ -454,6 +495,22 @@ func (c *Callbacks) processAfterToolResult(
 	if result.Context != nil {
 		*ctx = result.Context
 	}
+	if *lastResult != nil {
+		merged := *result
+		if merged.Context == nil {
+			merged.Context = (*lastResult).Context
+		}
+		if merged.CustomResult == nil {
+			// Result-handling preferences belong to the retained custom result.
+			merged.CustomResult = (*lastResult).CustomResult
+			merged.SkipResultFormatter =
+				(*lastResult).SkipResultFormatter
+			merged.SkipStateDelta = (*lastResult).SkipStateDelta
+		}
+		merged.SkipSummarization = merged.SkipSummarization ||
+			(*lastResult).SkipSummarization
+		result = &merged
+	}
 	if result.CustomResult != nil {
 		*lastResult = result
 		if !c.continueOnResponse {
@@ -466,6 +523,11 @@ func (c *Callbacks) processAfterToolResult(
 }
 
 // finalizeAfterToolResult determines the final return value for after tool callbacks.
+//
+// When no AfterTool callbacks are registered, CustomResult is args.Result so
+// direct callers keep the released no-callback contract. When callbacks ran
+// but none produced a CustomResult, CustomResult stays nil so plugin
+// dispatchers treat that as pass-through rather than an override.
 func (c *Callbacks) finalizeAfterToolResult(
 	lastResult *AfterToolResult,
 	firstErr error,
@@ -481,7 +543,7 @@ func (c *Callbacks) finalizeAfterToolResult(
 		return lastResult, firstErr
 	}
 	if lastResult == nil {
-		if args.Result != nil {
+		if len(c.AfterTool) == 0 && args != nil && args.Result != nil {
 			return &AfterToolResult{
 				CustomResult: args.Result,
 			}, nil
@@ -509,12 +571,37 @@ func (c *Callbacks) runAfterToolCallback(
 		toolName,
 		&err,
 	)
+	restore := normalizeAfterToolArgsResult(args)
+	defer restore()
 	return cb(ctx, args)
+}
+
+// normalizeAfterToolArgsResult temporarily rewrites args.Result to the
+// callback-facing result shape and returns a restore function.
+func normalizeAfterToolArgsResult(args *AfterToolArgs) func() {
+	if args == nil {
+		return func() {}
+	}
+	type callbackResultGetter interface {
+		GetCallbackResult() any
+	}
+	rg, ok := args.Result.(callbackResultGetter)
+	if !ok {
+		return func() {}
+	}
+	original := args.Result
+	args.Result = rg.GetCallbackResult()
+	return func() {
+		args.Result = original
+	}
 }
 
 // RunAfterTool runs all after tool callbacks in order.
 // This method uses the new structured callback interface.
 // If a callback returns a non-nil Context in the result, it will be used for subsequent callbacks.
+// If no AfterTool callbacks are registered, CustomResult is args.Result.
+// If callbacks ran but none returned a CustomResult, CustomResult is nil and
+// callers should keep using the original tool result.
 func (c *Callbacks) RunAfterTool(
 	ctx context.Context,
 	args *AfterToolArgs,

@@ -14,13 +14,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/spaolacci/murmur3"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/session/hook"
 	"trpc.group/trpc-go/trpc-agent-go/internal/session/sqldb"
@@ -32,6 +32,8 @@ import (
 
 var _ session.Service = (*Service)(nil)
 var _ session.TrackService = (*Service)(nil)
+
+var errSessionNotFound = errors.New("session not found")
 
 // SessionState is the state of a session.
 type SessionState struct {
@@ -116,7 +118,8 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 
 	// Set default cleanup interval if any TTL is configured and auto cleanup is not disabled
 	if opts.cleanupInterval <= 0 {
-		if opts.sessionTTL > 0 || opts.appStateTTL > 0 || opts.userStateTTL > 0 {
+		if opts.sessionTTL > 0 || opts.appStateTTL > 0 ||
+			opts.userStateTTL > 0 || opts.effectiveTrackEventTTL() > 0 {
 			opts.cleanupInterval = defaultCleanupIntervalSecond
 		}
 	}
@@ -162,20 +165,27 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 
 	// Initialize database schema unless skipped
 	if !opts.skipDBInit {
-		s.initDB(context.Background())
+		if err := s.initDB(context.Background()); err != nil {
+			_ = pgClient.Close()
+			return nil, fmt.Errorf("init database failed: %w", err)
+		}
 	}
 
 	if opts.enableAsyncPersist {
 		s.startAsyncPersistWorker()
 	}
 
-	// Start async summary workers if summarizer is configured.
-	if opts.summarizer != nil && opts.asyncSummaryNum > 0 {
+	// Start async summary workers if summary generation is configured.
+	if isummary.HasSummarizer(opts.summarizer) && opts.asyncSummaryNum > 0 {
 		s.asyncWorker = isummary.NewAsyncSummaryWorker(isummary.AsyncSummaryConfig{
 			Summarizer:        opts.summarizer,
 			AsyncSummaryNum:   opts.asyncSummaryNum,
 			SummaryQueueSize:  opts.summaryQueueSize,
 			SummaryJobTimeout: opts.summaryJobTimeout,
+			SummaryDispatchPolicy: isummary.NewSummaryDispatchPolicy(
+				opts.summaryFilterAllowlist,
+				opts.shouldCascadeFullSessionSummary(),
+			),
 			CreateSummaryFunc: s.CreateSessionSummary,
 		})
 		s.asyncWorker.Start()
@@ -315,6 +325,9 @@ func (s *Service) GetSession(
 		return nil, err
 	}
 	opt := applyOptions(opts...)
+	if err := session.ValidateGetSessionOptions(opt, true); err != nil {
+		return nil, err
+	}
 	hctx := &session.GetSessionContext{
 		Context: ctx,
 		Key:     key,
@@ -329,6 +342,7 @@ func (s *Service) GetSession(
 			c.Key,
 			c.Options.EventNum,
 			c.Options.EventTime,
+			c.Options.EventPage,
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -336,18 +350,6 @@ func (s *Service) GetSession(
 					"failed: %w",
 				err,
 			)
-		}
-
-		// Refresh session TTL if configured and session exists.
-		if sess != nil && s.opts.sessionTTL > 0 {
-			if err := s.refreshSessionTTL(c.Context, c.Key); err != nil {
-				log.WarnfContext(
-					c.Context,
-					"failed to refresh session TTL: %v",
-					err,
-				)
-				// Do not fail GetSession; just log a warning.
-			}
 		}
 		return sess, nil
 	}
@@ -364,7 +366,17 @@ func (s *Service) ListSessions(
 		return nil, err
 	}
 	opt := applyOptions(opts...)
-	sessList, err := s.listSessions(ctx, userKey, opt.EventNum, opt.EventTime)
+	if err := session.ValidateListSessionsOptions(opt); err != nil {
+		return nil, err
+	}
+	sessList, err := s.listSessions(
+		ctx,
+		userKey,
+		opt.EventNum,
+		opt.EventTime,
+		opt.ListSessionOnlyMeta,
+		opt.ListSessionPage,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("postgres session service get session list failed: %w", err)
 	}
@@ -560,66 +572,54 @@ func (s *Service) UpdateSessionState(ctx context.Context, key session.Key, state
 		}
 	}
 
-	// Get current session state
-	var currentStateBytes []byte
-	err := s.pgClient.Query(ctx, func(rows *sql.Rows) error {
-		if rows.Next() {
-			return rows.Scan(&currentStateBytes)
+	err := s.pgClient.Transaction(ctx, func(tx *sql.Tx) error {
+		sessState, _, err := loadSessionStateForUpdate(ctx, tx, s.tableSessionStates, key)
+		if err != nil {
+			if errors.Is(err, errSessionNotFound) {
+				return fmt.Errorf("postgres session service update session state failed: session not found")
+			}
+			return fmt.Errorf("postgres session service update session state failed: %w", err)
 		}
-		return sql.ErrNoRows
-	}, fmt.Sprintf(`SELECT state FROM %s
-		WHERE app_name = $1 AND user_id = $2 AND session_id = $3 AND deleted_at IS NULL`, s.tableSessionStates),
-		key.AppName, key.UserID, key.SessionID)
 
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("postgres session service update session state failed: session not found")
-	}
-	if err != nil {
-		return fmt.Errorf("postgres session service update session state failed: get session state: %w", err)
-	}
-
-	var sessState SessionState
-	if len(currentStateBytes) > 0 {
-		if err := json.Unmarshal(currentStateBytes, &sessState); err != nil {
-			return fmt.Errorf("postgres session service update session state failed: unmarshal state: %w", err)
+		now := time.Now()
+		if sessState.State == nil {
+			sessState.State = make(session.StateMap)
 		}
-	}
-	now := time.Now()
-	if sessState.State == nil {
-		sessState.State = make(session.StateMap)
-	}
-	for k, v := range state {
-		if v == nil {
-			sessState.State[k] = nil
-			continue
+		for k, v := range state {
+			if v == nil {
+				sessState.State[k] = nil
+				continue
+			}
+			copiedValue := make([]byte, len(v))
+			copy(copiedValue, v)
+			sessState.State[k] = copiedValue
 		}
-		copiedValue := make([]byte, len(v))
-		copy(copiedValue, v)
-		sessState.State[k] = copiedValue
-	}
-	sessState.UpdatedAt = now
+		sessState.UpdatedAt = now
 
-	updatedStateBytes, err := json.Marshal(sessState)
-	if err != nil {
-		return fmt.Errorf("postgres session service update session state failed: marshal state: %w", err)
-	}
+		updatedStateBytes, err := json.Marshal(sessState)
+		if err != nil {
+			return fmt.Errorf("postgres session service update session state failed: marshal state: %w", err)
+		}
 
-	var expiresAt *time.Time
-	if s.opts.sessionTTL > 0 {
-		t := now.Add(s.opts.sessionTTL)
-		expiresAt = &t
-	}
+		var expiresAt *time.Time
+		if s.opts.sessionTTL > 0 {
+			t := now.Add(s.opts.sessionTTL)
+			expiresAt = &t
+		}
 
-	_, err = s.pgClient.ExecContext(ctx,
-		fmt.Sprintf(`UPDATE %s SET state = $1, updated_at = $2, expires_at = $3
+		_, err = tx.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE %s SET state = $1, updated_at = $2, expires_at = $3
 		 WHERE app_name = $4 AND user_id = $5 AND session_id = $6 AND deleted_at IS NULL`, s.tableSessionStates),
-		updatedStateBytes, now, expiresAt,
-		key.AppName, key.UserID, key.SessionID)
-
+			updatedStateBytes, now, expiresAt,
+			key.AppName, key.UserID, key.SessionID)
+		if err != nil {
+			return fmt.Errorf("postgres session service update session state failed: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("postgres session service update session state failed: %w", err)
+		return err
 	}
-
 	return nil
 }
 
@@ -763,7 +763,7 @@ func (s *Service) AppendTrackEvent(
 
 		hKey := fmt.Sprintf("%s:%s:%s:%s", key.AppName, key.UserID, key.SessionID, trackEvent.Track)
 		n := len(s.trackEventChans)
-		index := int(murmur3.Sum32([]byte(hKey))) % n
+		index := session.HashString(hKey) % n
 		select {
 		case s.trackEventChans[index] <- &trackEventPair{key: key, event: trackEvent}:
 		case <-ctx.Done():
@@ -775,6 +775,30 @@ func (s *Service) AppendTrackEvent(
 		return fmt.Errorf("postgres session service append track event failed: %w", err)
 	}
 	return nil
+}
+
+// GetTrackEvents returns persisted track events for the given session track.
+func (s *Service) GetTrackEvents(
+	ctx context.Context,
+	key session.Key,
+	track session.Track,
+	opts ...session.Option,
+) (*session.TrackEvents, error) {
+	if err := key.CheckSessionKey(); err != nil {
+		return nil, err
+	}
+	opt := applyOptions(opts...)
+	trackEvents, err := s.getTrackEventsByTrackLists(
+		ctx,
+		[]session.Key{key},
+		[][]session.Track{{track}},
+		opt.EventNum,
+		opt.EventTime,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("postgres session service get track events failed: %w", err)
+	}
+	return &session.TrackEvents{Track: track, Events: trackEvents[0][track]}, nil
 }
 
 // Close closes the service.
@@ -832,7 +856,7 @@ func (s *Service) cleanupExpiredData(ctx context.Context, userKey *session.UserK
 	tasks := []cleanupTask{
 		{s.tableSessionStates, s.opts.sessionTTL},
 		{s.tableSessionEvents, s.opts.sessionTTL},
-		{s.tableSessionTracks, s.opts.sessionTTL},
+		{s.tableSessionTracks, s.opts.effectiveTrackEventTTL()},
 		{s.tableSessionSummaries, s.opts.sessionTTL},
 		{s.tableAppStates, s.opts.appStateTTL},
 		{s.tableUserStates, s.opts.userStateTTL},

@@ -78,7 +78,7 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/team"
 )
 
-modelInstance := openai.New("deepseek-chat")
+modelInstance := openai.New("deepseek-v4-flash")
 
 coder := llmagent.New(
     "coder",
@@ -151,7 +151,7 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/team"
 )
 
-modelInstance := openai.New("deepseek-chat")
+modelInstance := openai.New("deepseek-v4-flash")
 
 backendDev := llmagent.New(
     "backend_dev",
@@ -227,8 +227,8 @@ Tool（通过 ToolSet）安装到协调者上。`team.MemberToolConfig` 用来�
 行为。
 
 在实现上，`team.MemberToolConfig` 会直接映射到 AgentTool 的选项：
-`agenttool.WithStreamInner`、`agenttool.WithHistoryScope`、
-`agenttool.WithSkipSummarization`。
+`agenttool.WithStreamInner`、`agenttool.WithInnerTextMode`、
+`agenttool.WithHistoryScope`、`agenttool.WithSkipSummarization`。
 
 ### 快速上手
 
@@ -237,6 +237,7 @@ Tool（通过 ToolSet）安装到协调者上。`team.MemberToolConfig` 用来�
 ```go
 memberCfg := team.DefaultMemberToolConfig()
 memberCfg.StreamInner = true
+memberCfg.InnerTextMode = team.InnerTextModeExclude
 memberCfg.HistoryScope = team.HistoryScopeParentBranch
 memberCfg.SkipSummarization = false
 
@@ -250,6 +251,7 @@ tm, err := team.New(
 默认值（来自 `team.DefaultMemberToolConfig()`）：
 
 - `StreamInner=false`
+- `InnerTextMode=team.InnerTextModeInclude`
 - `HistoryScope=team.HistoryScopeParentBranch`
 - `SkipSummarization=false`
 
@@ -263,6 +265,26 @@ tm, err := team.New(
 - **用法**：先让协调者和成员都启用流式输出（例如
   `GenerationConfig{Stream: true}`），再设置
   `MemberToolConfig.StreamInner=true`。
+
+#### `InnerTextMode`
+
+- **实际默认行为**：`team.InnerTextModeInclude`
+- **作用**：当 `StreamInner=true` 时，控制成员 assistant 文本是否会继续透传到父流程。
+- **不会改变的部分**：它不会阻止成员结果被聚合进最终的工具响应；协调者后续推理仍然能拿到这份内容。
+- **适合 `team.InnerTextModeInclude` 的场景**：你希望看到成员完整的实时 transcript，包括成员自然语言正文。
+- **适合 `team.InnerTextModeExclude` 的场景**：你希望用户看到成员的进度信号（例如 tool call、tool.done），但最终正文只由协调者输出一份。
+
+`InnerTextMode` 只有在 `StreamInner=true` 时才有意义。若
+`StreamInner=false`，则不会有任何内部事件被透传。
+
+### 常见可见性组合
+
+- `StreamInner=false`
+  - 隐藏全部成员内部过程，用户只看到协调者最终答案。
+- `StreamInner=true` + `InnerTextMode=team.InnerTextModeInclude`
+  - 展示成员完整 transcript，之后再展示协调者的最终答案。
+- `StreamInner=true` + `InnerTextMode=team.InnerTextModeExclude`
+  - 保留成员进度，但隐藏成员 assistant 正文，让协调者成为唯一可见的最终回答者。
 
 #### `HistoryScope`
 
@@ -339,6 +361,98 @@ tm, err := team.NewSwarm(
 开启后：当某个成员通过 `transfer_to_agent` 交接并产出最后一次回复时，
 下一条用户输入将从该成员开始（直到再次发生 `transfer_to_agent`）。该能力通过
 Session State 实现，因此需要复用同一个 session。
+
+它和 `await_user_reply + runner.WithAwaitUserReplyRouting(true)` 的语义不同：
+
+- `WithCrossRequestTransfer(true)` 是 Swarm 专属的 owner 语义。只要没有新的
+  transfer，后续用户消息都会继续落到当前 active member。
+- `await_user_reply` 是一次性路由。它只消费下一条用户消息，消费后会自动清掉。
+
+### 独立成员历史（可选）
+
+默认情况下，Swarm 成员事件会持久化到 root session。如果成员需要私有历史，可以开启独立成员 session：
+
+```go
+tm, err := team.NewSwarm(
+    "support",
+    "main_agent",
+    []agent.Agent{mainAgent, refundAgent},
+    team.WithSwarmIndependentAgents(),
+)
+```
+
+开启后，入口成员继续使用 root session；其他成员使用由 root session、team name 和成员名派生出的稳定成员 session。成员事件仍然会输出给调用方，但独立成员的 transcript 会持久化到对应成员 session，而不是 root session。Runner completion event 仍然只是 root run 的结束标记；成员最终回复请消费被转发出来的成员事件。
+
+这个 option 只控制历史隔离。如果希望最后一次 transfer 的目标成员继续接收后续用户输入，需要同时配置 `team.WithCrossRequestTransfer(true)`。两者同时开启时，下一条用户输入会在该成员运行前持久化到 active member session。
+
+### 改写 handoff 输入（可选）
+
+默认情况下，Swarm 成员通过 `transfer_to_agent` 交接时，目标成员收到的用户输入就是工具调用中的 `message` 字段。如果业务希望用原始用户输入、模板或其他上下文重新构造目标成员的首轮输入，可以配置 `team.WithSwarmHandoffInputBuilder`：
+
+```go
+tm, err := team.NewSwarm(
+    "support",
+    "main_agent",
+    []agent.Agent{mainAgent, refundAgent},
+    team.WithSwarmHandoffInputBuilder(func(
+        ctx context.Context,
+        args team.SwarmHandoffInputArgs,
+    ) (model.Message, error) {
+        if args.ToAgentName == "refund_agent" {
+            return model.NewUserMessage(
+                "退款处理请求：\n" + args.RootInput.Content,
+            ), nil
+        }
+        return model.NewUserMessage(args.TransferMessage), nil
+    }),
+)
+if err != nil {
+    panic(err)
+}
+```
+
+`SwarmHandoffInputArgs` 提供以下字段：
+
+- `FromAgentName`：发起 handoff 的成员名。
+- `ToAgentName`：接收 handoff 的成员名。
+- `RootInput`：本轮用户最初输入。
+- `ParentInput`：发起 handoff 的当前成员输入。
+- `TransferMessage`：`transfer_to_agent` 工具调用里携带的 message。
+
+该选项只改写目标成员本次 handoff 的当前输入；不会改写发起方成员的上下文，也不会阻止目标成员读取已有会话历史。
+
+### 动态成员（运行时增删）
+
+在长时间运行的服务中，Swarm 的成员列表可能会变化（例如远程 Agent
+上线/下线、服务注册表变更）。
+
+你可以在运行时更新 Swarm Team 的成员列表：
+
+```go
+// 添加一个成员。
+if err := tm.AddSwarmMember(newAgent); err != nil {
+    panic(err)
+}
+
+// 按名称移除一个成员。
+if ok := tm.RemoveSwarmMember("member_name"); !ok {
+    // 未找到，或被拒绝（例如入口成员）。
+}
+
+// 替换整个成员列表。
+if err := tm.UpdateSwarmMembers(members); err != nil {
+    panic(err)
+}
+```
+
+注意：
+
+- 该能力只适用于 Swarm Team（通过 `team.NewSwarm` 创建）。
+- 入口成员（`entryName`）不能被移除；如果你想更换入口成员，请创建新的 Team。
+- 成员被移除后，其他成员的 SubAgents 列表会通过 `SetSubAgents` 重新绑定，
+  因此 `transfer_to_agent` 将无法再 transfer 到该成员。
+- 开启跨请求 transfer 后，如果 Session State 里记录的 active agent
+  已被移除，则下一次运行会回退到入口成员。
 
 ## Swarm 的安全限制
 

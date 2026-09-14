@@ -73,6 +73,8 @@ type options struct {
 	tailoringStrategy model.TailoringStrategy
 	// maxInputTokens is the max input tokens for token tailoring.
 	maxInputTokens int
+	// contextWindow is the model context window size in tokens.
+	contextWindow int
 	// tokenTailoringConfig allows customization of token tailoring parameters.
 	tokenTailoringConfig *model.TokenTailoringConfig
 	// geminiClientConfig for building gemini client.
@@ -87,7 +89,6 @@ var (
 			ReserveOutputTokens:    imodel.DefaultReserveOutputTokens,
 			SafetyMarginRatio:      imodel.DefaultSafetyMarginRatio,
 			InputTokensFloor:       imodel.DefaultInputTokensFloor,
-			OutputTokensFloor:      imodel.DefaultOutputTokensFloor,
 			MaxInputTokensRatio:    imodel.DefaultMaxInputTokensRatio,
 		},
 		tokenCounter: model.NewSimpleTokenCounter(),
@@ -107,7 +108,10 @@ func WithChannelBufferSize(size int) Option {
 	}
 }
 
-// WithChatRequestCallback sets the function to be called before sending a chat request.
+// WithChatRequestCallback sets the function to be called before sending a
+// chat request. The callback runs synchronously in GenerateContent before
+// the response goroutine starts. Start your own goroutine in the callback
+// if asynchronous behavior is needed.
 func WithChatRequestCallback(fn ChatRequestCallbackFunc) Option {
 	return func(opts *options) {
 		opts.chatRequestCallback = fn
@@ -130,7 +134,9 @@ func WithChatChunkCallback(fn ChatChunkCallbackFunc) Option {
 	}
 }
 
-// WithChatStreamCompleteCallback sets the function to be called when streaming is completed.
+// WithChatStreamCompleteCallback sets the function to be called when
+// streaming is completed. The callback runs synchronously before the
+// terminal streaming result is surfaced to the caller.
 // Called for both successful and failed streaming completions.
 func WithChatStreamCompleteCallback(fn ChatStreamCompleteCallbackFunc) Option {
 	return func(opts *options) {
@@ -153,6 +159,16 @@ func WithEnableTokenTailoring(enabled bool) Option {
 func WithMaxInputTokens(limit int) Option {
 	return func(opts *options) {
 		opts.maxInputTokens = limit
+	}
+}
+
+// WithContextWindow sets the model context window size in tokens for this
+// model instance.
+func WithContextWindow(tokens int) Option {
+	return func(opts *options) {
+		if tokens > 0 {
+			opts.contextWindow = tokens
+		}
 	}
 }
 
@@ -204,9 +220,6 @@ func WithTokenTailoringConfig(config *model.TokenTailoringConfig) Option {
 		}
 		if config.InputTokensFloor <= 0 {
 			config.InputTokensFloor = imodel.DefaultInputTokensFloor
-		}
-		if config.OutputTokensFloor <= 0 {
-			config.OutputTokensFloor = imodel.DefaultOutputTokensFloor
 		}
 		if config.MaxInputTokensRatio <= 0 {
 			config.MaxInputTokensRatio = imodel.DefaultMaxInputTokensRatio

@@ -11,27 +11,34 @@ package llmagent
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	knowledgetool "trpc.group/trpc-go/trpc-agent-go/knowledge/tool"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 const (
 	testToolNameA             = "a"
 	testDummyToolSetName      = "dummy"
+	testCtxToolSetName        = "ctx"
 	testUserToolNameOne       = "user_tool_1"
 	testUserToolNameTwo       = "user_tool_2"
 	testTransferToolName      = "transfer_to_agent"
 	testKnowledgeToolName     = "knowledge_search"
+	testCurrentTimeToolName   = "environment_context_current_time"
 	testDynamicToolSetName    = "dynamic"
 	testFirstToolSetName      = "set_one"
 	testSecondToolSetName     = "set_two"
 	testPrefixedKnowledgeTail = "_knowledge_search"
 	testFilterAgentName       = "filter-agent"
 	testSubAgentName          = "sub-agent"
+	testToolNameWithCtx       = "tool_with_ctx"
+	testToolNameWithoutCtx    = "tool_without_ctx"
+	testAwaitReplyToolName    = "await_user_reply"
 )
 
 // minimalKnowledge implements knowledge.Knowledge with no-op behaviors for unit tests.
@@ -72,7 +79,7 @@ func TestRegisterTools_Combinations(t *testing.T) {
 	kb := &minimalKnowledge{}
 
 	// with tools, toolset and knowledge and nil memory.
-	tools, userToolNames := registerTools(&Options{Tools: base, ToolSets: sets, Knowledge: kb})
+	tools, userToolNames, _ := registerTools(&Options{Tools: base, ToolSets: sets, Knowledge: kb}, nil)
 	if len(tools) < 2 {
 		t.Fatalf("expected aggregated tools from base and toolset")
 	}
@@ -110,6 +117,188 @@ func TestLLMAgent_Tools_IncludesTransferWhenSubAgents(t *testing.T) {
 	}
 }
 
+func TestLLMAgent_Tools_IncludesAwaitUserReplyWhenEnabled(t *testing.T) {
+	agt := New("main", WithAwaitUserReplyTool(true))
+
+	ts := agt.Tools()
+	found := false
+	for _, tl := range ts {
+		if tl.Declaration().Name == testAwaitReplyToolName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected await_user_reply tool when enabled")
+	}
+}
+
+func TestLLMAgent_Tools_IncludesCurrentTimeWhenAddCurrentTime(t *testing.T) {
+	agt := New("main", WithAddCurrentTime(true))
+
+	ts := agt.Tools()
+	found := false
+	for _, tl := range ts {
+		if tl.Declaration().Name == testCurrentTimeToolName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected environment_context_current_time tool when AddCurrentTime is enabled")
+	}
+
+	for _, tl := range agt.UserTools() {
+		if tl.Declaration().Name == testCurrentTimeToolName {
+			t.Fatalf("environment_context_current_time should be a framework tool, not a user tool")
+		}
+	}
+}
+
+func TestLLMAgent_CurrentTimeToolUsesAgentTimezone(t *testing.T) {
+	agt := New("main", WithAddCurrentTime(true), WithTimezone("Asia/Shanghai"))
+
+	var currentTimeTool tool.CallableTool
+	for _, tl := range agt.Tools() {
+		if tl.Declaration().Name == testCurrentTimeToolName {
+			callable, ok := tl.(tool.CallableTool)
+			if !ok {
+				t.Fatalf("current time tool should be callable")
+			}
+			currentTimeTool = callable
+			break
+		}
+	}
+	if currentTimeTool == nil {
+		t.Fatalf("expected environment_context_current_time tool")
+	}
+
+	result, err := currentTimeTool.Call(context.Background(), []byte(`{}`))
+	if err != nil {
+		t.Fatalf("current time tool call failed: %v", err)
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal current time result: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unmarshal current time result: %v", err)
+	}
+	if payload["timezone"] != "Asia/Shanghai" {
+		t.Fatalf("expected agent timezone, got %#v", payload["timezone"])
+	}
+}
+
+func TestLLMAgent_CurrentTimeToolOverridesSameNamedUserTool(t *testing.T) {
+	userTool := dummyTool{
+		decl: &tool.Declaration{Name: testCurrentTimeToolName},
+	}
+	agt := New(
+		"main",
+		WithTools([]tool.Tool{userTool}),
+		WithAddCurrentTime(true),
+		WithTimezone("UTC"),
+	)
+
+	var matches []tool.Tool
+	for _, tl := range agt.Tools() {
+		if tl.Declaration().Name == testCurrentTimeToolName {
+			matches = append(matches, tl)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one reserved current time tool, got %d", len(matches))
+	}
+	callable, ok := matches[0].(tool.CallableTool)
+	if !ok {
+		t.Fatalf("reserved current time tool should be callable")
+	}
+	result, err := callable.Call(context.Background(), []byte(`{}`))
+	if err != nil {
+		t.Fatalf("reserved current time tool call failed: %v", err)
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal current time result: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unmarshal current time result: %v", err)
+	}
+	if payload["timezone"] != "UTC" {
+		t.Fatalf("expected built-in current time tool, got payload %#v", payload)
+	}
+	for _, tl := range agt.UserTools() {
+		if tl.Declaration().Name == testCurrentTimeToolName {
+			t.Fatalf("reserved current time tool should not be tracked as user tool")
+		}
+	}
+}
+
+func TestLLMAgent_InvocationToolSurface_IncludesCurrentTimeWhenAddCurrentTime(t *testing.T) {
+	agt := New("main", WithAddCurrentTime(true))
+
+	tools, userToolNames := agt.InvocationToolSurface(
+		context.Background(),
+		agent.NewInvocation(
+			agent.WithInvocationMessage(model.NewUserMessage("hi")),
+		),
+	)
+	found := false
+	for _, tl := range tools {
+		if tl.Declaration().Name == testCurrentTimeToolName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected environment_context_current_time tool in invocation tool surface")
+	}
+	if userToolNames[testCurrentTimeToolName] {
+		t.Fatalf("environment_context_current_time should not be tracked as a user tool")
+	}
+}
+
+func TestLLMAgent_Tools_SkipsCurrentTimeWithOutputSchema(t *testing.T) {
+	agt := New("main",
+		WithAddCurrentTime(true),
+		WithOutputSchema(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"answer": map[string]any{"type": "string"},
+			},
+		}),
+	)
+
+	for _, tl := range agt.Tools() {
+		if tl.Declaration().Name == testCurrentTimeToolName {
+			t.Fatalf("environment_context_current_time should be disabled when output schema forbids tools")
+		}
+	}
+}
+
+func TestLLMAgent_FilterTools_PreservesAwaitUserReply(t *testing.T) {
+	agt := New(
+		"main",
+		WithAwaitUserReplyTool(true),
+		WithToolFilter(func(context.Context, tool.Tool) bool {
+			return false
+		}),
+	)
+
+	filtered := agt.FilterTools(context.Background())
+	for _, tl := range filtered {
+		if tl.Declaration().Name == testAwaitReplyToolName {
+			return
+		}
+	}
+
+	t.Fatalf(
+		"expected await_user_reply to be preserved by runtime filtering",
+	)
+}
+
 func TestLLMAgent_UserTools(t *testing.T) {
 	// Create agent with user tools, toolsets, knowledge, and subagents
 	userTool1 := dummyTool{
@@ -127,6 +316,7 @@ func TestLLMAgent_UserTools(t *testing.T) {
 		WithToolSets([]tool.ToolSet{toolSet}),
 		WithKnowledge(kb),
 		WithSubAgents([]agent.Agent{subAgent}),
+		WithAwaitUserReplyTool(true),
 	)
 
 	// Get all tools
@@ -167,7 +357,9 @@ func TestLLMAgent_UserTools(t *testing.T) {
 	// Verify that framework tools are NOT in user tools
 	for _, tool := range userTools {
 		name := tool.Declaration().Name
-		if name == testKnowledgeToolName || name == testTransferToolName {
+		if name == testKnowledgeToolName ||
+			name == testTransferToolName ||
+			name == testAwaitReplyToolName {
 			t.Errorf("framework tool %s should not be in user tools", name)
 		}
 	}
@@ -181,6 +373,7 @@ func TestLLMAgent_UserTools_EmptyCase(t *testing.T) {
 	agent := New("test-agent",
 		WithKnowledge(kb),
 		WithSubAgents([]agent.Agent{subAgent}),
+		WithAwaitUserReplyTool(true),
 	)
 
 	// Get user tools - should be empty
@@ -195,17 +388,21 @@ func TestLLMAgent_UserTools_EmptyCase(t *testing.T) {
 
 	foundKnowledge := false
 	foundTransfer := false
+	foundAwaitReply := false
 	for _, tool := range allTools {
 		switch tool.Declaration().Name {
 		case testKnowledgeToolName:
 			foundKnowledge = true
 		case testTransferToolName:
 			foundTransfer = true
+		case testAwaitReplyToolName:
+			foundAwaitReply = true
 		}
 	}
 
-	if !foundKnowledge || !foundTransfer {
-		t.Errorf("framework tools should be in all tools even when no user tools")
+	if !foundKnowledge || !foundTransfer || !foundAwaitReply {
+		t.Errorf("framework tools should be in all tools even when " +
+			"no user tools")
 	}
 }
 
@@ -226,6 +423,29 @@ func (d *dynamicToolSet) Name() string {
 	return d.name
 }
 
+type toolSetContextKey string
+
+const testToolSetContextKey toolSetContextKey = "toolset-context-key"
+
+type ctxSensitiveToolSet struct{ name string }
+
+func (s *ctxSensitiveToolSet) Tools(ctx context.Context) []tool.Tool {
+	toolName := testToolNameWithoutCtx
+	if ctx.Value(testToolSetContextKey) != nil {
+		toolName = testToolNameWithCtx
+	}
+
+	return []tool.Tool{
+		dummyTool{
+			decl: &tool.Declaration{Name: toolName},
+		},
+	}
+}
+
+func (s *ctxSensitiveToolSet) Close() error { return nil }
+
+func (s *ctxSensitiveToolSet) Name() string { return s.name }
+
 func TestLLMAgent_RefreshToolSetsOnRun(t *testing.T) {
 	staticTool := dummyTool{
 		decl: &tool.Declaration{Name: "static_tool"},
@@ -245,6 +465,7 @@ func TestLLMAgent_RefreshToolSetsOnRun(t *testing.T) {
 		WithTools([]tool.Tool{staticTool}),
 		WithToolSets([]tool.ToolSet{dyn}),
 		WithRefreshToolSetsOnRun(true),
+		WithAwaitUserReplyTool(true),
 	)
 
 	toolsV1 := agent.Tools()
@@ -296,12 +517,69 @@ func TestLLMAgent_RefreshToolSetsOnRun(t *testing.T) {
 	userTools := agent.UserTools()
 	for _, tl := range userTools {
 		name := tl.Declaration().Name
-		if name == "knowledge_search" || name == "transfer_to_agent" {
+		if name == "knowledge_search" ||
+			name == "transfer_to_agent" ||
+			name == testAwaitReplyToolName {
 			t.Fatalf(
 				"framework tool %s should not appear in user tools",
 				name,
 			)
 		}
+	}
+}
+
+func TestLLMAgent_FilterTools_PassesContextToToolSets(t *testing.T) {
+	toolSet := &ctxSensitiveToolSet{name: testCtxToolSetName}
+
+	agt := New(
+		"ctx-agent",
+		WithToolSets([]tool.ToolSet{toolSet}),
+		WithRefreshToolSetsOnRun(true),
+	)
+
+	ctx := context.WithValue(
+		context.Background(),
+		testToolSetContextKey,
+		struct{}{},
+	)
+
+	filtered := agt.FilterTools(ctx)
+
+	expectedWithCtx := testCtxToolSetName + "_" + testToolNameWithCtx
+	foundWithCtx := false
+	for _, tl := range filtered {
+		if tl.Declaration().Name == expectedWithCtx {
+			foundWithCtx = true
+			break
+		}
+	}
+	if !foundWithCtx {
+		t.Fatalf("expected %q in FilterTools output", expectedWithCtx)
+	}
+
+	expectedNoCtx := testCtxToolSetName + "_" + testToolNameWithoutCtx
+	tools := agt.Tools()
+	foundNoCtx := false
+	for _, tl := range tools {
+		if tl.Declaration().Name == expectedNoCtx {
+			foundNoCtx = true
+			break
+		}
+	}
+	if !foundNoCtx {
+		t.Fatalf("expected %q in Tools output", expectedNoCtx)
+	}
+
+	filteredNil := agt.FilterTools(context.TODO())
+	foundNoCtx = false
+	for _, tl := range filteredNil {
+		if tl.Declaration().Name == expectedNoCtx {
+			foundNoCtx = true
+			break
+		}
+	}
+	if !foundNoCtx {
+		t.Fatalf("missing %q from FilterTools(nil)", expectedNoCtx)
 	}
 }
 

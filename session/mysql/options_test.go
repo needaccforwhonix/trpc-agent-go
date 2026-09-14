@@ -53,6 +53,17 @@ func TestWithSessionTTL(t *testing.T) {
 	assert.Equal(t, ttl, opts.sessionTTL)
 }
 
+func TestWithTrackEventTTL(t *testing.T) {
+	opts := &ServiceOpts{sessionTTL: time.Hour}
+	assert.Equal(t, time.Hour, opts.effectiveTrackEventTTL())
+	WithTrackEventTTL(0)(opts)
+	require.NotNil(t, opts.trackEventTTL)
+	assert.Equal(t, time.Duration(0), opts.effectiveTrackEventTTL())
+	WithTrackEventTTL(30 * time.Minute)(opts)
+	require.NotNil(t, opts.trackEventTTL)
+	assert.Equal(t, 30*time.Minute, opts.effectiveTrackEventTTL())
+}
+
 func TestWithAppStateTTL(t *testing.T) {
 	opts := &ServiceOpts{}
 	ttl := 48 * time.Hour
@@ -142,6 +153,28 @@ func TestWithSummaryJobTimeout(t *testing.T) {
 
 	WithSummaryJobTimeout(-1 * time.Second)(opts)
 	assert.Equal(t, timeout, opts.summaryJobTimeout) // Should keep previous value
+}
+
+func TestWithSummaryFilterAllowlist(t *testing.T) {
+	opts := &ServiceOpts{}
+	WithSummaryFilterAllowlist("tool-usage", "user-messages")(opts)
+	assert.Equal(t, []string{"tool-usage", "user-messages"}, opts.summaryFilterAllowlist)
+}
+
+func TestWithCascadeFullSessionSummary(t *testing.T) {
+	opts := &ServiceOpts{}
+	WithCascadeFullSessionSummary(false)(opts)
+	require.NotNil(t, opts.cascadeFullSessionSummary)
+	assert.False(t, *opts.cascadeFullSessionSummary)
+}
+
+func TestShouldCascadeFullSessionSummary(t *testing.T) {
+	disabled := false
+	assert.True(t, (ServiceOpts{}).shouldCascadeFullSessionSummary())
+	assert.True(t, defaultOptions.shouldCascadeFullSessionSummary())
+	assert.False(t, (ServiceOpts{
+		cascadeFullSessionSummary: &disabled,
+	}).shouldCascadeFullSessionSummary())
 }
 
 func TestWithSoftDelete(t *testing.T) {

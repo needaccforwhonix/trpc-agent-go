@@ -15,9 +15,12 @@ package skill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -27,9 +30,16 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
 	localexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/local"
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/envscrub"
 	"trpc.group/trpc-go/trpc-agent-go/internal/fileref"
+	"trpc.group/trpc-go/trpc-agent-go/internal/skillstage"
 	"trpc.group/trpc-go/trpc-agent-go/internal/toolcache"
+	"trpc.group/trpc-go/trpc-agent-go/internal/workspaceinput"
+	"trpc.group/trpc-go/trpc-agent-go/internal/workspacesession"
 	"trpc.group/trpc-go/trpc-agent-go/log"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/skill"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -40,9 +50,43 @@ type RunTool struct {
 	repo skill.Repository
 	exec codeexecutor.CodeExecutor
 	reg  *codeexecutor.WorkspaceRegistry
+	wsr  *workspacesession.Resolver
+	sst  *skillstage.Stager
+
+	skillStager SkillStager
 
 	allowedCmds map[string]struct{}
 	deniedCmds  map[string]struct{}
+
+	forceSaveArtifacts bool
+	requireSkillLoaded bool
+	outputLimits       RunOutputLimits
+}
+
+// RunOutputLimits controls how much inline text skill_run returns.
+//
+// These limits apply to stdout/stderr and primary_output selection only.
+// Collected files still follow the workspace collector limits.
+type RunOutputLimits struct {
+	// StdoutStderrBytes is the per-stream inline limit for stdout/stderr.
+	StdoutStderrBytes int
+	// PrimaryOutputBytes is the largest text file eligible for
+	// primary_output.
+	PrimaryOutputBytes int
+}
+
+// SkillRunEnvProvider is an optional interface for skill repositories that
+// want to inject environment variables into skill_run executions.
+//
+// Returned variables are merged into runInput.Env with least privilege:
+// - Never overrides explicit tool-call env (runInput.Env)
+// - Never overrides existing host env (os.LookupEnv)
+// - Blocks known-dangerous env keys
+type SkillRunEnvProvider interface {
+	SkillRunEnv(
+		ctx context.Context,
+		skillName string,
+	) (map[string]string, error)
 }
 
 // NewRunTool creates a new RunTool.
@@ -54,13 +98,21 @@ func NewRunTool(
 	rt := &RunTool{
 		repo: repo,
 		exec: exec,
-		reg:  codeexecutor.NewWorkspaceRegistry(),
+		sst:  skillstage.New(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(rt)
 		}
 	}
+	rt.outputLimits = normalizeRunOutputLimits(rt.outputLimits)
+	if rt.skillStager == nil {
+		rt.skillStager = newCopySkillStager(rt)
+	}
+	if rt.reg == nil {
+		rt.reg = codeexecutor.NewWorkspaceRegistry()
+	}
+	rt.wsr = workspacesession.NewResolver(exec, rt.reg)
 	rt.loadAllowedCommandsFromEnv()
 	rt.loadDeniedCommandsFromEnv()
 	return rt
@@ -79,16 +131,35 @@ const (
 const (
 	skillDirInputs = "inputs"
 	skillDirVenv   = ".venv"
+	skillDirBin    = "bin"
 )
 
 const (
-	envPath       = "PATH"
-	envVirtualEnv = "VIRTUAL_ENV"
+	envPath            = "PATH"
+	envVirtualEnv      = "VIRTUAL_ENV"
+	envEditor          = "EDITOR"
+	envVisual          = "VISUAL"
+	posixPathListSep   = ":"
+	windowsPathListSep = ";"
+)
+
+const (
+	envLDPreload           = "LD_PRELOAD"
+	envLDLibraryPath       = "LD_LIBRARY_PATH"
+	envDYLDInsertLibraries = "DYLD_INSERT_LIBRARIES"
+	envDYLDLibraryPath     = "DYLD_LIBRARY_PATH"
+	envDYLDForceFlatNS     = "DYLD_FORCE_FLAT_NAMESPACE"
+	envOpenSSLConf         = "OPENSSL_CONF"
 )
 
 const workspaceMetadataFileMode uint32 = 0o600
 
-const workspaceMetadataTmpFile = ".metadata.tmp"
+const (
+	editorHelperDir     = ".trpc_agent"
+	editorContentFile   = "editor_input.txt"
+	editorScriptFile    = "editor_write.sh"
+	editorScriptMissing = "editor wrapper: missing target file"
+)
 
 // WithAllowedCommands restricts skill_run to a single program execution
 // whose command name is in the allowlist.
@@ -112,6 +183,51 @@ func WithDeniedCommands(cmds ...string) func(*RunTool) {
 	}
 }
 
+// WithForceSaveArtifacts forces skill_run to persist collected outputs
+// via the artifact service when possible.
+//
+// It applies to both:
+//   - legacy output_files + save_as_artifacts
+//   - declarative outputs.save
+func WithForceSaveArtifacts(enable bool) func(*RunTool) {
+	return func(t *RunTool) {
+		t.forceSaveArtifacts = enable
+	}
+}
+
+// WithRunOutputLimits customizes the inline stdout/stderr limit and the
+// maximum file size eligible for primary_output.
+//
+// These limits do not change output_files collection limits. For large text
+// payloads, prefer writing files under out/ and collecting them with
+// output_files or outputs.
+func WithRunOutputLimits(limits RunOutputLimits) func(*RunTool) {
+	return func(t *RunTool) {
+		t.outputLimits = limits
+	}
+}
+
+// WithRequireSkillLoaded rejects skill_run calls unless the skill has been
+// loaded via skill_load in the current session state.
+//
+// When enabled, models must call skill_load first to bring SKILL.md (and any
+// selected docs) into context, reducing hallucinated commands/scripts.
+func WithRequireSkillLoaded(enable bool) func(*RunTool) {
+	return func(t *RunTool) {
+		t.requireSkillLoaded = enable
+	}
+}
+
+// WithWorkspaceRegistry reuses a caller-provided workspace registry so
+// skill_run can share the same invocation workspace with other tools.
+func WithWorkspaceRegistry(
+	reg *codeexecutor.WorkspaceRegistry,
+) func(*RunTool) {
+	return func(t *RunTool) {
+		t.reg = reg
+	}
+}
+
 func (t *RunTool) loadAllowedCommandsFromEnv() {
 	if len(t.allowedCmds) > 0 {
 		return
@@ -132,7 +248,7 @@ func (t *RunTool) setAllowedCommands(cmds []string) {
 		t.allowedCmds = make(map[string]struct{}, len(cmds))
 	}
 	for _, c := range cmds {
-		s := strings.TrimSpace(c)
+		s := normalizeCommandForList(c)
 		if s == "" {
 			continue
 		}
@@ -160,7 +276,7 @@ func (t *RunTool) setDeniedCommands(cmds []string) {
 		t.deniedCmds = make(map[string]struct{}, len(cmds))
 	}
 	for _, c := range cmds {
-		s := strings.TrimSpace(c)
+		s := normalizeCommandForList(c)
 		if s == "" {
 			continue
 		}
@@ -192,6 +308,8 @@ type runInput struct {
 	Command        string            `json:"command"`
 	Cwd            string            `json:"cwd,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
+	Stdin          string            `json:"stdin,omitempty"`
+	EditorText     string            `json:"editor_text,omitempty"`
 	OutputFiles    []string          `json:"output_files,omitempty"`
 	Timeout        int               `json:"timeout,omitempty"`
 	SaveArtifacts  bool              `json:"save_as_artifacts,omitempty"`
@@ -204,6 +322,7 @@ type runInput struct {
 
 // runOutput is the structured result returned by skill_run.
 type runOutput struct {
+	StagedInputs  []stagedInput `json:"staged_inputs,omitempty"`
 	OutputFiles   []runFile     `json:"output_files"`
 	PrimaryOutput *runFile      `json:"primary_output,omitempty"`
 	Stdout        string        `json:"stdout"`
@@ -215,6 +334,8 @@ type runOutput struct {
 	Warnings      []string      `json:"warnings,omitempty"`
 }
 
+type stagedInput = workspaceinput.StagedInput
+
 type runFile struct {
 	codeexecutor.File
 	Ref string `json:"ref,omitempty"`
@@ -225,11 +346,29 @@ type artifactRef struct {
 	Version int    `json:"version"`
 }
 
+type artifactStateRef struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
+	Ref     string `json:"ref"`
+}
+
+type skillRunArtifactsDelta struct {
+	ToolCallID string             `json:"tool_call_id"`
+	Artifacts  []artifactStateRef `json:"artifacts"`
+}
+
 // Declaration implements tool.Tool.
 func (t *RunTool) Declaration() *tool.Declaration {
 	desc := "Run a command inside a skill workspace. " +
 		"Use it only for commands required by the skill " +
 		"docs (not for generic shell tasks). " +
+		"Use stdout/stderr for short logs; for large or " +
+		"structured text, write files under out/ and " +
+		"return them via output_files or outputs. " +
+		"User-uploaded file inputs are staged under " +
+		"$WORK_DIR/inputs (also visible as inputs/). " +
+		"For declarative inputs, to paths starting with " +
+		"inputs/ are treated as work/inputs/. " +
 		"Returns stdout/stderr, a primary_output " +
 		"(best small text file), and collected output_files " +
 		"(text inline by default, with workspace:// refs). " +
@@ -239,11 +378,16 @@ func (t *RunTool) Declaration() *tool.Declaration {
 		"other tools."
 	cmdDesc := "Shell command"
 	if len(t.allowedCmds) > 0 || len(t.deniedCmds) > 0 {
-		desc += " Restrictions enabled when allowed_commands/denied_commands are set: " +
-			"no shell; one executable + args only; no > < | ; && ||."
-		cmdDesc = "Command string (no shell syntax when allowed_commands/denied_commands are set)"
+		desc += " Restrictions enabled when " +
+			"allowed_commands/denied_commands are set: " +
+			"no shell; one executable + args only; " +
+			"no > < | ; && ||."
+		cmdDesc = "Command string (no shell syntax " +
+			"when allowed_commands/denied_commands are set)"
 		if len(t.allowedCmds) > 0 {
-			desc += " Allowed commands: " + formatCommandPreview(t.allowedCmds, 20) + "."
+			desc += " Allowed commands: " +
+				formatCommandPreview(t.allowedCmds, 20) +
+				"."
 		}
 	}
 	return &tool.Declaration{
@@ -259,6 +403,18 @@ func (t *RunTool) Declaration() *tool.Declaration {
 				"cwd":     {Type: "string", Description: "Working dir"},
 				"env": {Type: "object", Description: "Env vars",
 					AdditionalProperties: &tool.Schema{Type: "string"}},
+				"stdin": {
+					Type: "string",
+					Description: "Optional one-shot stdin text " +
+						"passed to the command",
+				},
+				"editor_text": {
+					Type: "string",
+					Description: "Optional text used to satisfy " +
+						"CLIs that launch $EDITOR. When set, " +
+						"skill_run stages a temporary editor " +
+						"wrapper and points EDITOR/VISUAL to it.",
+				},
 				"output_files": {Type: "array",
 					Items: &tool.Schema{Type: "string"},
 					Description: "Workspace-relative paths/globs to " +
@@ -281,8 +437,7 @@ func (t *RunTool) Declaration() *tool.Declaration {
 				"outputs": outputSpecSchema(),
 			},
 		},
-		OutputSchema: &tool.Schema{Type: "object",
-			Description: "Run result with output files"},
+		OutputSchema: skillRunOutputSchema(),
 	}
 }
 
@@ -318,56 +473,94 @@ func (t *RunTool) Call(
 	if err != nil {
 		return nil, err
 	}
-	root, err := t.repo.Path(in.Skill)
+	if t.requireSkillLoaded && !isSkillLoadedInContext(ctx, in.Skill) {
+		return nil, fmt.Errorf(
+			"skill_run requires skill_load first for %q",
+			in.Skill,
+		)
+	}
+	in, saveRequested, outputsSaveSkipReason := t.applyArtifactSaveOverrides(
+		ctx,
+		in,
+	)
+	prepared, err := t.prepareWorkspaceForRun(ctx, in)
 	if err != nil {
 		return nil, err
 	}
-	eng := t.ensureEngine()
-	ws, err := t.createWorkspace(ctx, eng, in.Skill)
-	if err != nil {
-		return nil, err
-	}
-	if err := t.stageSkill(ctx, eng, ws, root, in.Skill); err != nil {
-		return nil, err
-	}
-	// Prepare IO context and stage declared inputs.
-	ctxIO := withArtifactContext(ctx)
-	if len(in.Inputs) > 0 {
-		if err := eng.FS().StageInputs(ctxIO, ws, in.Inputs); err != nil {
-			return nil, err
+	rr, err := t.runPrepared(prepared, in)
+	if errors.Is(err, codeexecutor.ErrWorkspaceStale) {
+		t.invalidateWorkspaceHandle(prepared.handle)
+		if codeexecutor.IsWorkspaceRetrySafe(err) {
+			prepared, err = t.prepareWorkspaceForRun(ctx, in)
+			if err == nil {
+				rr, err = t.runPrepared(prepared, in)
+			}
+			if errors.Is(err, codeexecutor.ErrWorkspaceStale) {
+				t.invalidateWorkspaceHandle(prepared.handle)
+			}
 		}
 	}
-	// Compute CWD and execute program.
-	cwd := resolveCWD(in.Cwd, in.Skill)
-	rr, err := t.runProgram(ctx, eng, ws, cwd, in)
 	if err != nil {
 		return nil, err
 	}
 
-	autoFiles := t.autoExportWorkspaceOut(ctxIO, eng, ws, in)
-
-	// Collect outputs via spec or legacy globs.
-	files, manifest, err := t.prepareOutputs(
-		ctxIO, eng, ws, in,
+	ws := prepared.handle.Workspace
+	autoFiles, err := t.autoExportWorkspaceOut(
+		prepared.ctxIO, prepared.eng, ws, in,
+	)
+	if err != nil {
+		if errors.Is(err, codeexecutor.ErrWorkspaceStale) {
+			t.invalidateWorkspaceHandle(prepared.handle)
+		}
+		return nil, err
+	}
+	files, manifest, outputWarn, partialStale, err := t.prepareOutputs(
+		prepared.ctxIO,
+		prepared.eng,
+		ws,
+		in,
+	)
+	if partialStale {
+		t.invalidateWorkspaceHandle(prepared.handle)
+	}
+	if err != nil {
+		if errors.Is(err, codeexecutor.ErrWorkspaceStale) {
+			t.invalidateWorkspaceHandle(prepared.handle)
+		}
+		return nil, err
+	}
+	filteredOutputs := filterFailedEmptyOutputs(rr, files, manifest)
+	files = filteredOutputs.files
+	manifest = filteredOutputs.manifest
+	out, err := t.buildRunOutput(
+		ctx,
+		rr,
+		autoFiles,
+		files,
+		manifest,
+		in,
+		saveRequested,
+		outputsSaveSkipReason,
 	)
 	if err != nil {
 		return nil, err
 	}
-	trimTruncatedUTF8TextFiles(files)
-	out := buildRunOutput(rr, files)
-	mergeAutoPrimaryOutput(autoFiles, &out)
-	if len(files) > 0 && !in.SaveArtifacts {
-		out.Warnings = append(out.Warnings,
-			warnOutputFilesWorkspaceOnly)
+	if len(filteredOutputs.warnings) > 0 {
+		out.Warnings = append(out.Warnings, filteredOutputs.warnings...)
 	}
-	if err := t.attachArtifactsIfRequested(
-		ctx, &out, files, in.ArtifactPrefix, in.SaveArtifacts,
-		in.OmitInline,
-	); err != nil {
-		return nil, err
+	if len(outputWarn) > 0 {
+		out.Warnings = append(out.Warnings, outputWarn...)
 	}
-	mergeManifestArtifactRefs(manifest, &out)
-	applyOmitInlineContent(ctx, &out, in.OmitInline)
+	out.StagedInputs = prepared.staged
+	if len(prepared.warnings) > 0 {
+		out.Warnings = append(out.Warnings, prepared.warnings...)
+	}
+	if len(filteredOutputs.omittedNames) > 0 {
+		toolcache.DeleteSkillRunOutputFilesFromContext(
+			ctx,
+			filteredOutputs.omittedNames,
+		)
+	}
 	toolcache.StoreSkillRunOutputFilesFromContext(ctx, files)
 	return out, nil
 }
@@ -375,26 +568,356 @@ func (t *RunTool) Call(
 var _ tool.Tool = (*RunTool)(nil)
 var _ tool.CallableTool = (*RunTool)(nil)
 
+func isSkillLoadedInContext(ctx context.Context, name string) bool {
+	inv, ok := agent.InvocationFromContext(ctx)
+	if !ok || inv == nil || inv.Session == nil {
+		return true
+	}
+	key := skill.LoadedKey(inv.AgentName, strings.TrimSpace(name))
+	v, ok := inv.Session.GetState(key)
+	return ok && len(v) > 0
+}
+
+// StateDelta returns a stable, replayable artifact ref list when skill_run
+// persisted outputs via Artifact service.
+//
+// It is consumed by the flow to attach StateDelta onto tool.response events.
+func (t *RunTool) StateDelta(
+	toolCallID string,
+	_ []byte,
+	resultJSON []byte,
+) map[string][]byte {
+	toolCallID = strings.TrimSpace(toolCallID)
+	if toolCallID == "" {
+		return nil
+	}
+	if len(resultJSON) == 0 {
+		return nil
+	}
+	var out runOutput
+	if err := json.Unmarshal(resultJSON, &out); err != nil {
+		return nil
+	}
+	if len(out.ArtifactFiles) == 0 {
+		return nil
+	}
+	refs := make([]artifactStateRef, 0, len(out.ArtifactFiles))
+	for _, f := range out.ArtifactFiles {
+		name := strings.TrimSpace(f.Name)
+		if name == "" || f.Version < 0 {
+			continue
+		}
+		refs = append(refs, artifactStateRef{
+			Name:    name,
+			Version: f.Version,
+			Ref:     fmt.Sprintf("artifact://%s@%d", name, f.Version),
+		})
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(skillRunArtifactsDelta{
+		ToolCallID: toolCallID,
+		Artifacts:  refs,
+	})
+	if err != nil {
+		return nil
+	}
+	return map[string][]byte{
+		skill.StateKeyArtifacts: b,
+	}
+}
+
+var _ stateDeltaProvider = (*RunTool)(nil)
+
+func (t *RunTool) applyArtifactSaveOverrides(
+	ctx context.Context,
+	in runInput,
+) (runInput, bool, string) {
+	if t.forceSaveArtifacts {
+		if len(in.OutputFiles) > 0 {
+			in.SaveArtifacts = true
+		}
+		if in.Outputs != nil && len(in.OutputFiles) == 0 {
+			in.Outputs.Save = true
+		}
+	}
+
+	saveRequested := (in.SaveArtifacts && len(in.OutputFiles) > 0) ||
+		(in.Outputs != nil && in.Outputs.Save)
+	var outputsSaveSkipReason string
+	if in.Outputs != nil && in.Outputs.Save {
+		outputsSaveSkipReason = artifactSaveSkipReason(ctx)
+		if outputsSaveSkipReason != "" {
+			in.Outputs.Save = false
+		}
+	}
+	return in, saveRequested, outputsSaveSkipReason
+}
+
+func (t *RunTool) prepareWorkspaceForRun(
+	ctx context.Context,
+	in runInput,
+) (workspaceRunPreparation, error) {
+	eng := t.ensureEngine()
+	prepared, acquired, err := t.prepareWorkspaceAttempt(ctx, eng, in)
+	if errors.Is(err, codeexecutor.ErrWorkspaceStale) {
+		if acquired {
+			t.wsr.InvalidateWorkspaceHandle(prepared.handle)
+		}
+		if codeexecutor.IsWorkspaceRetrySafe(err) {
+			prepared, acquired, err = t.prepareWorkspaceAttempt(ctx, eng, in)
+			if errors.Is(err, codeexecutor.ErrWorkspaceStale) && acquired {
+				t.wsr.InvalidateWorkspaceHandle(prepared.handle)
+			}
+		}
+	}
+	if err != nil {
+		return workspaceRunPreparation{}, err
+	}
+	return prepared, nil
+}
+
+type workspaceRunPreparation struct {
+	eng       codeexecutor.Engine
+	handle    codeexecutor.WorkspaceHandle
+	skillRoot string
+	ctxIO     context.Context
+	staged    []stagedInput
+	warnings  []string
+}
+
+func (t *RunTool) prepareWorkspaceAttempt(
+	ctx context.Context,
+	eng codeexecutor.Engine,
+	in runInput,
+) (workspaceRunPreparation, bool, error) {
+	handle, err := t.createWorkspaceHandle(ctx, eng, in.Skill)
+	if err != nil {
+		return workspaceRunPreparation{}, false, err
+	}
+	prepared := workspaceRunPreparation{eng: eng, handle: handle}
+	ws := handle.Workspace
+	stageRes, err := t.stageSkillForRun(ctx, eng, ws, in.Skill)
+	if err != nil {
+		return prepared, true, err
+	}
+	prepared.skillRoot = stageRes.WorkspaceSkillDir
+	prepared.staged, prepared.warnings, err = t.stageUserFileInputs(
+		ctx, eng, ws,
+	)
+	if err != nil {
+		return prepared, true, err
+	}
+	prepared.ctxIO = withArtifactContext(ctx)
+	if len(in.Inputs) > 0 {
+		if err := eng.FS().StageInputs(
+			prepared.ctxIO, ws, in.Inputs,
+		); err != nil {
+			return prepared, true, err
+		}
+	}
+	return prepared, true, nil
+}
+
+func (t *RunTool) runPrepared(
+	prepared workspaceRunPreparation,
+	in runInput,
+) (codeexecutor.RunResult, error) {
+	cwd := resolveCWD(in.Cwd, prepared.skillRoot)
+	return t.runProgram(
+		prepared.ctxIO,
+		prepared.eng,
+		prepared.handle.Workspace,
+		prepared.skillRoot,
+		cwd,
+		in,
+	)
+}
+
+func (t *RunTool) invalidateWorkspaceHandle(
+	handle codeexecutor.WorkspaceHandle,
+) {
+	if t != nil && t.wsr != nil {
+		t.wsr.InvalidateWorkspaceHandle(handle)
+	}
+}
+
+func (t *RunTool) stageSkillForRun(
+	ctx context.Context,
+	eng codeexecutor.Engine,
+	ws codeexecutor.Workspace,
+	name string,
+) (SkillStageResult, error) {
+	if t.skillStager == nil {
+		return SkillStageResult{}, fmt.Errorf(
+			errSkillStagerNotConfigured,
+		)
+	}
+	res, err := t.skillStager.StageSkill(ctx, SkillStageRequest{
+		SkillName:  name,
+		Repository: t.repo,
+		Engine:     eng,
+		Workspace:  ws,
+	})
+	if err != nil {
+		return SkillStageResult{}, err
+	}
+	return normalizeSkillStageResult(res)
+}
+
+func (t *RunTool) buildRunOutput(
+	ctx context.Context,
+	rr codeexecutor.RunResult,
+	autoFiles []codeexecutor.File,
+	files []codeexecutor.File,
+	manifest *codeexecutor.OutputManifest,
+	in runInput,
+	saveRequested bool,
+	outputsSaveSkipReason string,
+) (runOutput, error) {
+	trimTruncatedUTF8TextFiles(files)
+	out := buildRunOutputWithLimits(rr, files, t.outputLimits)
+	mergeAutoPrimaryOutputWithLimit(
+		autoFiles,
+		&out,
+		t.outputLimits.PrimaryOutputBytes,
+	)
+	appendOutputsSaveWarning(&out, outputsSaveSkipReason)
+	saveArtifacts := in.SaveArtifacts && len(in.OutputFiles) > 0
+	if err := t.attachArtifactsIfRequested(
+		ctx,
+		&out,
+		files,
+		in.ArtifactPrefix,
+		saveArtifacts,
+		in.OmitInline,
+	); err != nil {
+		return runOutput{}, err
+	}
+	mergeManifestArtifactRefs(manifest, &out)
+	if len(out.OutputFiles) > 0 && !saveRequested {
+		out.Warnings = append(out.Warnings,
+			warnOutputFilesWorkspaceOnly)
+	}
+	applyOmitInlineContent(ctx, &out, in.OmitInline)
+	return out, nil
+}
+
+const (
+	userFileInputFromPrefix  = "user_message://"
+	userFileInputModePut     = "put"
+	userFileInputNameFmt     = "upload_%d"
+	userFileInputDefaultName = "upload"
+
+	userFileInputKeyFileIDPrefix = "file_id/"
+	userFileInputKeySHA256Prefix = "sha256/"
+	userFileInputHostPrefix      = "host://"
+
+	userFileInputWarnPrefix     = "user file input:"
+	userFileInputWarnMissingRef = userFileInputWarnPrefix +
+		" missing bytes and file_id"
+	userFileInputWarnNoDownloader = userFileInputWarnPrefix +
+		" model does not support file download"
+	userFileInputWarnArtifactNoService = userFileInputWarnPrefix +
+		" artifact service is not configured"
+)
+
+func (t *RunTool) stageUserFileInputs(
+	ctx context.Context,
+	eng codeexecutor.Engine,
+	ws codeexecutor.Workspace,
+) ([]stagedInput, []string, error) {
+	return workspaceinput.StageConversationFiles(ctx, eng, ws)
+}
+
+func fileNameFromArtifactRef(fileID string) string {
+	return workspaceinput.ArtifactBaseName(fileID)
+}
+
+func sanitizeUserFileName(name string) string {
+	return workspaceinput.SanitizeFileName(name)
+}
+
+func uniqueUserFileName(
+	used map[string]struct{},
+	existingTo map[string]struct{},
+	name string,
+) string {
+	return workspaceinput.UniqueFileName(used, existingTo, name)
+}
+
+func userFileInputBytes(
+	ctx context.Context,
+	mdl model.Model,
+	f model.File,
+) ([]byte, string, string) {
+	return workspaceinput.ResolveFileBytes(ctx, mdl, f)
+}
+
+func userFileInputsFromMessage(msg model.Message) []model.File {
+	if len(msg.ContentParts) == 0 {
+		return nil
+	}
+	var out []model.File
+	for _, part := range msg.ContentParts {
+		if part.Type != model.ContentTypeFile || part.File == nil {
+			continue
+		}
+		out = append(out, *part.File)
+	}
+	return out
+}
+
+func userFileInputsFromSession(sess *session.Session) []model.File {
+	if sess == nil {
+		return nil
+	}
+	sess.EventMu.RLock()
+	events := append([]event.Event(nil), sess.Events...)
+	sess.EventMu.RUnlock()
+
+	var out []model.File
+	for _, ev := range events {
+		if ev.Response == nil {
+			continue
+		}
+		for _, choice := range ev.Response.Choices {
+			if choice.Message.Role != model.RoleUser {
+				continue
+			}
+			out = append(out, userFileInputsFromMessage(choice.Message)...)
+		}
+	}
+	return out
+}
+
 func (t *RunTool) autoExportWorkspaceOut(
 	ctx context.Context,
 	eng codeexecutor.Engine,
 	ws codeexecutor.Workspace,
 	in runInput,
-) []codeexecutor.File {
+) ([]codeexecutor.File, error) {
 	if eng == nil || in.Outputs != nil || len(in.OutputFiles) > 0 {
-		return nil
+		return nil, nil
 	}
 	files, err := eng.FS().Collect(ctx, ws,
 		[]string{defaultAutoExportPattern})
-	if err != nil || len(files) == 0 {
-		return nil
+	if err != nil {
+		if errors.Is(err, codeexecutor.ErrWorkspaceStale) {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if len(files) == 0 {
+		return nil, nil
 	}
 	if len(files) > defaultAutoExportMax {
 		files = files[:defaultAutoExportMax]
 	}
 	trimTruncatedUTF8TextFiles(files)
 	toolcache.StoreSkillRunOutputFilesFromContext(ctx, files)
-	return files
+	return files, nil
 }
 
 // parseRunArgs validates and decodes input args.
@@ -412,44 +935,82 @@ func (t *RunTool) parseRunArgs(args []byte) (runInput, error) {
 	if t.exec == nil {
 		return runInput{}, fmt.Errorf("executor is not configured")
 	}
+	normalizeRunInput(&in)
 	return in, nil
+}
+
+func normalizeRunInput(in *runInput) {
+	if in == nil || len(in.Inputs) == 0 {
+		return
+	}
+	for i := range in.Inputs {
+		in.Inputs[i].To = normalizeInputTo(in.Inputs[i].To)
+	}
+}
+
+func normalizeInputTo(to string) string {
+	s := strings.TrimSpace(to)
+	s = strings.ReplaceAll(s, "\\", "/")
+	if s == "" {
+		return ""
+	}
+	cleaned := path.Clean(s)
+	if cleaned == "." {
+		return ""
+	}
+	if cleaned == skillDirInputs {
+		return ""
+	}
+	prefix := skillDirInputs + "/"
+	if strings.HasPrefix(cleaned, prefix) {
+		rest := strings.TrimPrefix(cleaned, prefix)
+		return path.Join(
+			codeexecutor.DirWork, skillDirInputs, rest,
+		)
+	}
+	return cleaned
 }
 
 // ensureEngine gets engine from executor or builds a local one.
 func (t *RunTool) ensureEngine() codeexecutor.Engine {
-	if ep, ok := t.exec.(codeexecutor.EngineProvider); ok && ep != nil {
-		if e := ep.Engine(); e != nil {
-			return e
-		}
+	if t.wsr == nil {
+		log.Warnf(
+			"skill_run: falling back to local engine; " +
+				"workspace resolver is not configured",
+		)
+		rt := localexec.NewRuntime("")
+		return codeexecutor.NewEngine(rt, rt, rt)
 	}
-	log.Warnf(
-		"skill_run: falling back to local engine; " +
-			"no EngineProvider on executor",
-	)
-	rt := localexec.NewRuntime("")
-	return codeexecutor.NewEngine(rt, rt, rt)
+	return t.wsr.EnsureEngine()
 }
 
 func (t *RunTool) createWorkspace(
 	ctx context.Context, eng codeexecutor.Engine, name string,
 ) (codeexecutor.Workspace, error) {
-	// Acquire a session-scoped workspace using a persistent registry.
-	reg := t.reg
-	if reg == nil {
-		reg = codeexecutor.NewWorkspaceRegistry()
-		t.reg = reg
-	}
-	// Prefer session ID from invocation context; otherwise fallback
-	// to skill name.
-	sid := name
-	if inv, ok := agent.InvocationFromContext(ctx); ok && inv != nil {
-		if inv.Session != nil && inv.Session.ID != "" {
-			sid = inv.Session.ID
-		}
-	}
-	return reg.Acquire(ctx, eng.Manager(), sid)
+	handle, err := t.createWorkspaceHandle(ctx, eng, name)
+	return handle.Workspace, err
 }
 
+func (t *RunTool) createWorkspaceHandle(
+	ctx context.Context, eng codeexecutor.Engine, name string,
+) (codeexecutor.WorkspaceHandle, error) {
+	if t.reg == nil || t.wsr == nil {
+		if t.reg == nil {
+			t.reg = codeexecutor.NewWorkspaceRegistry()
+		}
+		t.wsr = workspacesession.NewResolver(t.exec, t.reg)
+	}
+	return t.wsr.CreateWorkspaceHandle(ctx, eng, name)
+}
+
+// stageSkill materializes the skill source under skills/<name>.
+// As of the workspaceprep migration, skillstage.StageSkill defaults
+// to a writable working copy. skill_run inherits the same writable
+// semantics during its deprecation period; this matches the
+// workspace_exec / reconciler path and avoids carrying two skill
+// staging modes in parallel. If a future caller specifically needs
+// the legacy read-only tree, it should switch to the lower-level
+// StageSkillWithOptions API.
 func (t *RunTool) stageSkill(
 	ctx context.Context,
 	eng codeexecutor.Engine,
@@ -457,59 +1018,10 @@ func (t *RunTool) stageSkill(
 	root string,
 	name string,
 ) error {
-	// Compute digest of the skill directory on host.
-	dg, err := codeexecutor.DirDigest(root)
-	if err != nil {
-		return err
+	if t.sst == nil {
+		t.sst = skillstage.New()
 	}
-	md, err := t.loadWorkspaceMetadata(ctx, eng, ws)
-	if err != nil {
-		return err
-	}
-	// Stage into /skills/<name> inside workspace.
-	dest := path.Join(codeexecutor.DirSkills, name)
-	// If metadata has same digest, skip staging.
-	if s, ok := md.Skills[name]; ok &&
-		s.Digest == dg && s.Mounted {
-		ok, err := t.skillLinksPresent(ctx, eng, ws, name)
-		if err != nil {
-			return err
-		}
-		if ok {
-			return nil
-		}
-	}
-	if err := t.removeWorkspacePath(ctx, eng, ws, dest); err != nil {
-		return err
-	}
-	// Stage as a regular directory first (no read-only mount). We will
-	// add convenience links and then make files read-only except those
-	// links. This enables relative paths like "scripts/..." and
-	// "out/..." to work from the skill root.
-	if err := eng.FS().StageDirectory(
-		ctx, ws, root, dest,
-		codeexecutor.StageOptions{ReadOnly: false, AllowMount: false},
-	); err != nil {
-		return err
-	}
-
-	// Link workspace-level dirs under the skill root: out, work, inputs.
-	if err := t.linkWorkspaceDirs(ctx, eng, ws, name); err != nil {
-		return err
-	}
-	// Make everything under skill root read-only while keeping symlinks
-	// untouched so writes land in workspace-level targets.
-	if err := t.readOnlyExceptSymlinks(ctx, eng, ws, dest); err != nil {
-		return err
-	}
-	md.Skills[name] = codeexecutor.SkillMeta{
-		Name:     name,
-		RelPath:  dest,
-		Digest:   dg,
-		Mounted:  true,
-		StagedAt: time.Now(),
-	}
-	return t.saveWorkspaceMetadata(ctx, eng, ws, md)
+	return t.sst.StageSkill(ctx, eng, ws, root, name)
 }
 
 func (t *RunTool) loadWorkspaceMetadata(
@@ -517,40 +1029,10 @@ func (t *RunTool) loadWorkspaceMetadata(
 	eng codeexecutor.Engine,
 	ws codeexecutor.Workspace,
 ) (codeexecutor.WorkspaceMetadata, error) {
-	now := time.Now()
-	md := codeexecutor.WorkspaceMetadata{
-		Version:    1,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		LastAccess: now,
-		Skills:     map[string]codeexecutor.SkillMeta{},
+	if t.sst == nil {
+		t.sst = skillstage.New()
 	}
-	if eng == nil || eng.FS() == nil {
-		return md, fmt.Errorf("workspace fs is not configured")
-	}
-	files, err := eng.FS().Collect(
-		ctx, ws, []string{codeexecutor.MetaFileName},
-	)
-	if err != nil {
-		return md, err
-	}
-	if len(files) == 0 || strings.TrimSpace(files[0].Content) == "" {
-		return md, nil
-	}
-	if err := json.Unmarshal([]byte(files[0].Content), &md); err != nil {
-		return codeexecutor.WorkspaceMetadata{}, err
-	}
-	if md.Version == 0 {
-		md.Version = 1
-	}
-	if md.CreatedAt.IsZero() {
-		md.CreatedAt = now
-	}
-	md.LastAccess = now
-	if md.Skills == nil {
-		md.Skills = map[string]codeexecutor.SkillMeta{}
-	}
-	return md, nil
+	return t.sst.LoadWorkspaceMetadata(ctx, eng, ws)
 }
 
 func (t *RunTool) saveWorkspaceMetadata(
@@ -559,50 +1041,10 @@ func (t *RunTool) saveWorkspaceMetadata(
 	ws codeexecutor.Workspace,
 	md codeexecutor.WorkspaceMetadata,
 ) error {
-	if eng == nil || eng.FS() == nil {
-		return fmt.Errorf("workspace fs is not configured")
+	if t.sst == nil {
+		t.sst = skillstage.New()
 	}
-	if eng.Runner() == nil {
-		return fmt.Errorf("workspace runner is not configured")
-	}
-	if md.Version == 0 {
-		md.Version = 1
-	}
-	now := time.Now()
-	if md.CreatedAt.IsZero() {
-		md.CreatedAt = now
-	}
-	md.UpdatedAt = now
-	md.LastAccess = now
-	if md.Skills == nil {
-		md.Skills = map[string]codeexecutor.SkillMeta{}
-	}
-	buf, err := json.MarshalIndent(md, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := eng.FS().PutFiles(ctx, ws, []codeexecutor.PutFile{{
-		Path:    workspaceMetadataTmpFile,
-		Content: buf,
-		Mode:    workspaceMetadataFileMode,
-	}}); err != nil {
-		return err
-	}
-	var sb strings.Builder
-	sb.WriteString("set -e; mv -f ")
-	sb.WriteString(shellQuote(workspaceMetadataTmpFile))
-	sb.WriteString(" ")
-	sb.WriteString(shellQuote(codeexecutor.MetaFileName))
-	_, err = eng.Runner().RunProgram(
-		ctx, ws, codeexecutor.RunProgramSpec{
-			Cmd:     "bash",
-			Args:    []string{"-lc", sb.String()},
-			Env:     map[string]string{},
-			Cwd:     ".",
-			Timeout: 5 * time.Second,
-		},
-	)
-	return err
+	return t.sst.SaveWorkspaceMetadata(ctx, eng, ws, md)
 }
 
 func (t *RunTool) skillLinksPresent(
@@ -611,80 +1053,10 @@ func (t *RunTool) skillLinksPresent(
 	ws codeexecutor.Workspace,
 	name string,
 ) (bool, error) {
-	skillName := strings.TrimSpace(name)
-	if skillName == "" {
-		return false, nil
+	if t.sst == nil {
+		t.sst = skillstage.New()
 	}
-	if eng == nil || eng.Runner() == nil {
-		return false, fmt.Errorf("workspace runner is not configured")
-	}
-	base := path.Join(codeexecutor.DirSkills, skillName)
-	var sb strings.Builder
-	sb.WriteString("test -L ")
-	sb.WriteString(shellQuote(path.Join(base, codeexecutor.DirOut)))
-	sb.WriteString(" && test -L ")
-	sb.WriteString(shellQuote(path.Join(base, codeexecutor.DirWork)))
-	sb.WriteString(" && test -L ")
-	sb.WriteString(shellQuote(path.Join(base, skillDirInputs)))
-	rr, err := eng.Runner().RunProgram(
-		ctx, ws, codeexecutor.RunProgramSpec{
-			Cmd:     "bash",
-			Args:    []string{"-lc", sb.String()},
-			Env:     map[string]string{},
-			Cwd:     ".",
-			Timeout: 5 * time.Second,
-		},
-	)
-	if err != nil {
-		return false, err
-	}
-	if rr.ExitCode == 0 {
-		return true, nil
-	}
-	return false, nil
-}
-
-// linkWorkspaceDirs creates convenience symlinks under the staged
-// skill root so commands that write to "out/" (relative to the skill
-// CWD) resolve to the workspace output directory. It also links work
-// and inputs for consistency.
-func (t *RunTool) linkWorkspaceDirs(
-	ctx context.Context, eng codeexecutor.Engine,
-	ws codeexecutor.Workspace, name string,
-) error {
-	skillRoot := path.Join(codeexecutor.DirSkills, name)
-	// Relative links from skills/<name> to workspace dirs.
-	toOut := path.Join("..", "..", codeexecutor.DirOut)
-	toWork := path.Join("..", "..", codeexecutor.DirWork)
-	toInputs := path.Join(
-		"..", "..", codeexecutor.DirWork, "inputs",
-	)
-	var sb strings.Builder
-	sb.WriteString("set -e; cd ")
-	sb.WriteString(shellQuote(skillRoot))
-	sb.WriteString("; rm -rf out work inputs ")
-	sb.WriteString(shellQuote(skillDirVenv))
-	sb.WriteString("; mkdir -p ")
-	sb.WriteString(shellQuote(toInputs))
-	sb.WriteString(" ")
-	sb.WriteString(shellQuote(skillDirVenv))
-	sb.WriteString("; ln -sfn ")
-	sb.WriteString(shellQuote(toOut))
-	sb.WriteString(" out; ln -sfn ")
-	sb.WriteString(shellQuote(toWork))
-	sb.WriteString(" work; ln -sfn ")
-	sb.WriteString(shellQuote(toInputs))
-	sb.WriteString(" inputs")
-	_, err := eng.Runner().RunProgram(
-		ctx, ws, codeexecutor.RunProgramSpec{
-			Cmd:     "bash",
-			Args:    []string{"-lc", sb.String()},
-			Env:     map[string]string{},
-			Cwd:     ".",
-			Timeout: 5 * time.Second,
-		},
-	)
-	return err
+	return t.sst.SkillLinksPresent(ctx, eng, ws, name)
 }
 
 func (t *RunTool) removeWorkspacePath(
@@ -693,60 +1065,10 @@ func (t *RunTool) removeWorkspacePath(
 	ws codeexecutor.Workspace,
 	rel string,
 ) error {
-	target := strings.TrimSpace(rel)
-	if target == "" {
-		return nil
+	if t.sst == nil {
+		t.sst = skillstage.New()
 	}
-	if eng == nil || eng.Runner() == nil {
-		return fmt.Errorf("workspace runner is not configured")
-	}
-	var sb strings.Builder
-	sb.WriteString("set -e; if [ -e ")
-	sb.WriteString(shellQuote(target))
-	sb.WriteString(" ]; then find ")
-	sb.WriteString(shellQuote(target))
-	sb.WriteString(" -type l -prune -o -exec chmod u+w {} +; fi")
-	sb.WriteString("; rm -rf ")
-	sb.WriteString(shellQuote(target))
-	_, err := eng.Runner().RunProgram(
-		ctx,
-		ws,
-		codeexecutor.RunProgramSpec{
-			Cmd:     "bash",
-			Args:    []string{"-lc", sb.String()},
-			Env:     map[string]string{},
-			Cwd:     ".",
-			Timeout: 5 * time.Second,
-		},
-	)
-	return err
-}
-
-// readOnlyExceptSymlinks removes write bits on all regular files and
-// directories under the staged skill root while skipping symlinks to
-// avoid changing workspace-level targets like out/.
-func (t *RunTool) readOnlyExceptSymlinks(
-	ctx context.Context, eng codeexecutor.Engine,
-	ws codeexecutor.Workspace, dest string,
-) error {
-	venv := path.Join(dest, skillDirVenv)
-	var sb strings.Builder
-	// Use find to skip symlinks and chmod others.
-	sb.WriteString("set -e; find ")
-	sb.WriteString(shellQuote(dest))
-	sb.WriteString(" -path ")
-	sb.WriteString(shellQuote(venv))
-	sb.WriteString(" -prune -o -type l -prune -o -exec chmod a-w {} +")
-	_, err := eng.Runner().RunProgram(
-		ctx, ws, codeexecutor.RunProgramSpec{
-			Cmd:     "bash",
-			Args:    []string{"-lc", sb.String()},
-			Env:     map[string]string{},
-			Cwd:     ".",
-			Timeout: 5 * time.Second,
-		},
-	)
-	return err
+	return t.sst.RemoveWorkspacePath(ctx, eng, ws, rel)
 }
 
 // shellQuote wraps a string for safe single-quoted usage in a
@@ -791,13 +1113,17 @@ func isWorkspaceEnvPath(s string) bool {
 
 func isAllowedWorkspacePath(rel string) bool {
 	switch {
-	case rel == codeexecutor.DirSkills || strings.HasPrefix(rel, codeexecutor.DirSkills+"/"):
+	case rel == codeexecutor.DirSkills ||
+		strings.HasPrefix(rel, codeexecutor.DirSkills+"/"):
 		return true
-	case rel == codeexecutor.DirWork || strings.HasPrefix(rel, codeexecutor.DirWork+"/"):
+	case rel == codeexecutor.DirWork ||
+		strings.HasPrefix(rel, codeexecutor.DirWork+"/"):
 		return true
-	case rel == codeexecutor.DirOut || strings.HasPrefix(rel, codeexecutor.DirOut+"/"):
+	case rel == codeexecutor.DirOut ||
+		strings.HasPrefix(rel, codeexecutor.DirOut+"/"):
 		return true
-	case rel == codeexecutor.DirRuns || strings.HasPrefix(rel, codeexecutor.DirRuns+"/"):
+	case rel == codeexecutor.DirRuns ||
+		strings.HasPrefix(rel, codeexecutor.DirRuns+"/"):
 		return true
 	default:
 		return false
@@ -823,7 +1149,10 @@ func resolveCWD(cwd string, name string) string {
 	// skill root. "$WORK_DIR" style paths resolve to workspace-relative
 	// roots. Absolute paths are treated as workspace-absolute and must
 	// start with known workspace dirs like "/skills" or "/work".
-	base := path.Join(codeexecutor.DirSkills, name)
+	base := strings.TrimSpace(name)
+	if base == "" {
+		base = "."
+	}
 	s := strings.TrimSpace(cwd)
 	s = strings.ReplaceAll(s, "\\", "/")
 	if s == "" {
@@ -869,77 +1198,236 @@ func (t *RunTool) runProgram(
 	ctx context.Context,
 	eng codeexecutor.Engine,
 	ws codeexecutor.Workspace,
+	skillRoot string,
 	cwd string,
 	in runInput,
 ) (codeexecutor.RunResult, error) {
+	spec, err := t.buildRunProgramSpec(
+		ctx,
+		eng,
+		ws,
+		skillRoot,
+		cwd,
+		in,
+	)
+	if err != nil {
+		return codeexecutor.RunResult{}, err
+	}
+	return eng.Runner().RunProgram(ctx, ws, spec)
+}
+
+func (t *RunTool) buildRunProgramSpec(
+	ctx context.Context,
+	eng codeexecutor.Engine,
+	ws codeexecutor.Workspace,
+	skillRoot string,
+	cwd string,
+	in runInput,
+) (codeexecutor.RunProgramSpec, error) {
 	timeout := time.Duration(in.Timeout) * time.Second
 	if in.Timeout <= 0 {
 		timeout = defaultSkillRunTimeout
 	}
-	env := in.Env
-	if env == nil {
-		env = map[string]string{}
-	}
+	env := cloneStringMap(in.Env)
+	t.maybeInjectSkillEnv(ctx, in.Skill, env)
 	if _, ok := env[codeexecutor.EnvSkillName]; !ok {
 		env[codeexecutor.EnvSkillName] = in.Skill
 	}
+	if err := t.prepareEditorEnv(ctx, eng, ws, env, in.EditorText); err != nil {
+		return codeexecutor.RunProgramSpec{}, err
+	}
 
-	venvRel, venvBinRel := venvRelPaths(cwd, in.Skill)
+	venvRel, venvBinRel, skillBinRel := skillLocalRelPaths(
+		cwd,
+		skillRoot,
+	)
 
 	if len(t.allowedCmds) > 0 || len(t.deniedCmds) > 0 {
-		injectVenvEnv(env, venvRel, venvBinRel)
+		// Policy mode: scrub the merged env before building PATH
+		// so a caller-supplied PATH / BASH_ENV / LD_PRELOAD /
+		// BASH_FUNC_* cannot survive into the spawn. Without
+		// this, a model-supplied `env: {"PATH": "./bin"}` is
+		// prepended to PATH ahead of skillBin by
+		// injectSkillLocalEnvWithSep, so an allowed bare command
+		// (`curl`, `python`, `git`, …) resolves at the attacker
+		// controlled directory rather than the vetted binary -
+		// the same vulnerability class that PR #1800 closed for
+		// `workspace_exec`. The scrub mirrors what
+		// tool/workspaceexec already does for its own policy
+		// mode; on Windows the comparison is case-insensitive so
+		// "Path" / "Home" cannot survive by varying case.
+		env = scrubPolicyEnv(env)
+		injectSkillLocalEnvWithSep(
+			env,
+			venvRel,
+			venvBinRel,
+			skillBinRel,
+			pathListSeparatorForEngine(eng),
+		)
 		argv, err := splitCommandLine(in.Command)
 		if err != nil {
-			return codeexecutor.RunResult{}, err
+			return codeexecutor.RunProgramSpec{}, err
 		}
 		cmd := argv[0]
-		if len(t.allowedCmds) > 0 && !cmdInList(t.allowedCmds, cmd) {
-			return codeexecutor.RunResult{}, fmt.Errorf(
-				"skill_run: command %q is not allowed by allowed_commands",
-				cmd,
-			)
-		}
-		if cmdInList(t.deniedCmds, cmd) {
-			return codeexecutor.RunResult{}, fmt.Errorf(
+		if _, ok := matchSkillLocalCommand(
+			t.deniedCmds,
+			cmd,
+			venvBinRel,
+			"",
+		); ok {
+			return codeexecutor.RunProgramSpec{}, fmt.Errorf(
 				"skill_run: command %q is denied by denied_commands",
 				cmd,
 			)
 		}
-		return eng.Runner().RunProgram(
-			ctx, ws, codeexecutor.RunProgramSpec{
-				Cmd:     cmd,
-				Args:    argv[1:],
-				Env:     env,
-				Cwd:     cwd,
-				Timeout: timeout,
-			},
-		)
+		if len(t.allowedCmds) > 0 && !cmdInList(t.allowedCmds, cmd) {
+			if rel, ok := matchSkillLocalCommand(
+				t.allowedCmds,
+				cmd,
+				venvBinRel,
+				skillBinRel,
+			); ok {
+				cmd = rel
+			} else {
+				return codeexecutor.RunProgramSpec{}, fmt.Errorf(
+					"skill_run: command %q is not allowed by "+
+						"allowed_commands",
+					cmd,
+				)
+			}
+		}
+		if cmdInList(t.deniedCmds, cmd) {
+			return codeexecutor.RunProgramSpec{}, fmt.Errorf(
+				"skill_run: command %q is denied by denied_commands",
+				cmd,
+			)
+		}
+		return codeexecutor.RunProgramSpec{
+			Cmd:      cmd,
+			Args:     argv[1:],
+			Env:      env,
+			CleanEnv: true,
+			Cwd:      cwd,
+			Stdin:    in.Stdin,
+			Timeout:  timeout,
+		}, nil
 	}
 
-	cmd := wrapWithVenvPrefix(in.Command, venvRel, venvBinRel)
-	return eng.Runner().RunProgram(
-		ctx, ws, codeexecutor.RunProgramSpec{
-			Cmd:     "bash",
-			Args:    []string{"-c", cmd},
-			Env:     env,
-			Cwd:     cwd,
-			Timeout: timeout,
-		},
+	cmd := wrapWithSkillLocalPrefix(
+		in.Command,
+		venvRel,
+		venvBinRel,
+		skillBinRel,
 	)
+	return codeexecutor.RunProgramSpec{
+		Cmd:     "bash",
+		Args:    []string{"-c", cmd},
+		Env:     env,
+		Cwd:     cwd,
+		Stdin:   in.Stdin,
+		Timeout: timeout,
+	}, nil
 }
 
-func venvRelPaths(cwd string, skillName string) (string, string) {
+func venvRelPaths(cwd string, skillRoot string) (string, string) {
+	venvRel, venvBinRel, _ := skillLocalRelPaths(cwd, skillRoot)
+	return venvRel, venvBinRel
+}
+
+func skillLocalRelPaths(
+	cwd string,
+	skillRoot string,
+) (string, string, string) {
 	base := path.Clean(strings.TrimSpace(cwd))
 	if base == "" {
 		base = "."
 	}
-	skillRoot := path.Join(codeexecutor.DirSkills, skillName)
+	skillRoot = path.Clean(strings.TrimSpace(skillRoot))
+	if skillRoot == "" {
+		skillRoot = "."
+	}
 	venv := path.Join(skillRoot, skillDirVenv)
-	venvBin := path.Join(venv, "bin")
+	venvBin := path.Join(venv, skillDirBin)
+	skillBin := path.Join(skillRoot, skillDirBin)
 
 	relVenv := slashRel(base, venv)
 	relBin := slashRel(base, venvBin)
-	return relVenv, relBin
+	relSkillBin := slashRel(base, skillBin)
+	return relVenv, relBin, relSkillBin
+}
+
+func (t *RunTool) maybeInjectSkillEnv(
+	ctx context.Context,
+	skillName string,
+	env map[string]string,
+) {
+	p, ok := t.repo.(SkillRunEnvProvider)
+	if !ok || p == nil {
+		return
+	}
+
+	overrides, err := p.SkillRunEnv(ctx, skillName)
+	if err != nil {
+		log.WarnfContext(
+			ctx,
+			"skill_run: env provider failed for %q: %v",
+			skillName,
+			err,
+		)
+		return
+	}
+	for k, v := range overrides {
+		key := strings.TrimSpace(k)
+		if key == "" || strings.TrimSpace(v) == "" {
+			continue
+		}
+		if !isValidEnvVarName(key) {
+			continue
+		}
+		if isBlockedSkillEnvKey(key) {
+			continue
+		}
+		if _, ok := env[key]; ok {
+			continue
+		}
+		if v, ok := os.LookupEnv(key); ok &&
+			strings.TrimSpace(v) != "" {
+			continue
+		}
+		env[key] = v
+	}
+}
+
+func isBlockedSkillEnvKey(key string) bool {
+	switch strings.ToUpper(strings.TrimSpace(key)) {
+	case envLDPreload,
+		envLDLibraryPath,
+		envDYLDInsertLibraries,
+		envDYLDLibraryPath,
+		envDYLDForceFlatNS,
+		envOpenSSLConf:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidEnvVarName(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i, r := range key {
+		switch {
+		case r == '_' || ('A' <= r && r <= 'Z') ||
+			('a' <= r && r <= 'z'):
+			continue
+		case i > 0 && '0' <= r && r <= '9':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func slashRel(base string, target string) string {
@@ -983,33 +1471,209 @@ func slashRel(base string, target string) string {
 }
 
 func injectVenvEnv(env map[string]string, venv string, venvBin string) {
+	injectSkillLocalEnv(env, venv, venvBin, "")
+}
+
+func injectSkillLocalEnv(
+	env map[string]string,
+	venv string,
+	venvBin string,
+	skillBin string,
+) {
+	injectSkillLocalEnvWithSep(
+		env,
+		venv,
+		venvBin,
+		skillBin,
+		posixPathListSep,
+	)
+}
+
+// scrubPolicyEnv returns the env that should be passed to the
+// runtime when a skill_run command policy is active. It filters the
+// input through internal/envscrub so shell start-up vars (HOME,
+// BASH_ENV, ENV, SHELL, …), executable resolution vars (PATH,
+// LD_PRELOAD, DYLD_*, IFS, CDPATH, …), BASH_FUNC_* Shellshock
+// entries and non-POSIX keys are dropped before the per-call PATH
+// is rebuilt by injectSkillLocalEnvWithSep. A nil / empty result
+// is normalised to an empty non-nil map so the subsequent assign
+// of env[PATH] / env[VIRTUAL_ENV] does not panic.
+//
+// The same envscrub package backs the equivalent scrub in
+// tool/workspaceexec so the two policy modes stay in sync.
+func scrubPolicyEnv(env map[string]string) map[string]string {
+	out := envscrub.Scrub(env, runtime.GOOS == "windows")
+	if out == nil {
+		out = map[string]string{}
+	}
+	return out
+}
+
+func injectSkillLocalEnvWithSep(
+	env map[string]string,
+	venv string,
+	venvBin string,
+	skillBin string,
+	sep string,
+) {
 	if env == nil {
 		return
+	}
+	if sep == "" {
+		sep = posixPathListSep
 	}
 	if _, ok := env[envVirtualEnv]; !ok && strings.TrimSpace(venv) != "" {
 		env[envVirtualEnv] = venv
 	}
-	basePATH := strings.TrimSpace(env[envPath])
+	pathKey := pathEnvKey(env, sep)
+	basePATH := strings.TrimSpace(env[pathKey])
 	if basePATH == "" {
 		basePATH = strings.TrimSpace(os.Getenv(envPath))
 	}
-	sep := string(os.PathListSeparator)
-	if basePATH == "" {
-		env[envPath] = venvBin
-		return
+	pathParts := make([]string, 0, 3)
+	for _, dir := range []string{venvBin, basePATH, skillBin} {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		pathParts = append(pathParts, dir)
 	}
-	env[envPath] = venvBin + sep + basePATH
+	env[pathKey] = strings.Join(pathParts, sep)
+}
+
+func pathEnvKey(env map[string]string, sep string) string {
+	if _, ok := env[envPath]; ok {
+		return envPath
+	}
+	if sep != windowsPathListSep {
+		return envPath
+	}
+	for key := range env {
+		if strings.EqualFold(key, envPath) {
+			return key
+		}
+	}
+	return envPath
+}
+
+type pathListSeparatorProvider interface {
+	PathListSeparator() string
+}
+
+func pathListSeparatorForEngine(eng codeexecutor.Engine) string {
+	if eng == nil || eng.Runner() == nil {
+		return posixPathListSep
+	}
+	provider, ok := eng.Runner().(pathListSeparatorProvider)
+	if !ok {
+		return posixPathListSep
+	}
+	if sep := provider.PathListSeparator(); sep != "" {
+		return sep
+	}
+	return posixPathListSep
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func (t *RunTool) prepareEditorEnv(
+	ctx context.Context,
+	eng codeexecutor.Engine,
+	ws codeexecutor.Workspace,
+	env map[string]string,
+	editorText string,
+) error {
+	if editorText == "" {
+		return nil
+	}
+	if _, ok := env[envEditor]; ok {
+		return fmt.Errorf(
+			"editor_text cannot be combined with env.%s",
+			envEditor,
+		)
+	}
+	if _, ok := env[envVisual]; ok {
+		return fmt.Errorf(
+			"editor_text cannot be combined with env.%s",
+			envVisual,
+		)
+	}
+
+	contentRel := path.Join(
+		codeexecutor.DirWork,
+		editorHelperDir,
+		editorContentFile,
+	)
+	scriptRel := path.Join(
+		codeexecutor.DirWork,
+		editorHelperDir,
+		editorScriptFile,
+	)
+	contentPath := path.Join(ws.Path, contentRel)
+	scriptPath := path.Join(ws.Path, scriptRel)
+
+	script := buildEditorWrapperScript(contentPath)
+	files := []codeexecutor.PutFile{
+		{
+			Path:    contentRel,
+			Content: []byte(editorText),
+			Mode:    codeexecutor.DefaultScriptFileMode,
+		},
+		{
+			Path:    scriptRel,
+			Content: []byte(script),
+			Mode:    codeexecutor.DefaultExecFileMode,
+		},
+	}
+	if err := eng.FS().PutFiles(ctx, ws, files); err != nil {
+		return err
+	}
+	env[envEditor] = scriptPath
+	env[envVisual] = scriptPath
+	return nil
+}
+
+func buildEditorWrapperScript(contentPath string) string {
+	var sb strings.Builder
+	sb.WriteString("#!/bin/sh\n")
+	sb.WriteString("set -eu\n")
+	sb.WriteString("for last do target=\"$last\"; done\n")
+	sb.WriteString("if [ -z \"${target:-}\" ]; then\n")
+	sb.WriteString("  echo ")
+	sb.WriteString(shellQuote(editorScriptMissing))
+	sb.WriteString(" >&2\n")
+	sb.WriteString("  exit 1\n")
+	sb.WriteString("fi\n")
+	sb.WriteString("cat ")
+	sb.WriteString(shellQuote(contentPath))
+	sb.WriteString(" > \"$target\"\n")
+	return sb.String()
 }
 
 func wrapWithVenvPrefix(cmd string, venv string, venvBin string) string {
+	return wrapWithSkillLocalPrefix(cmd, venv, venvBin, "")
+}
+
+func wrapWithSkillLocalPrefix(
+	cmd string,
+	venv string,
+	venvBin string,
+	skillBin string,
+) string {
 	var sb strings.Builder
 	sb.WriteString("export ")
 	sb.WriteString(envPath)
 	sb.WriteString("=")
-	sb.WriteString(shellQuote(venvBin))
-	sb.WriteString(":\"$")
-	sb.WriteString(envPath)
-	sb.WriteString("\"; ")
+	writeShellSkillPATH(&sb, venvBin, skillBin)
+	sb.WriteString("; ")
 	sb.WriteString("if [ -z \"$")
 	sb.WriteString(envVirtualEnv)
 	sb.WriteString("\" ]; then export ")
@@ -1021,7 +1685,91 @@ func wrapWithVenvPrefix(cmd string, venv string, venvBin string) string {
 	return sb.String()
 }
 
-const disallowedShellMeta = "\n\r;&|<>"
+func writeShellSkillPATH(
+	sb *strings.Builder,
+	venvBin string,
+	skillBin string,
+) {
+	if strings.TrimSpace(venvBin) == "" {
+		sb.WriteString("\"$")
+		sb.WriteString(envPath)
+		sb.WriteString("\"")
+	} else {
+		sb.WriteString(shellQuote(venvBin))
+		sb.WriteString("${")
+		sb.WriteString(envPath)
+		sb.WriteString(":+\":$")
+		sb.WriteString(envPath)
+		sb.WriteString("\"}")
+	}
+	if strings.TrimSpace(skillBin) == "" {
+		return
+	}
+	sb.WriteString("; export ")
+	sb.WriteString(envPath)
+	sb.WriteString("=\"${")
+	sb.WriteString(envPath)
+	sb.WriteString(":+$")
+	sb.WriteString(envPath)
+	sb.WriteString(":}\"")
+	sb.WriteString(shellQuote(skillBin))
+}
+
+func isBareCommandName(cmd string) bool {
+	cmd = strings.TrimSpace(cmd)
+	return cmd != "" && cmd == path.Base(cmd) && cmd == filepath.Base(cmd)
+}
+
+func matchSkillLocalCommand(
+	list map[string]struct{},
+	cmd string,
+	venvBinRel string,
+	skillBinRel string,
+) (string, bool) {
+	if len(list) == 0 || !isBareCommandName(cmd) {
+		return "", false
+	}
+	for _, dir := range []string{venvBinRel, skillBinRel} {
+		candidate := skillLocalCommandPath(dir, cmd)
+		if candidate == "" {
+			continue
+		}
+		if cmdInList(list, candidate) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func skillLocalCommandPath(dirRel string, cmd string) string {
+	if strings.TrimSpace(dirRel) == "" {
+		return ""
+	}
+	return forceExplicitRelativeCommand(path.Join(dirRel, cmd))
+}
+
+func forceExplicitRelativeCommand(rel string) string {
+	out := path.Clean(filepath.ToSlash(rel))
+	if out == "." || out == "" {
+		return out
+	}
+	if out == path.Base(out) {
+		return "./" + out
+	}
+	return out
+}
+
+const (
+	disallowedShellMeta = "\n\r;&|<>"
+
+	errShellMetaFmt = "skill_run: shell metacharacter %q is not allowed " +
+		"when command restrictions are enabled " +
+		"(allowed_commands/denied_commands set). " +
+		"Use a single executable with args only " +
+		"(no redirects/pipes/chaining). " +
+		"To allow shell syntax, clear " +
+		"allowed_commands/denied_commands in the tool config"
+)
 
 func cmdInList(list map[string]struct{}, cmd string) bool {
 	if len(list) == 0 {
@@ -1030,9 +1778,23 @@ func cmdInList(list map[string]struct{}, cmd string) bool {
 	if _, ok := list[cmd]; ok {
 		return true
 	}
+	if normalized := normalizeCommandForList(cmd); normalized != cmd {
+		if _, ok := list[normalized]; ok {
+			return true
+		}
+	}
 	base := filepathBase(cmd)
 	_, ok := list[base]
 	return ok
+}
+
+func normalizeCommandForList(cmd string) string {
+	cmd = strings.TrimSpace(filepath.ToSlash(cmd))
+	cmd = strings.TrimPrefix(cmd, "./")
+	if cmd == "" {
+		return ""
+	}
+	return path.Clean(cmd)
 }
 
 func splitCommandLine(s string) ([]string, error) {
@@ -1041,10 +1803,7 @@ func splitCommandLine(s string) ([]string, error) {
 	}
 	if idx := strings.IndexAny(s, disallowedShellMeta); idx >= 0 {
 		meta := s[idx : idx+1]
-		return nil, fmt.Errorf(
-			"skill_run: shell metacharacter %q is not allowed when command restrictions are enabled (allowed_commands/denied_commands set). Use a single executable with args only (no redirects/pipes/chaining). To allow shell syntax, clear allowed_commands/denied_commands in the tool config",
-			meta,
-		)
+		return nil, fmt.Errorf(errShellMetaFmt, meta)
 	}
 	var args []string
 	var cur strings.Builder
@@ -1117,48 +1876,89 @@ func withArtifactContext(ctx context.Context) context.Context {
 }
 
 // prepareOutputs collects files either through OutputSpec or legacy
-// output_files patterns. It returns collected files and optional
-// manifest.
+// output_files patterns. The bool result reports a non-fatal partial commit
+// that also carried ErrWorkspaceStale, allowing callers to invalidate the
+// exact handle while preserving the partial output result.
 func (t *RunTool) prepareOutputs(
 	ctx context.Context,
 	eng codeexecutor.Engine,
 	ws codeexecutor.Workspace,
 	in runInput,
-) ([]codeexecutor.File, *codeexecutor.OutputManifest, error) {
+) (
+	[]codeexecutor.File,
+	*codeexecutor.OutputManifest,
+	[]string,
+	bool,
+	error,
+) {
 	var files []codeexecutor.File
 	var manifest *codeexecutor.OutputManifest
 	if in.Outputs != nil && len(in.OutputFiles) == 0 {
 		m, err := eng.FS().CollectOutputs(ctx, ws, *in.Outputs)
-		if err != nil {
-			return nil, nil, err
+		stale := errors.Is(err, codeexecutor.ErrWorkspaceStale)
+		if err != nil &&
+			!errors.Is(err, codeexecutor.ErrPartialOutputCommit) {
+			return nil, nil, nil, false, err
 		}
 		manifest = &m
 		if in.Outputs.Inline {
-			for _, fr := range m.Files {
-				files = append(files, codeexecutor.File{
-					Name:      fr.Name,
-					Content:   fr.Content,
-					MIMEType:  fr.MIMEType,
-					SizeBytes: fr.SizeBytes,
-					Truncated: fr.Truncated,
-				})
-			}
+			files = outputFilesFromManifest(m)
 		}
-		return files, manifest, nil
+		if err != nil {
+			return files, manifest, []string{
+				warnPartialOutputCommit,
+			}, stale, nil
+		}
+		return files, manifest, nil, false, nil
 	}
 	fs, err := t.collectFiles(ctx, eng, ws, in.OutputFiles)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, false, err
 	}
-	return fs, nil, nil
+	return fs, nil, nil, false, nil
+}
+
+func outputFilesFromManifest(
+	manifest codeexecutor.OutputManifest,
+) []codeexecutor.File {
+	files := make([]codeexecutor.File, 0, len(manifest.Files))
+	for _, fr := range manifest.Files {
+		files = append(files, codeexecutor.File{
+			Name:      fr.Name,
+			Content:   fr.Content,
+			MIMEType:  fr.MIMEType,
+			SizeBytes: fr.SizeBytes,
+			Truncated: fr.Truncated,
+		})
+	}
+	return files
 }
 
 // buildRunOutput converts a RunResult and files into runOutput.
 func buildRunOutput(
 	rr codeexecutor.RunResult, files []codeexecutor.File,
 ) runOutput {
-	stdout, stdoutTrunc := truncateOutput(rr.Stdout)
-	stderr, stderrTrunc := truncateOutput(rr.Stderr)
+	return buildRunOutputWithLimits(
+		rr,
+		files,
+		defaultRunOutputLimits(),
+	)
+}
+
+func buildRunOutputWithLimits(
+	rr codeexecutor.RunResult,
+	files []codeexecutor.File,
+	limits RunOutputLimits,
+) runOutput {
+	limits = normalizeRunOutputLimits(limits)
+	stdout, stdoutTrunc := truncateOutputWithLimit(
+		rr.Stdout,
+		limits.StdoutStderrBytes,
+	)
+	stderr, stderrTrunc := truncateOutputWithLimit(
+		rr.Stderr,
+		limits.StdoutStderrBytes,
+	)
 	var warnings []string
 	if stdoutTrunc {
 		warnings = append(warnings, warnStdoutTruncated)
@@ -1169,35 +1969,171 @@ func buildRunOutput(
 
 	outFiles := toRunFiles(files)
 	return runOutput{
-		OutputFiles:   outFiles,
-		PrimaryOutput: selectPrimaryOutput(outFiles),
-		Stdout:        stdout,
-		Stderr:        stderr,
-		ExitCode:      rr.ExitCode,
-		TimedOut:      rr.TimedOut,
-		Duration:      rr.Duration.Milliseconds(),
-		Warnings:      warnings,
+		OutputFiles: outFiles,
+		PrimaryOutput: selectPrimaryOutputWithLimit(
+			outFiles,
+			limits.PrimaryOutputBytes,
+		),
+		Stdout:   stdout,
+		Stderr:   stderr,
+		ExitCode: rr.ExitCode,
+		TimedOut: rr.TimedOut,
+		Duration: rr.Duration.Milliseconds(),
+		Warnings: warnings,
 	}
 }
 
+type failedOutputFilterResult struct {
+	files        []codeexecutor.File
+	manifest     *codeexecutor.OutputManifest
+	omittedNames []string
+	warnings     []string
+}
+
+func filterFailedEmptyOutputs(
+	rr codeexecutor.RunResult,
+	files []codeexecutor.File,
+	manifest *codeexecutor.OutputManifest,
+) failedOutputFilterResult {
+	result := failedOutputFilterResult{
+		files:    files,
+		manifest: manifest,
+	}
+	if !failedRunResult(rr) {
+		return result
+	}
+
+	seen := make(map[string]struct{})
+	if len(files) > 0 {
+		filtered := make([]codeexecutor.File, 0, len(files))
+		for _, f := range files {
+			if emptyCollectedFile(f) {
+				result.omittedNames = appendFilteredFileName(
+					result.omittedNames,
+					seen,
+					f.Name,
+				)
+				continue
+			}
+			filtered = append(filtered, f)
+		}
+		if len(filtered) != len(files) {
+			result.files = filtered
+		}
+	}
+	result.manifest = filterFailedEmptyManifestFiles(
+		manifest,
+		seen,
+		&result.omittedNames,
+	)
+	if len(result.omittedNames) > 0 {
+		result.warnings = []string{warnFailedRunEmptyOutputFiles}
+	}
+	return result
+}
+
+func failedRunResult(rr codeexecutor.RunResult) bool {
+	return rr.ExitCode != 0 || rr.TimedOut
+}
+
+func emptyCollectedFile(f codeexecutor.File) bool {
+	return f.SizeBytes == 0 && f.Content == ""
+}
+
+func emptyCollectedFileRef(f codeexecutor.FileRef) bool {
+	return f.SizeBytes == 0 && f.Content == ""
+}
+
+func appendFilteredFileName(
+	names []string,
+	seen map[string]struct{},
+	name string,
+) []string {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return names
+	}
+	if _, ok := seen[n]; ok {
+		return names
+	}
+	seen[n] = struct{}{}
+	return append(names, n)
+}
+
+func filterFailedEmptyManifestFiles(
+	manifest *codeexecutor.OutputManifest,
+	seen map[string]struct{},
+	omittedNames *[]string,
+) *codeexecutor.OutputManifest {
+	if manifest == nil || len(manifest.Files) == 0 {
+		return manifest
+	}
+
+	filtered := make([]codeexecutor.FileRef, 0, len(manifest.Files))
+	omitted := false
+	for _, f := range manifest.Files {
+		name := strings.TrimSpace(f.Name)
+		if _, ok := seen[name]; ok {
+			omitted = true
+			continue
+		}
+		if emptyCollectedFileRef(f) {
+			*omittedNames = appendFilteredFileName(
+				*omittedNames,
+				seen,
+				name,
+			)
+			omitted = true
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	if !omitted {
+		return manifest
+	}
+	cloned := *manifest
+	cloned.Files = filtered
+	return &cloned
+}
+
 const (
-	maxOutputChars = 16 * 1024
+	defaultStdoutStderrBytes = 16 * 1024
+	defaultPrimaryOutputSize = 32 * 1024
 )
 
 const (
-	maxPrimaryOutputChars = 32 * 1024
-)
-
-const (
-	warnStdoutTruncated = "stdout truncated"
-	warnStderrTruncated = "stderr truncated"
+	warnStdoutTruncated     = "stdout truncated"
+	warnStderrTruncated     = "stderr truncated"
+	warnPartialOutputCommit = "output files were collected, but " +
+		"workspace metadata could not be updated"
+	warnFailedRunEmptyOutputFiles = "empty output_files omitted " +
+		"because command failed; shell redirections can create " +
+		"empty files before execution fails"
 )
 
 func truncateOutput(s string) (string, bool) {
-	if len(s) <= maxOutputChars {
+	return truncateOutputWithLimit(
+		s,
+		defaultStdoutStderrBytes,
+	)
+}
+
+func truncateOutputWithLimit(s string, limit int) (string, bool) {
+	if limit <= 0 {
+		limit = defaultStdoutStderrBytes
+	}
+	if len(s) <= limit {
 		return s, false
 	}
-	return s[:maxOutputChars], true
+	truncated := s[:limit]
+	if utf8.ValidString(truncated) {
+		return truncated, true
+	}
+	n := validUTF8PrefixLen(truncated)
+	if n <= 0 {
+		return "", true
+	}
+	return truncated[:n], true
 }
 
 func toRunFiles(files []codeexecutor.File) []runFile {
@@ -1268,6 +2204,19 @@ func validUTF8PrefixLen(s string) int {
 }
 
 func selectPrimaryOutput(files []runFile) *runFile {
+	return selectPrimaryOutputWithLimit(
+		files,
+		defaultPrimaryOutputSize,
+	)
+}
+
+func selectPrimaryOutputWithLimit(
+	files []runFile,
+	limit int,
+) *runFile {
+	if limit <= 0 {
+		limit = defaultPrimaryOutputSize
+	}
 	var best *runFile
 	for _, f := range files {
 		if strings.TrimSpace(f.Content) == "" {
@@ -1276,7 +2225,7 @@ func selectPrimaryOutput(files []runFile) *runFile {
 		if !codeexecutor.IsTextMIME(f.MIMEType) {
 			continue
 		}
-		if len(f.Content) > maxPrimaryOutputChars {
+		if len(f.Content) > limit {
 			continue
 		}
 		if best != nil && best.Name < f.Name {
@@ -1289,11 +2238,43 @@ func selectPrimaryOutput(files []runFile) *runFile {
 }
 
 func mergeAutoPrimaryOutput(files []codeexecutor.File, out *runOutput) {
+	mergeAutoPrimaryOutputWithLimit(
+		files,
+		out,
+		defaultPrimaryOutputSize,
+	)
+}
+
+func mergeAutoPrimaryOutputWithLimit(
+	files []codeexecutor.File,
+	out *runOutput,
+	limit int,
+) {
 	if out == nil || out.PrimaryOutput != nil || len(files) == 0 {
 		return
 	}
 	runFiles := toRunFiles(files)
-	out.PrimaryOutput = selectPrimaryOutput(runFiles)
+	out.PrimaryOutput = selectPrimaryOutputWithLimit(
+		runFiles,
+		limit,
+	)
+}
+
+func defaultRunOutputLimits() RunOutputLimits {
+	return RunOutputLimits{
+		StdoutStderrBytes:  defaultStdoutStderrBytes,
+		PrimaryOutputBytes: defaultPrimaryOutputSize,
+	}
+}
+
+func normalizeRunOutputLimits(limits RunOutputLimits) RunOutputLimits {
+	if limits.StdoutStderrBytes <= 0 {
+		limits.StdoutStderrBytes = defaultStdoutStderrBytes
+	}
+	if limits.PrimaryOutputBytes <= 0 {
+		limits.PrimaryOutputBytes = defaultPrimaryOutputSize
+	}
+	return limits
 }
 
 // attachArtifactsIfRequested saves files as artifacts when requested
@@ -1335,6 +2316,9 @@ func (t *RunTool) attachArtifactsIfRequested(
 const warnSaveArtifactsSkippedTmpl = "save_as_artifacts requested but " +
 	"%s; outputs are not persisted"
 
+const warnOutputsSaveSkippedTmpl = "outputs.save requested but " +
+	"%s; outputs are not persisted"
+
 const warnOutputFilesWorkspaceOnly = "output_files are workspace-" +
 	"relative; prefer output_files content; when you need a " +
 	"stable reference, use output_files[*].ref (workspace://...)"
@@ -1374,6 +2358,16 @@ func appendWarning(out *runOutput, reason string) {
 	)
 }
 
+func appendOutputsSaveWarning(out *runOutput, reason string) {
+	if out == nil || reason == "" {
+		return
+	}
+	out.Warnings = append(
+		out.Warnings,
+		fmt.Sprintf(warnOutputsSaveSkippedTmpl, reason),
+	)
+}
+
 const warnOmitInlineNoFallback = "omit_inline_content requested but " +
 	"invocation is missing; returning inline output_files"
 
@@ -1400,6 +2394,165 @@ func applyOmitInlineContent(
 func hasOmitInlineFallback(ctx context.Context) bool {
 	inv, ok := agent.InvocationFromContext(ctx)
 	return ok && inv != nil
+}
+
+func skillRunOutputSchema() *tool.Schema {
+	return &tool.Schema{
+		Type: "object",
+		Description: "Structured result of skill_run. " +
+			"Important: the tool can return this object even when the " +
+			"command fails; treat exit_code != 0 or timed_out == true as " +
+			"primary failure signals, and inspect stderr/warnings for " +
+			"diagnostics. " +
+			"Tool-level failures (invalid args, missing skill_load, " +
+			"workspace setup errors) return an error instead of this object.",
+		Required: []string{
+			"output_files",
+			"stdout",
+			"stderr",
+			"exit_code",
+			"timed_out",
+			"duration_ms",
+		},
+		Properties: map[string]*tool.Schema{
+			"staged_inputs": {
+				Type: "array",
+				Description: "Inputs staged into the workspace " +
+					"(e.g. user uploads or declarative inputs). " +
+					"Paths are workspace-relative and typically " +
+					"live under work/inputs/.",
+				Items: stagedInputSchema(),
+			},
+			"output_files": {
+				Type: "array",
+				Description: "Collected output files. " +
+					"Text files may be inlined via content. " +
+					"Binary outputs omit inline content and " +
+					"should be accessed via ref (workspace://...).",
+				Items: runFileSchema("Output file"),
+			},
+			"primary_output": runFileSchema(
+				"Convenience: best small text output file (if any)",
+			),
+			"stdout": {
+				Type:        "string",
+				Description: "Standard output (may be truncated; see warnings)",
+			},
+			"stderr": {
+				Type: "string",
+				Description: "Standard error (may be truncated; see warnings). " +
+					"Non-empty stderr often indicates the command failed, " +
+					"but some commands may write warnings there even when " +
+					"exit_code == 0.",
+			},
+			"exit_code": {
+				Type: "integer",
+				Description: "Process exit code. " +
+					"0 typically means success; non-zero indicates failure.",
+			},
+			"timed_out": {
+				Type:        "boolean",
+				Description: "True if the command timed out",
+			},
+			"duration_ms": {
+				Type:        "integer",
+				Description: "Execution duration in milliseconds",
+			},
+			"artifact_files": {
+				Type: "array",
+				Description: "Artifact references for saved outputs when " +
+					"save_as_artifacts or outputs.save is enabled and the " +
+					"Artifact service is configured.",
+				Items: artifactRefSchema(),
+			},
+			"warnings": {
+				Type:        "array",
+				Items:       &tool.Schema{Type: "string"},
+				Description: "Non-fatal warnings/hints about truncation or persistence",
+			},
+		},
+	}
+}
+
+func stagedInputSchema() *tool.Schema {
+	return &tool.Schema{
+		Type:     "object",
+		Required: []string{"name"},
+		Properties: map[string]*tool.Schema{
+			"name": {
+				Type:        "string",
+				Description: "Workspace-relative path where the input was staged",
+			},
+			"original_name": {
+				Type:        "string",
+				Description: "Original filename (if available)",
+			},
+			"mime_type": {
+				Type:        "string",
+				Description: "Detected MIME type (if available)",
+			},
+			"size_bytes": {
+				Type:        "integer",
+				Description: "Size in bytes (if available)",
+			},
+		},
+	}
+}
+
+func runFileSchema(desc string) *tool.Schema {
+	if desc == "" {
+		desc = "File"
+	}
+	return &tool.Schema{
+		Type:        "object",
+		Description: desc,
+		Required:    []string{"name", "mime_type"},
+		Properties: map[string]*tool.Schema{
+			"name": {
+				Type:        "string",
+				Description: "Workspace-relative path",
+			},
+			"content": {
+				Type: "string",
+				Description: "Inline content for small text outputs. " +
+					"Omitted/empty for binary outputs or when omit_inline_content is true.",
+			},
+			"mime_type": {
+				Type:        "string",
+				Description: "Detected MIME type",
+			},
+			"size_bytes": {
+				Type:        "integer",
+				Description: "File size in bytes (may be omitted)",
+			},
+			"truncated": {
+				Type:        "boolean",
+				Description: "True if content was truncated to configured limits",
+			},
+			"ref": {
+				Type: "string",
+				Description: "Stable reference to the file in the workspace " +
+					"(workspace://...). Use this when passing a file to other tools.",
+			},
+		},
+	}
+}
+
+func artifactRefSchema() *tool.Schema {
+	return &tool.Schema{
+		Type:     "object",
+		Required: []string{"name", "version"},
+		Properties: map[string]*tool.Schema{
+			"name": {
+				Type:        "string",
+				Description: "Artifact name",
+			},
+			"version": {
+				Type:        "integer",
+				Description: "Artifact version",
+			},
+		},
+	}
 }
 
 func inputSpecsSchema() *tool.Schema {

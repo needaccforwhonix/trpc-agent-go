@@ -19,6 +19,8 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
+	"trpc.group/trpc-go/trpc-agent-go/internal/errorcontent"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/messageorigin"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
@@ -59,6 +61,291 @@ func TestProcessRequest_IgnoresRunOptionsMessages_UsesSessionOnly(t *testing.T) 
 	require.True(t, model.MessagesEqual(model.NewAssistantMessage("latest from session"), req.Messages[2]))
 }
 
+func TestProcessRequest_MergesNonTerminalAssistantTextIntoFollowingToolCall(t *testing.T) {
+	const (
+		requestID    = "request-1"
+		invocationID = "invocation-1"
+		agentName    = "test-agent"
+		toolCallID   = "call-1"
+	)
+	newEvent := func(responseID string, msg model.Message) event.Event {
+		return event.Event{
+			ID:           responseID + "-event",
+			RequestID:    requestID,
+			InvocationID: invocationID,
+			Author:       agentName,
+			Response: &model.Response{
+				ID:      responseID,
+				Object:  model.ObjectTypeChatCompletion,
+				Done:    false,
+				Choices: []model.Choice{{Message: msg}},
+			},
+		}
+	}
+	userMessage := model.NewUserMessage("hello")
+	userEvent := newSessionEvent("user", userMessage)
+	userEvent.RequestID = requestID
+	userEvent.InvocationID = invocationID
+	sess := &session.Session{Events: []event.Event{
+		userEvent,
+		newEvent("stream-response-id", model.NewAssistantMessage("hello world")),
+		newEvent("tool-call-response-id", model.Message{
+			Role: model.RoleAssistant,
+			ToolCalls: []model.ToolCall{{
+				ID: toolCallID,
+				Function: model.FunctionDefinitionParam{
+					Name:      "test_tool",
+					Arguments: []byte(`{}`),
+				},
+			}},
+		}),
+		newEvent("tool-result-response-id", model.Message{
+			Role:    model.RoleTool,
+			ToolID:  toolCallID,
+			Content: "result",
+		}),
+	}}
+	inv := &agent.Invocation{
+		InvocationID: invocationID,
+		AgentName:    agentName,
+		Session:      sess,
+		Message:      userMessage,
+		RunOptions:   agent.RunOptions{RequestID: requestID},
+	}
+	req := &model.Request{}
+	var projectedAssistantResponseIDs []string
+	processor := NewContentRequestProcessor(
+		WithEventMessageProjector(func(
+			_ *agent.Invocation,
+			evt event.Event,
+			msg model.Message,
+		) model.Message {
+			if msg.Role == model.RoleAssistant {
+				projectedAssistantResponseIDs = append(
+					projectedAssistantResponseIDs,
+					evt.Response.ID,
+				)
+			}
+			return msg
+		}),
+	)
+
+	processor.ProcessRequest(
+		context.Background(),
+		inv,
+		req,
+		nil,
+	)
+
+	require.Len(t, req.Messages, 3)
+	require.Equal(t, model.RoleUser, req.Messages[0].Role)
+	require.Equal(t, model.RoleAssistant, req.Messages[1].Role)
+	require.Equal(t, "hello world", req.Messages[1].Content)
+	require.Len(t, req.Messages[1].ToolCalls, 1)
+	require.Equal(t, toolCallID, req.Messages[1].ToolCalls[0].ID)
+	require.Equal(t, model.RoleTool, req.Messages[2].Role)
+	require.Equal(t, "result", req.Messages[2].Content)
+
+	require.Len(t, sess.Events, 4)
+	require.Equal(t, "stream-response-id", sess.Events[1].Response.ID)
+	require.Equal(t, "hello world", sess.Events[1].Choices[0].Message.Content)
+	require.Equal(t, "tool-call-response-id", sess.Events[2].Response.ID)
+	require.Empty(t, sess.Events[2].Choices[0].Message.Content)
+	require.Len(t, sess.Events[2].Choices[0].Message.ToolCalls, 1)
+	require.Equal(t, []string{
+		"stream-response-id",
+		"tool-call-response-id",
+	}, projectedAssistantResponseIDs)
+}
+
+func TestProjectCurrentInvocationMessages_NormalizesAssistantToolTurnAfterProjection(t *testing.T) {
+	const (
+		requestID    = "request-1"
+		invocationID = "invocation-1"
+	)
+	newEvent := func(eventID, responseID string, msg model.Message) event.Event {
+		return event.Event{
+			ID:           eventID,
+			RequestID:    requestID,
+			InvocationID: invocationID,
+			Author:       "test-agent",
+			Response: &model.Response{
+				ID:      responseID,
+				Object:  model.ObjectTypeChatCompletion,
+				Choices: []model.Choice{{Message: msg}},
+			},
+		}
+	}
+	events := []event.Event{
+		newEvent("text-event", "text-response", model.NewAssistantMessage("hello world")),
+		newEvent("tool-call-event", "tool-call-response", model.Message{
+			Role: model.RoleAssistant,
+			ToolCalls: []model.ToolCall{{
+				ID: "call-1",
+				Function: model.FunctionDefinitionParam{
+					Name:      "lookup",
+					Arguments: []byte(`{}`),
+				},
+			}},
+		}),
+	}
+	inv := &agent.Invocation{
+		InvocationID: invocationID,
+		AgentName:    "test-agent",
+		RunOptions:   agent.RunOptions{RequestID: requestID},
+	}
+
+	t.Run("merges current invocation events", func(t *testing.T) {
+		inv.Session = &session.Session{Events: events}
+		messages := NewContentRequestProcessor().getCurrentInvocationMessages(inv)
+
+		require.Len(t, messages, 1)
+		require.Equal(t, "hello world", messages[0].Content)
+		require.Len(t, messages[0].ToolCalls, 1)
+	})
+
+	t.Run("appends tool call text verbatim", func(t *testing.T) {
+		eventsWithToolText := []event.Event{
+			cloneEventForContentSnapshot(events[0]),
+			cloneEventForContentSnapshot(events[1]),
+		}
+		eventsWithToolText[1].Choices[0].Message.Content = " checking"
+
+		inv.Session = &session.Session{Events: eventsWithToolText}
+		messages := NewContentRequestProcessor().getCurrentInvocationMessages(inv)
+
+		require.Len(t, messages, 1)
+		require.Equal(t, "hello world checking", messages[0].Content)
+		require.Len(t, messages[0].ToolCalls, 1)
+	})
+
+	t.Run("refuses unsafe projector output", func(t *testing.T) {
+		processor := NewContentRequestProcessor(
+			WithEventMessageProjector(func(
+				_ *agent.Invocation,
+				evt event.Event,
+				msg model.Message,
+			) model.Message {
+				if evt.ID == "text-event" {
+					msg.ReasoningSignature = "signature"
+				}
+				return msg
+			}),
+		)
+
+		inv.Session = &session.Session{Events: events}
+		messages := processor.getCurrentInvocationMessages(inv)
+
+		require.Len(t, messages, 2)
+		require.Equal(t, "signature", messages[0].ReasoningSignature)
+		require.Len(t, messages[1].ToolCalls, 1)
+	})
+}
+
+func TestNonTerminalAssistantToolCallPairs_PreservesBoundaries(t *testing.T) {
+	newEvents := func() []event.Event {
+		return []event.Event{
+			{
+				ID:        "text-event",
+				RequestID: "request-1", InvocationID: "invocation-1", Author: "agent",
+				Response: &model.Response{ID: "text-response", Choices: []model.Choice{{
+					Message: model.NewAssistantMessage("text"),
+				}}},
+			},
+			{
+				ID:        "tool-call-event",
+				RequestID: "request-1", InvocationID: "invocation-1", Author: "agent",
+				Response: &model.Response{ID: "tool-call-response", Choices: []model.Choice{{Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{{
+						ID: "call-1",
+						Function: model.FunctionDefinitionParam{
+							Name:      "test_tool",
+							Arguments: []byte(`{}`),
+						},
+					}},
+				}}}},
+			},
+		}
+	}
+	partText := "part"
+	toolCallIndex := 0
+	tests := []struct {
+		name   string
+		mutate func([]event.Event)
+		mark   func(*agent.Invocation)
+	}{
+		{name: "completed text", mutate: func(events []event.Event) {
+			events[0].Done = true
+		}},
+		{name: "completed tool call", mutate: func(events []event.Event) {
+			events[1].Done = true
+		}},
+		{name: "different request", mutate: func(events []event.Event) {
+			events[1].RequestID = "request-2"
+		}},
+		{name: "different invocation", mutate: func(events []event.Event) {
+			events[1].InvocationID = "invocation-2"
+		}},
+		{name: "missing request", mutate: func(events []event.Event) {
+			events[0].RequestID = ""
+		}},
+		{name: "missing invocation", mutate: func(events []event.Event) {
+			events[0].InvocationID = ""
+		}},
+		{name: "missing event ID", mutate: func(events []event.Event) {
+			events[0].ID = ""
+		}},
+		{name: "missing response ID", mutate: func(events []event.Event) {
+			events[0].Response.ID = ""
+		}},
+		{name: "signed text", mutate: func(events []event.Event) {
+			events[0].Choices[0].Message.ReasoningSignature = "signature"
+		}},
+		{name: "signed tool call", mutate: func(events []event.Event) {
+			events[1].Choices[0].Message.ReasoningSignature = "signature"
+		}},
+		{name: "multimodal tool call", mutate: func(events []event.Event) {
+			events[1].Choices[0].Message.ContentParts = []model.ContentPart{{
+				Type: model.ContentTypeText,
+				Text: &partText,
+			}}
+		}},
+		{name: "provider-specific tool call", mutate: func(events []event.Event) {
+			events[1].Choices[0].Message.ToolCalls[0].ExtraFields = map[string]any{
+				"thought_signature": "signature",
+			}
+		}},
+		{name: "streaming tool call", mutate: func(events []event.Event) {
+			events[1].Choices[0].Message.ToolCalls[0].Index = &toolCallIndex
+		}},
+		{name: "different seed origin", mutate: func([]event.Event) {}, mark: func(inv *agent.Invocation) {
+			messageorigin.MarkSeedHistory(inv, "text-event")
+		}},
+		{name: "different current turn origin", mutate: func([]event.Event) {}, mark: func(inv *agent.Invocation) {
+			messageorigin.MarkCurrentTurn(inv, "text-event")
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := newEvents()
+			tt.mutate(events)
+			inv := &agent.Invocation{}
+			if tt.mark != nil {
+				tt.mark(inv)
+			}
+
+			result := nonTerminalAssistantToolCallPairs(
+				inv,
+				events,
+			)
+
+			require.Empty(t, result)
+		})
+	}
+}
+
 func TestProcessRequest_FiltersEmptyAssistantMessages(t *testing.T) {
 	sess := &session.Session{}
 	sess.Events = append(sess.Events,
@@ -87,6 +374,297 @@ func TestProcessRequest_FiltersEmptyAssistantMessages(t *testing.T) {
 	require.Len(t, req.Messages, 2)
 	require.True(t, model.MessagesEqual(model.NewUserMessage("hello"), req.Messages[0]))
 	require.True(t, model.MessagesEqual(model.NewAssistantMessage("hi"), req.Messages[1]))
+}
+
+func TestProcessRequest_OmitsSyntheticErrorContent(t *testing.T) {
+	newErrorEvent := func(content string, mark bool) event.Event {
+		evt := event.NewErrorEvent("inv", "test-agent", "flow_error", "boom")
+		evt.Response.Choices = []model.Choice{{
+			Message: model.NewAssistantMessage(content),
+		}}
+		if mark {
+			errorcontent.MarkSynthetic(evt)
+		}
+		return *evt
+	}
+	newLegacyErrorEvent := func() event.Event {
+		evt := newErrorEvent(errorcontent.FallbackMessage, false)
+		reason := "error"
+		evt.Response.Choices[0].FinishReason = &reason
+		return evt
+	}
+	newRealMatchingErrorEvent := func() event.Event {
+		evt := newErrorEvent(errorcontent.FallbackMessage, false)
+		reason := "stop"
+		evt.Response.Choices[0].FinishReason = &reason
+		return evt
+	}
+	tests := []struct {
+		name      string
+		error     event.Event
+		options   []ContentOption
+		wantRoles []model.Role
+		wantText  []string
+	}{
+		{
+			name:  "marked runner fallback",
+			error: newErrorEvent(errorcontent.FallbackMessage, true),
+			wantRoles: []model.Role{
+				model.RoleUser,
+			},
+			wantText: []string{"first\n\nsecond"},
+		},
+		{
+			name:  "marked customized plugin content",
+			error: newErrorEvent("Please try again later.", true),
+			wantRoles: []model.Role{
+				model.RoleUser,
+			},
+			wantText: []string{"first\n\nsecond"},
+		},
+		{
+			name:  "legacy runner fallback",
+			error: newLegacyErrorEvent(),
+			wantRoles: []model.Role{
+				model.RoleUser,
+			},
+			wantText: []string{"first\n\nsecond"},
+		},
+		{
+			name:  "explicit compatibility mode",
+			error: newErrorEvent(errorcontent.FallbackMessage, true),
+			options: []ContentOption{
+				WithIncludeSyntheticErrorMessages(true),
+			},
+			wantRoles: []model.Role{
+				model.RoleUser,
+				model.RoleAssistant,
+				model.RoleUser,
+			},
+			wantText: []string{
+				"first",
+				errorcontent.FallbackMessage,
+				"second",
+			},
+		},
+		{
+			name:  "real response matching fallback text",
+			error: newRealMatchingErrorEvent(),
+			wantRoles: []model.Role{
+				model.RoleUser,
+				model.RoleAssistant,
+				model.RoleUser,
+			},
+			wantText: []string{
+				"first",
+				errorcontent.FallbackMessage,
+				"second",
+			},
+		},
+		{
+			name:  "real assistant error content",
+			error: newErrorEvent("A real partial response.", false),
+			wantRoles: []model.Role{
+				model.RoleUser,
+				model.RoleAssistant,
+				model.RoleUser,
+			},
+			wantText: []string{
+				"first",
+				"A real partial response.",
+				"second",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &session.Session{Events: []event.Event{
+				newSessionEvent("user", model.NewUserMessage("first")),
+				tt.error,
+				newSessionEvent("user", model.NewUserMessage("second")),
+			}}
+			inv := &agent.Invocation{
+				AgentName: "test-agent",
+				Session:   sess,
+			}
+			req := &model.Request{}
+
+			NewContentRequestProcessor(tt.options...).ProcessRequest(
+				context.Background(),
+				inv,
+				req,
+				nil,
+			)
+
+			require.Len(t, req.Messages, len(tt.wantRoles))
+			for i := range tt.wantRoles {
+				require.Equal(t, tt.wantRoles[i], req.Messages[i].Role)
+				require.Equal(t, tt.wantText[i], req.Messages[i].Content)
+			}
+		})
+	}
+}
+
+func TestProcessRequest_OmitsSyntheticErrorContent_PreservesUserParts(t *testing.T) {
+	firstText := "first part"
+	secondText := "second part"
+	first := model.NewUserMessage("first")
+	first.ContentParts = []model.ContentPart{{
+		Type: model.ContentTypeText,
+		Text: &firstText,
+	}}
+	second := model.NewUserMessage("second")
+	second.ContentParts = []model.ContentPart{{
+		Type: model.ContentTypeText,
+		Text: &secondText,
+	}}
+	errorEvent := event.NewErrorEvent(
+		"inv",
+		"test-agent",
+		"flow_error",
+		"boom",
+	)
+	errorEvent.Response.Choices = []model.Choice{{
+		Message: model.NewAssistantMessage(errorcontent.FallbackMessage),
+	}}
+	errorcontent.MarkSynthetic(errorEvent)
+	sess := &session.Session{Events: []event.Event{
+		newSessionEvent("user", first),
+		*errorEvent,
+		newSessionEvent("user", second),
+	}}
+	inv := &agent.Invocation{AgentName: "test-agent", Session: sess}
+	req := &model.Request{}
+
+	NewContentRequestProcessor().ProcessRequest(
+		context.Background(),
+		inv,
+		req,
+		nil,
+	)
+
+	require.Len(t, req.Messages, 1)
+	require.Equal(t, "first\n\nsecond", req.Messages[0].Content)
+	require.Len(t, req.Messages[0].ContentParts, 2)
+	require.Equal(t, firstText, *req.Messages[0].ContentParts[0].Text)
+	require.Equal(t, secondText, *req.Messages[0].ContentParts[1].Text)
+}
+
+func TestProcessRequest_OmitsSyntheticErrorAcrossEmptyProjection(t *testing.T) {
+	const invocationID = "inv-synthetic-error"
+	first := newSessionEvent("user", model.NewUserMessage("first"))
+	first.InvocationID = invocationID
+	errorEvent := event.NewErrorEvent(
+		invocationID,
+		"test-agent",
+		"flow_error",
+		"boom",
+	)
+	errorEvent.Response.Choices = []model.Choice{{
+		Message: model.NewAssistantMessage(errorcontent.FallbackMessage),
+	}}
+	errorcontent.MarkSynthetic(errorEvent)
+	dropped := newSessionEvent(
+		"test-agent",
+		model.NewAssistantMessage("drop me"),
+	)
+	dropped.InvocationID = invocationID
+	second := newSessionEvent("user", model.NewUserMessage("second"))
+	second.InvocationID = invocationID
+
+	tests := []struct {
+		name         string
+		runtimeState map[string]any
+	}{
+		{name: "all history"},
+		{
+			name: "current invocation",
+			runtimeState: map[string]any{
+				graph.CfgKeyIncludeContents: "none",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := &session.Session{Events: []event.Event{
+				first,
+				*errorEvent,
+				dropped,
+				second,
+			}}
+			inv := &agent.Invocation{
+				InvocationID: invocationID,
+				AgentName:    "test-agent",
+				Session:      sess,
+				RunOptions: agent.RunOptions{
+					RuntimeState: tt.runtimeState,
+				},
+			}
+			req := &model.Request{}
+
+			NewContentRequestProcessor(
+				WithEventMessageProjector(func(
+					_ *agent.Invocation,
+					_ event.Event,
+					msg model.Message,
+				) model.Message {
+					if msg.Content == "drop me" {
+						msg.Content = ""
+					}
+					return msg
+				}),
+			).ProcessRequest(context.Background(), inv, req, nil)
+
+			require.Len(t, req.Messages, 1)
+			require.Equal(t, model.RoleUser, req.Messages[0].Role)
+			require.Equal(t, "first\n\nsecond", req.Messages[0].Content)
+		})
+	}
+}
+
+func TestProcessRequest_IncludeContentsNone_OmitsSyntheticErrorContent(t *testing.T) {
+	const invocationID = "inv-synthetic-error"
+	first := newSessionEvent("user", model.NewUserMessage("first"))
+	first.InvocationID = invocationID
+	errorEvent := event.NewErrorEvent(
+		invocationID,
+		"test-agent",
+		"flow_error",
+		"boom",
+	)
+	errorEvent.Response.Choices = []model.Choice{{
+		Message: model.NewAssistantMessage(errorcontent.FallbackMessage),
+	}}
+	errorcontent.MarkSynthetic(errorEvent)
+	second := newSessionEvent("user", model.NewUserMessage("second"))
+	second.InvocationID = invocationID
+	sess := &session.Session{Events: []event.Event{
+		first,
+		*errorEvent,
+		second,
+	}}
+	inv := &agent.Invocation{
+		InvocationID: invocationID,
+		AgentName:    "test-agent",
+		Session:      sess,
+		RunOptions: agent.RunOptions{RuntimeState: map[string]any{
+			graph.CfgKeyIncludeContents: "none",
+		}},
+	}
+	req := &model.Request{}
+
+	NewContentRequestProcessor().ProcessRequest(
+		context.Background(),
+		inv,
+		req,
+		nil,
+	)
+
+	require.Len(t, req.Messages, 1)
+	require.Equal(t, model.RoleUser, req.Messages[0].Role)
+	require.Equal(t, "first\n\nsecond", req.Messages[0].Content)
 }
 
 func TestProcessRequest_FiltersEmptyAssistantMessages_ToolCallResponse(t *testing.T) {
@@ -283,6 +861,176 @@ func TestProcessRequest_InsertsInjectedContextMessages_BeforeSessionHistory(t *t
 	require.True(t, model.MessagesEqual(model.NewUserMessage("hello"), req.Messages[3]))
 	require.True(t, model.MessagesEqual(model.NewAssistantMessage("hi"), req.Messages[4]))
 	require.True(t, model.MessagesEqual(model.NewUserMessage("current"), req.Messages[5]))
+}
+
+func TestProcessRequest_InsertsLateContextMessages_BeforeLatestUserMessage(t *testing.T) {
+	lateContext := []model.Message{
+		model.NewUserMessage("late rules"),
+		model.NewUserMessage("late background"),
+	}
+
+	sess := &session.Session{}
+	sess.Events = append(sess.Events,
+		newSessionEvent("user", model.NewUserMessage("hello")),
+		newSessionEvent("test-agent", model.NewAssistantMessage("hi")),
+	)
+
+	inv := &agent.Invocation{
+		InvocationID: "inv-late-context",
+		AgentName:    "test-agent",
+		Session:      sess,
+		Message:      model.NewUserMessage("current"),
+		RunOptions: agent.RunOptions{
+			LateContextMessages: lateContext,
+		},
+	}
+
+	req := &model.Request{
+		Messages: []model.Message{model.NewSystemMessage("agent system prompt")},
+	}
+	p := NewContentRequestProcessor()
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	require.Len(t, req.Messages, 1+2+len(lateContext)+1)
+	require.True(t, model.MessagesEqual(model.NewSystemMessage("agent system prompt"), req.Messages[0]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("hello"), req.Messages[1]))
+	require.True(t, model.MessagesEqual(model.NewAssistantMessage("hi"), req.Messages[2]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("late rules"), req.Messages[3]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("late background"), req.Messages[4]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("current"), req.Messages[5]))
+}
+
+func TestProcessRequest_InsertsLateContextMessages_AfterLeadingSystemWhenNoUser(t *testing.T) {
+	lateContext := []model.Message{
+		model.NewUserMessage("late rules"),
+	}
+
+	inv := &agent.Invocation{
+		InvocationID: "inv-late-no-user",
+		AgentName:    "test-agent",
+		RunOptions: agent.RunOptions{
+			LateContextMessages: lateContext,
+		},
+	}
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("agent system prompt"),
+			model.NewAssistantMessage("assistant tail"),
+		},
+	}
+	p := NewContentRequestProcessor()
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	require.Len(t, req.Messages, 3)
+	require.True(t, model.MessagesEqual(model.NewSystemMessage("agent system prompt"), req.Messages[0]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("late rules"), req.Messages[1]))
+	require.True(t, model.MessagesEqual(model.NewAssistantMessage("assistant tail"), req.Messages[2]))
+}
+
+func TestProcessRequest_InsertsLateContextMessages_KeepsToolTailAfterUserTurn(t *testing.T) {
+	lateContext := []model.Message{
+		model.NewUserMessage("late rules"),
+		model.NewUserMessage("late background"),
+	}
+
+	toolCallMsg := model.Message{
+		Role: model.RoleAssistant,
+		ToolCalls: []model.ToolCall{
+			{
+				Type: "function",
+				ID:   "call_1",
+				Function: model.FunctionDefinitionParam{
+					Name:      "get_user_phone",
+					Arguments: []byte(`{"purpose":"test"}`),
+				},
+			},
+		},
+	}
+	toolResultMsg := model.NewToolMessage("call_1", "get_user_phone", `{"status":"ok"}`)
+
+	sess := &session.Session{}
+	sess.Events = append(sess.Events,
+		newSessionEvent("user", model.NewUserMessage("hello")),
+		newSessionEvent("test-agent", model.NewAssistantMessage("hi")),
+		newSessionEvent("user", model.NewUserMessage("current")),
+		newSessionEvent("test-agent", toolCallMsg),
+		newSessionEvent("test-agent", toolResultMsg),
+	)
+
+	inv := &agent.Invocation{
+		InvocationID: "inv-late-tool-tail",
+		AgentName:    "test-agent",
+		Session:      sess,
+		Message:      model.NewUserMessage("current"),
+		RunOptions: agent.RunOptions{
+			LateContextMessages: lateContext,
+		},
+	}
+
+	req := &model.Request{
+		Messages: []model.Message{model.NewSystemMessage("agent system prompt")},
+	}
+	p := NewContentRequestProcessor()
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	require.Len(t, req.Messages, 8)
+	require.True(t, model.MessagesEqual(model.NewSystemMessage("agent system prompt"), req.Messages[0]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("hello"), req.Messages[1]))
+	require.True(t, model.MessagesEqual(model.NewAssistantMessage("hi"), req.Messages[2]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("late rules"), req.Messages[3]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("late background"), req.Messages[4]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("current"), req.Messages[5]))
+	require.True(t, model.MessagesEqual(toolCallMsg, req.Messages[6]))
+	require.True(t, model.MessagesEqual(toolResultMsg, req.Messages[7]))
+}
+
+func TestProcessRequest_InsertsInjectedAndLateContextMessages_InOrder(t *testing.T) {
+	injectedContext := []model.Message{
+		model.NewSystemMessage("ctx system"),
+		model.NewUserMessage("ctx user"),
+	}
+	lateContext := []model.Message{
+		model.NewUserMessage("late rules"),
+	}
+
+	sess := &session.Session{}
+	sess.Events = append(sess.Events,
+		newSessionEvent("user", model.NewUserMessage("hello")),
+		newSessionEvent("test-agent", model.NewAssistantMessage("hi")),
+	)
+
+	inv := &agent.Invocation{
+		InvocationID: "inv-injected-and-late",
+		AgentName:    "test-agent",
+		Session:      sess,
+		Message:      model.NewUserMessage("current"),
+		RunOptions: agent.RunOptions{
+			InjectedContextMessages: injectedContext,
+			LateContextMessages:     lateContext,
+		},
+	}
+
+	req := &model.Request{
+		Messages: []model.Message{model.NewSystemMessage("agent system prompt")},
+	}
+	p := NewContentRequestProcessor()
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	require.Len(t, req.Messages, 1+len(injectedContext)+2+len(lateContext)+1)
+	require.True(t, model.MessagesEqual(model.NewSystemMessage("agent system prompt"), req.Messages[0]))
+
+	// Injected context is inserted early, before session history.
+	require.True(t, model.MessagesEqual(model.NewSystemMessage("ctx system"), req.Messages[1]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("ctx user"), req.Messages[2]))
+
+	// Session history stays canonical.
+	require.True(t, model.MessagesEqual(model.NewUserMessage("hello"), req.Messages[3]))
+	require.True(t, model.MessagesEqual(model.NewAssistantMessage("hi"), req.Messages[4]))
+
+	// Late context is inserted right before the latest user message.
+	require.True(t, model.MessagesEqual(model.NewUserMessage("late rules"), req.Messages[5]))
+	require.True(t, model.MessagesEqual(model.NewUserMessage("current"), req.Messages[6]))
 }
 
 func TestProcessRequest_NoDuplicateInvocationToolMessage(t *testing.T) {
@@ -520,6 +1268,136 @@ func TestProcessRequest_CrossBranch_RewritesToUser(t *testing.T) {
 	require.Contains(t, req.Messages[0].Content, "For context")
 }
 
+func TestProcessRequest_PreserveForeignMessagesKeepsOriginalTranscript(t *testing.T) {
+	inv := agent.NewInvocation(
+		agent.WithInvocationSession(&session.Session{}),
+		agent.WithInvocationMessage(model.NewUserMessage("ask")),
+		agent.WithInvocationEventFilterKey("graph-agent"),
+	)
+	inv.AgentName = "graph-agent"
+	inv.Branch = "graph-agent"
+
+	toolCallID := "call_select"
+	sess := &session.Session{}
+	sess.Events = append(sess.Events,
+		newSessionEventWithBranch(
+			"other-agent",
+			"graph-agent",
+			"other-root",
+			model.NewAssistantMessage("我来帮你调用上车点选择工具。"),
+		),
+		newSessionEventWithBranch(
+			"other-agent",
+			"graph-agent",
+			"other-root",
+			model.Message{
+				Role: model.RoleAssistant,
+				ToolCalls: []model.ToolCall{{
+					ID:   toolCallID,
+					Type: "function",
+					Function: model.FunctionDefinitionParam{
+						Name:      "select_get_on_address",
+						Arguments: []byte(`{"title":"请问你要从哪里出发？"}`),
+					},
+				}},
+			},
+		),
+		newSessionEventWithBranch(
+			"other-agent",
+			"graph-agent",
+			"other-root",
+			model.Message{
+				Role:     model.RoleTool,
+				ToolID:   toolCallID,
+				ToolName: "select_get_on_address",
+				Content:  `{"title":"凌波门"}`,
+			},
+		),
+		newSessionEventWithBranch(
+			"other-agent",
+			"graph-agent",
+			"other-root",
+			model.NewAssistantMessage("正在为你搜索武汉大学。"),
+		),
+	)
+	inv.Session = sess
+
+	req := &model.Request{}
+	p := NewContentRequestProcessor(
+		WithPreserveSameBranch(true),
+		WithPreserveForeignMessages(true),
+	)
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	require.Len(t, req.Messages, 5)
+	require.Equal(t, model.RoleAssistant, req.Messages[0].Role)
+	require.Equal(t, "我来帮你调用上车点选择工具。", req.Messages[0].Content)
+	require.Equal(t, model.RoleAssistant, req.Messages[1].Role)
+	require.Len(t, req.Messages[1].ToolCalls, 1)
+	require.Equal(t, "select_get_on_address", req.Messages[1].ToolCalls[0].Function.Name)
+	require.Equal(t, model.RoleTool, req.Messages[2].Role)
+	require.Equal(t, `{"title":"凌波门"}`, req.Messages[2].Content)
+	require.Equal(t, model.RoleAssistant, req.Messages[3].Role)
+	require.Equal(t, "正在为你搜索武汉大学。", req.Messages[3].Content)
+	require.Equal(t, model.RoleUser, req.Messages[4].Role)
+	require.Equal(t, "ask", req.Messages[4].Content)
+}
+
+func TestProcessRequest_ProjectsForeignAssistantEventsBeforeToolTurnMerge(t *testing.T) {
+	const (
+		requestID    = "request-1"
+		invocationID = "invocation-1"
+	)
+	newEvent := func(eventID, responseID string, msg model.Message) event.Event {
+		return event.Event{
+			ID:           eventID,
+			RequestID:    requestID,
+			InvocationID: invocationID,
+			Author:       "other-agent",
+			Response: &model.Response{
+				ID:      responseID,
+				Object:  model.ObjectTypeChatCompletion,
+				Choices: []model.Choice{{Message: msg}},
+			},
+		}
+	}
+	sess := &session.Session{Events: []event.Event{
+		newEvent("text-event", "text-response", model.NewAssistantMessage("preface")),
+		newEvent("tool-call-event", "tool-call-response", model.Message{
+			Role: model.RoleAssistant,
+			ToolCalls: []model.ToolCall{{
+				ID: "call-1",
+				Function: model.FunctionDefinitionParam{
+					Name:      "lookup",
+					Arguments: []byte(`{}`),
+				},
+			}},
+		}),
+	}}
+	inv := &agent.Invocation{
+		InvocationID: invocationID,
+		AgentName:    "test-agent",
+		Session:      sess,
+		Message:      model.NewUserMessage("ask"),
+		RunOptions:   agent.RunOptions{RequestID: requestID},
+	}
+	req := &model.Request{}
+
+	NewContentRequestProcessor().ProcessRequest(
+		context.Background(),
+		inv,
+		req,
+		nil,
+	)
+
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, model.NewUserMessage("ask"), req.Messages[0])
+	require.Equal(t, model.RoleUser, req.Messages[1].Role)
+	require.Contains(t, req.Messages[1].Content, "preface")
+	require.Contains(t, req.Messages[1].Content, "lookup")
+	require.Empty(t, req.Messages[1].ToolCalls)
+}
+
 func newSessionEvent(author string, msg model.Message) event.Event {
 	return event.Event{
 		Response: &model.Response{
@@ -532,9 +1410,8 @@ func newSessionEvent(author string, msg model.Message) event.Event {
 	}
 }
 
-// Test that session summary is inserted as a separate system message after the
-// last system message.
-func TestProcessRequest_SessionSummary_InsertAsSeparateSystemMessage(t *testing.T) {
+// Test that session summary is merged into existing system message.
+func TestProcessRequest_SessionSummary_MergesIntoSystemMessage(t *testing.T) {
 	// Create session with summary
 	sess := &session.Session{
 		Summaries: map[string]*session.Summary{
@@ -562,17 +1439,19 @@ func TestProcessRequest_SessionSummary_InsertAsSeparateSystemMessage(t *testing.
 
 	p1 := NewContentRequestProcessor(WithAddSessionSummary(true))
 	p1.ProcessRequest(context.Background(), inv1, req1, nil)
+	raw, ok := inv1.GetState(contentHasSessionSummaryStateKey)
+	require.True(t, ok)
+	require.Equal(t, true, raw)
 
-	// Should have 4 messages: system, summary system, user, current request
-	require.Equal(t, 4, len(req1.Messages))
+	// Should have 3 messages: system (merged), user, current request
+	require.Equal(t, 3, len(req1.Messages))
 	require.Equal(t, model.RoleSystem, req1.Messages[0].Role)
-	require.Equal(t, "existing system prompt", req1.Messages[0].Content)
-	require.Equal(t, model.RoleSystem, req1.Messages[1].Role)
-	require.Equal(t, NewContentRequestProcessor().formatSummary("Session summary content"), req1.Messages[1].Content)
+	require.Contains(t, req1.Messages[0].Content, "existing system prompt")
+	require.Contains(t, req1.Messages[0].Content, "Session summary content")
+	require.Equal(t, model.RoleUser, req1.Messages[1].Role)
+	require.Equal(t, "user question", req1.Messages[1].Content)
 	require.Equal(t, model.RoleUser, req1.Messages[2].Role)
-	require.Equal(t, "user question", req1.Messages[2].Content)
-	require.Equal(t, model.RoleUser, req1.Messages[3].Role)
-	require.Equal(t, "current request", req1.Messages[3].Content)
+	require.Equal(t, "current request", req1.Messages[2].Content)
 
 	// Test case 2: Request has only user message (no system message)
 	req2 := &model.Request{
@@ -590,6 +1469,9 @@ func TestProcessRequest_SessionSummary_InsertAsSeparateSystemMessage(t *testing.
 
 	p2 := NewContentRequestProcessor(WithAddSessionSummary(true))
 	p2.ProcessRequest(context.Background(), inv2, req2, nil)
+	raw, ok = inv2.GetState(contentHasSessionSummaryStateKey)
+	require.True(t, ok)
+	require.Equal(t, true, raw)
 
 	// Should have 3 messages: summary system, user, current request
 	require.Equal(t, 3, len(req2.Messages))
@@ -600,7 +1482,7 @@ func TestProcessRequest_SessionSummary_InsertAsSeparateSystemMessage(t *testing.
 	require.Equal(t, model.RoleUser, req2.Messages[2].Role)
 	require.Equal(t, "current request", req2.Messages[2].Content)
 
-	// Test case 3: Request has multiple system messages
+	// Test case 3: Request has multiple system messages (only first one gets merged)
 	req3 := &model.Request{
 		Messages: []model.Message{
 			model.NewSystemMessage("system 1"),
@@ -618,26 +1500,521 @@ func TestProcessRequest_SessionSummary_InsertAsSeparateSystemMessage(t *testing.
 
 	p3 := NewContentRequestProcessor(WithAddSessionSummary(true))
 	p3.ProcessRequest(context.Background(), inv3, req3, nil)
+	raw, ok = inv3.GetState(contentHasSessionSummaryStateKey)
+	require.True(t, ok)
+	require.Equal(t, true, raw)
 
-	// Should have 5 messages: system1, system2, summary system, user, current
-	// request.
-	require.Equal(t, 5, len(req3.Messages))
+	// Should have 4 messages: system1 (merged with summary), system2, user, current
+	// request. Summary merges into first system message.
+	require.Equal(t, 4, len(req3.Messages))
 	require.Equal(t, model.RoleSystem, req3.Messages[0].Role)
-	require.Equal(t, "system 1", req3.Messages[0].Content)
+	require.Contains(t, req3.Messages[0].Content, "system 1")
+	require.Contains(t, req3.Messages[0].Content, "Session summary content")
 	require.Equal(t, model.RoleSystem, req3.Messages[1].Role)
 	require.Equal(t, "system 2", req3.Messages[1].Content)
-	require.Equal(t, model.RoleSystem, req3.Messages[2].Role)
+	require.Equal(t, model.RoleUser, req3.Messages[2].Role)
+	require.Equal(t, "user question", req3.Messages[2].Content)
+	require.Equal(t, model.RoleUser, req3.Messages[3].Role)
+	require.Equal(t, "current request", req3.Messages[3].Content)
+}
+
+func TestProcessRequest_SessionSummary_ResumesLatestCoveredToolRound(t *testing.T) {
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	userMsg := model.NewUserMessage("run the task")
+	toolCallMsg := model.Message{
+		Role:    model.RoleAssistant,
+		Content: "Starting with step 1.",
+		ToolCalls: []model.ToolCall{{
+			Type: "function",
+			ID:   "call_1",
+			Function: model.FunctionDefinitionParam{
+				Name:      "step_worker",
+				Arguments: []byte(`{"step":1}`),
+			},
+		}},
+	}
+	toolResultMsg := model.Message{
+		Role:     model.RoleTool,
+		ToolID:   "call_1",
+		ToolName: "step_worker",
+		Content:  strings.Repeat("large-result;", 16),
+	}
+	sess := &session.Session{
+		Summaries: map[string]*session.Summary{
+			"test-agent": {
+				Summary:   "step 1 completed successfully",
+				UpdatedAt: baseTime.Add(2 * time.Second),
+				Boundary: session.NewSummaryBoundaryWithEventID(
+					"test-agent",
+					baseTime.Add(2*time.Second),
+					"tool-result-1",
+				),
+			},
+		},
+		Events: []event.Event{
+			{
+				ID:           "user-1",
+				Author:       "user",
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				Timestamp:    baseTime,
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Done:    true,
+					Choices: []model.Choice{{Index: 0, Message: userMsg}},
+				},
+			},
+			{
+				ID:           "tool-call-1",
+				Author:       "test-agent",
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				Timestamp:    baseTime.Add(time.Second),
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Done:    true,
+					Choices: []model.Choice{{Index: 0, Message: toolCallMsg}},
+				},
+			},
+			{
+				ID:           "tool-result-1",
+				Author:       "test-agent",
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				Timestamp:    baseTime.Add(2 * time.Second),
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Done:    true,
+					Object:  model.ObjectTypeToolResponse,
+					Choices: []model.Choice{{Index: 0, Message: toolResultMsg}},
+				},
+			},
+		},
+	}
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationID("inv1"),
+		agent.WithInvocationEventFilterKey("test-agent"),
+		agent.WithInvocationMessage(userMsg),
+		agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+	)
+	inv.AgentName = "test-agent"
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("system prompt"),
+		},
+	}
+	p := NewContentRequestProcessor(
+		WithAddSessionSummary(true),
+		WithEnableContextCompaction(true),
+		WithContextCompactionToolResultMaxTokens(10),
+	)
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	raw, ok := inv.GetState(contentHasCompactedToolResultsStateKey)
+	require.True(t, ok)
+	require.Equal(t, true, raw)
+
+	require.Len(t, req.Messages, 4)
+	require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+	require.Contains(t, req.Messages[0].Content, "system prompt")
+	require.Contains(t, req.Messages[0].Content,
+		"step 1 completed successfully")
+	require.True(t, model.MessagesEqual(userMsg, req.Messages[1]))
+	require.Equal(t, model.RoleAssistant, req.Messages[2].Role)
+	require.Equal(t, "Starting with step 1.", req.Messages[2].Content)
+	require.Len(t, req.Messages[2].ToolCalls, 1)
+	require.Equal(t, "call_1", req.Messages[2].ToolCalls[0].ID)
+	require.JSONEq(t, `{"step":1}`, string(
+		req.Messages[2].ToolCalls[0].Function.Arguments,
+	))
+	require.Equal(t, model.RoleTool, req.Messages[3].Role)
+	require.Equal(t, "call_1", req.Messages[3].ToolID)
+	require.Equal(t, "step_worker", req.Messages[3].ToolName)
+	require.Contains(t, req.Messages[3].Content, compactedToolResultPlaceholder)
+	require.NotContains(t, req.Messages[3].Content, "large-result;")
 	require.Equal(
 		t,
-		NewContentRequestProcessor().formatSummary(
-			"Session summary content",
-		),
-		req3.Messages[2].Content,
+		`{"step":1}`,
+		string(sess.Events[1].Choices[0].Message.ToolCalls[0].Function.Arguments),
+		"resume-tail compaction must not mutate session history",
 	)
-	require.Equal(t, model.RoleUser, req3.Messages[3].Role)
-	require.Equal(t, "user question", req3.Messages[3].Content)
-	require.Equal(t, model.RoleUser, req3.Messages[4].Role)
-	require.Equal(t, "current request", req3.Messages[4].Content)
+}
+
+func TestProcessRequest_SessionSummary_PreservesSmallLatestToolRound(t *testing.T) {
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	userMsg := model.NewUserMessage("run the task")
+	toolCallMsg := model.Message{
+		Role:    model.RoleAssistant,
+		Content: "Starting with step 1.",
+		ToolCalls: []model.ToolCall{{
+			Type: "function",
+			ID:   "call_1",
+			Function: model.FunctionDefinitionParam{
+				Name:      "step_worker",
+				Arguments: []byte(`{"step":1}`),
+			},
+		}},
+	}
+	toolResultMsg := model.Message{
+		Role:     model.RoleTool,
+		ToolID:   "call_1",
+		ToolName: "step_worker",
+		Content:  "small result",
+	}
+	sess := &session.Session{
+		Summaries: map[string]*session.Summary{
+			"test-agent": {
+				Summary:   "step 1 completed successfully",
+				UpdatedAt: baseTime.Add(2 * time.Second),
+				Boundary: session.NewSummaryBoundaryWithEventID(
+					"test-agent",
+					baseTime.Add(2*time.Second),
+					"evt-tool-result",
+				),
+			},
+		},
+		Events: []event.Event{
+			{
+				Author:       "user",
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				Timestamp:    baseTime,
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Done:    true,
+					Choices: []model.Choice{{Index: 0, Message: userMsg}},
+				},
+			},
+			{
+				Author:       "test-agent",
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				Timestamp:    baseTime.Add(time.Second),
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Done:    true,
+					Choices: []model.Choice{{Index: 0, Message: toolCallMsg}},
+				},
+			},
+			{
+				ID:           "evt-tool-result",
+				Author:       "test-agent",
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				Timestamp:    baseTime.Add(2 * time.Second),
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Done:    true,
+					Object:  model.ObjectTypeToolResponse,
+					Choices: []model.Choice{{Index: 0, Message: toolResultMsg}},
+				},
+			},
+		},
+	}
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationID("inv1"),
+		agent.WithInvocationEventFilterKey("test-agent"),
+		agent.WithInvocationMessage(userMsg),
+		agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+	)
+	inv.AgentName = "test-agent"
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("system prompt"),
+		},
+	}
+	p := NewContentRequestProcessor(WithAddSessionSummary(true))
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	raw, ok := inv.GetState(contentHasCompactedToolResultsStateKey)
+	require.False(t, ok)
+	require.Nil(t, raw)
+
+	require.Len(t, req.Messages, 4)
+	require.True(t, model.MessagesEqual(userMsg, req.Messages[1]))
+	require.Equal(t, toolCallMsg.ToolCalls, req.Messages[2].ToolCalls)
+	require.Equal(t, model.RoleTool, req.Messages[3].Role)
+	require.Equal(t, "call_1", req.Messages[3].ToolID)
+	require.Equal(t, "step_worker", req.Messages[3].ToolName)
+	require.Equal(t, "small result", req.Messages[3].Content)
+}
+
+func TestContentRequestProcessor_HasCompactedCurrentInvocationToolResults(t *testing.T) {
+	baseTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	since := baseTime.Add(2 * time.Second)
+
+	t.Run("nil invocation", func(t *testing.T) {
+		p := NewContentRequestProcessor()
+		require.False(t, p.hasCompactedCurrentInvocationToolResults(nil, since))
+	})
+
+	t.Run("missing request metadata", func(t *testing.T) {
+		p := NewContentRequestProcessor()
+		inv := &agent.Invocation{
+			Session: &session.Session{},
+		}
+		require.False(t, p.hasCompactedCurrentInvocationToolResults(inv, since))
+	})
+
+	t.Run("ignores non matching and non tool events", func(t *testing.T) {
+		p := NewContentRequestProcessor()
+		inv := agent.NewInvocation(
+			agent.WithInvocationID("inv1"),
+			agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+			agent.WithInvocationSession(&session.Session{
+				Events: []event.Event{
+					{
+						RequestID:    "req2",
+						InvocationID: "inv1",
+						Timestamp:    baseTime,
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.NewToolMessage(
+								"call_1",
+								"worker",
+								"result",
+							)}},
+						},
+					},
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						Timestamp:    baseTime,
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage(
+								"not a tool result",
+							)}},
+						},
+					},
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						Timestamp:    since.Add(time.Second),
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.NewToolMessage(
+								"call_2",
+								"worker",
+								"after cutoff",
+							)}},
+						},
+					},
+				},
+			}),
+		)
+		require.False(t, p.hasCompactedCurrentInvocationToolResults(inv, since))
+	})
+
+	t.Run("respects branch filter", func(t *testing.T) {
+		p := NewContentRequestProcessor(WithBranchFilterMode(BranchFilterModeExact))
+		inv := agent.NewInvocation(
+			agent.WithInvocationID("inv1"),
+			agent.WithInvocationEventFilterKey("wanted"),
+			agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+			agent.WithInvocationSession(&session.Session{
+				Events: []event.Event{
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						FilterKey:    "other",
+						Timestamp:    baseTime,
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.NewToolMessage(
+								"call_1",
+								"worker",
+								"result",
+							)}},
+						},
+					},
+				},
+			}),
+		)
+		require.False(t, p.hasCompactedCurrentInvocationToolResults(inv, since))
+	})
+
+	t.Run("detects compacted tool result", func(t *testing.T) {
+		p := NewContentRequestProcessor(
+			WithEnableContextCompaction(true),
+			WithContextCompactionToolResultMaxTokens(1),
+		)
+		inv := agent.NewInvocation(
+			agent.WithInvocationID("inv1"),
+			agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+			agent.WithInvocationSession(&session.Session{
+				Events: []event.Event{
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						Timestamp:    baseTime,
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.NewToolMessage(
+								"call_1",
+								"worker",
+								"result result",
+							)}},
+						},
+					},
+				},
+			}),
+		)
+		require.True(t, p.hasCompactedCurrentInvocationToolResults(inv, since))
+	})
+
+	t.Run("does not infer missing tool name from branch history", func(t *testing.T) {
+		reusedToolID := "call_reused"
+		toolCallEvent := func(filterKey, toolName string, ts time.Time) event.Event {
+			return event.Event{
+				RequestID:    "req1",
+				InvocationID: "inv1",
+				FilterKey:    filterKey,
+				Timestamp:    ts,
+				Version:      event.CurrentVersion,
+				Response: &model.Response{
+					Done: true,
+					Choices: []model.Choice{{Index: 0, Message: model.Message{
+						Role: model.RoleAssistant,
+						ToolCalls: []model.ToolCall{{
+							ID: reusedToolID,
+							Function: model.FunctionDefinitionParam{
+								Name:      toolName,
+								Arguments: []byte(`{}`),
+							},
+						}},
+					}}},
+				},
+			}
+		}
+		p := NewContentRequestProcessor(
+			WithBranchFilterMode(BranchFilterModeExact),
+			WithEnableContextCompaction(true),
+			WithContextCompactionKeepToolNames("session_load"),
+			WithContextCompactionToolResultMaxTokens(1),
+		)
+		inv := agent.NewInvocation(
+			agent.WithInvocationID("inv1"),
+			agent.WithInvocationEventFilterKey("wanted"),
+			agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+			agent.WithInvocationSession(&session.Session{
+				Events: []event.Event{
+					toolCallEvent("other", "session_load", baseTime),
+					toolCallEvent("wanted", "shell", baseTime.Add(time.Second)),
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						FilterKey:    "wanted",
+						Timestamp:    baseTime.Add(1500 * time.Millisecond),
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.NewToolMessage(
+								reusedToolID,
+								"",
+								"result result",
+							)}},
+						},
+					},
+				},
+			}),
+		)
+
+		require.True(t, p.hasCompactedCurrentInvocationToolResults(inv, since))
+	})
+
+	t.Run("ignores kept tool result", func(t *testing.T) {
+		p := NewContentRequestProcessor(
+			WithEnableContextCompaction(true),
+			WithContextCompactionKeepToolNames("session_load"),
+		)
+		inv := agent.NewInvocation(
+			agent.WithInvocationID("inv1"),
+			agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+			agent.WithInvocationSession(&session.Session{
+				Events: []event.Event{
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						Timestamp:    baseTime,
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.Message{
+								Role: model.RoleAssistant,
+								ToolCalls: []model.ToolCall{{
+									ID: "call_1",
+									Function: model.FunctionDefinitionParam{
+										Name:      "session_load",
+										Arguments: []byte(`{}`),
+									},
+								}},
+							}}},
+						},
+					},
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						Timestamp:    baseTime.Add(time.Second),
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{{Index: 0, Message: model.NewToolMessage(
+								"call_1",
+								"session_load",
+								"kept result",
+							)}},
+						},
+					},
+				},
+			}),
+		)
+		require.False(t, p.hasCompactedCurrentInvocationToolResults(inv, since))
+	})
+
+	t.Run("detects compacted tool result in later choice", func(t *testing.T) {
+		p := NewContentRequestProcessor(
+			WithEnableContextCompaction(true),
+			WithContextCompactionToolResultMaxTokens(1),
+		)
+		inv := agent.NewInvocation(
+			agent.WithInvocationID("inv1"),
+			agent.WithInvocationRunOptions(agent.RunOptions{RequestID: "req1"}),
+			agent.WithInvocationSession(&session.Session{
+				Events: []event.Event{
+					{
+						RequestID:    "req1",
+						InvocationID: "inv1",
+						Timestamp:    baseTime,
+						Version:      event.CurrentVersion,
+						Response: &model.Response{
+							Done: true,
+							Choices: []model.Choice{
+								{Index: 0, Message: model.NewAssistantMessage("progress")},
+								{Index: 1, Message: model.NewToolMessage(
+									"call_1",
+									"worker",
+									"result result",
+								)},
+							},
+						},
+					},
+				},
+			}),
+		)
+		require.True(t, p.hasCompactedCurrentInvocationToolResults(inv, since))
+	})
 }
 
 // Test additional edge cases for session summary insertion.
@@ -666,6 +2043,9 @@ func TestProcessRequest_SessionSummary_EdgeCases(t *testing.T) {
 
 	p1 := NewContentRequestProcessor(WithAddSessionSummary(true))
 	p1.ProcessRequest(context.Background(), inv1, req1, nil)
+	raw, ok := inv1.GetState(contentHasSessionSummaryStateKey)
+	require.True(t, ok)
+	require.Equal(t, true, raw)
 
 	// Should have 2 messages: summary system, current request
 	require.Equal(t, 2, len(req1.Messages))
@@ -690,15 +2070,17 @@ func TestProcessRequest_SessionSummary_EdgeCases(t *testing.T) {
 
 	p2 := NewContentRequestProcessor(WithAddSessionSummary(true))
 	p2.ProcessRequest(context.Background(), inv2, req2, nil)
+	raw, ok = inv2.GetState(contentHasSessionSummaryStateKey)
+	require.True(t, ok)
+	require.Equal(t, true, raw)
 
-	// Should have 3 messages: system, summary system, current request
-	require.Equal(t, 3, len(req2.Messages))
+	// Should have 2 messages: system (merged with summary), current request
+	require.Equal(t, 2, len(req2.Messages))
 	require.Equal(t, model.RoleSystem, req2.Messages[0].Role)
-	require.Equal(t, "system prompt", req2.Messages[0].Content)
-	require.Equal(t, model.RoleSystem, req2.Messages[1].Role)
-	require.Equal(t, NewContentRequestProcessor().formatSummary("Session summary content"), req2.Messages[1].Content)
-	require.Equal(t, model.RoleUser, req2.Messages[2].Role)
-	require.Equal(t, "current request", req2.Messages[2].Content)
+	require.Contains(t, req2.Messages[0].Content, "system prompt")
+	require.Contains(t, req2.Messages[0].Content, "Session summary content")
+	require.Equal(t, model.RoleUser, req2.Messages[1].Role)
+	require.Equal(t, "current request", req2.Messages[1].Content)
 }
 
 func TestContentRequestProcessor_AggregatePrefixSummaries_Sorted(
@@ -735,8 +2117,8 @@ func TestContentRequestProcessor_AggregatePrefixSummaries_Sorted(
 	got, updatedAt := p.aggregatePrefixSummaries(summaries, "app")
 	require.Equal(t, "root\n\na\n\nb", got)
 	require.Equal(t,
-		time.Date(2023, 1, 3, 12, 0, 0, 0, time.UTC),
-		updatedAt,
+		time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC),
+		updatedAt.CutoffTime(),
 	)
 }
 
@@ -821,43 +2203,18 @@ func TestPromptCachePrefixStability_DynamicSystemTail(t *testing.T) {
 	prefixRun1 := firstRunes(render(reqRun1.Messages), cachePrefixRunes)
 	prefixRun2 := firstRunes(render(reqRun2.Messages), cachePrefixRunes)
 
-	// New behavior: summary is appended after all stable system messages, so
-	// the cacheable prefix stays stable across runs.
-	require.Equal(t, prefixRun1, prefixRun2)
-	require.NotContains(t, prefixRun1, summaryRun1)
-	require.NotContains(t, prefixRun2, summaryRun2)
+	// New behavior: summary is merged into the first system message.
+	// This means the first system message's content changes across runs,
+	// so the cacheable prefix does NOT stay stable.
+	// The summary content is merged into sysA, changing its content.
+	require.NotEqual(t, prefixRun1, prefixRun2)
+	// The first message contains both sysA content and the summary.
+	require.Contains(t, reqRun1.Messages[0].Content, summaryRun1)
+	require.Contains(t, reqRun2.Messages[0].Content, summaryRun2)
 
-	legacyMessages := func(summaryText string) []model.Message {
-		msgs := []model.Message{
-			model.NewSystemMessage(sysA),
-			model.NewSystemMessage(sysB),
-			model.NewUserMessage("hi"),
-		}
-		idx := findSystemMessageIndex(msgs)
-		summaryMsg := model.NewSystemMessage(summaryText)
-		if idx < 0 {
-			return append([]model.Message{summaryMsg}, msgs...)
-		}
-		out := append([]model.Message{}, msgs[:idx+1]...)
-		out = append(out, summaryMsg)
-		out = append(out, msgs[idx+1:]...)
-		return out
-	}
-
-	legacyPrefix1 := firstRunes(
-		render(legacyMessages(summaryRun1)),
-		cachePrefixRunes,
-	)
-	legacyPrefix2 := firstRunes(
-		render(legacyMessages(summaryRun2)),
-		cachePrefixRunes,
-	)
-
-	// Old behavior: summary inserted after the first system message, likely
-	// landing in the first ~1024 tokens and invalidating the cache prefix.
-	require.NotEqual(t, legacyPrefix1, legacyPrefix2)
-	require.Contains(t, legacyPrefix1, summaryRun1)
-	require.Contains(t, legacyPrefix2, summaryRun2)
+	// Verify that sysB (second system message) stays stable.
+	require.Equal(t, sysB, reqRun1.Messages[1].Content)
+	require.Equal(t, sysB, reqRun2.Messages[1].Content)
 }
 
 func newSessionEventWithBranch(author, filterKey, branch string, msg model.Message) event.Event {
@@ -873,4 +2230,503 @@ func newSessionEventWithBranch(author, filterKey, branch string, msg model.Messa
 		Branch:    branch,
 		Version:   event.CurrentVersion,
 	}
+}
+
+// Test that session summary is injected as user message when SessionSummaryInjectionUser is used.
+func TestProcessRequest_SessionSummary_UserInjectionMode(t *testing.T) {
+	summaryTime := time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC)
+	sess := &session.Session{
+		Summaries: map[string]*session.Summary{
+			"test-agent": {
+				Summary:   "user mode summary content",
+				UpdatedAt: summaryTime,
+			},
+		},
+	}
+
+	t.Run("no_existing_system_prompt", func(t *testing.T) {
+		inv := agent.NewInvocation(
+			agent.WithInvocationSession(sess),
+			agent.WithInvocationEventFilterKey("test-agent"),
+			agent.WithInvocationMessage(model.NewUserMessage("current request")),
+		)
+		inv.AgentName = "test-agent"
+
+		req := &model.Request{}
+		p := NewContentRequestProcessor(
+			WithAddSessionSummary(true),
+			WithSessionSummaryInjectionMode(SessionSummaryInjectionUser),
+		)
+		p.ProcessRequest(context.Background(), inv, req, nil)
+
+		raw, ok := inv.GetState(contentHasSessionSummaryStateKey)
+		require.True(t, ok)
+		require.Equal(t, true, raw)
+
+		// Should have at least 1 message. No system message should be present.
+		require.GreaterOrEqual(t, len(req.Messages), 1)
+		for _, msg := range req.Messages {
+			require.NotEqual(t, model.RoleSystem, msg.Role,
+				"user injection mode should not produce system messages for summary")
+		}
+		// First message should contain the summary.
+		require.Contains(t, req.Messages[0].Content, "user mode summary content")
+		require.Equal(t, model.RoleUser, req.Messages[0].Role)
+	})
+
+	t.Run("with_existing_system_prompt", func(t *testing.T) {
+		inv := agent.NewInvocation(
+			agent.WithInvocationSession(sess),
+			agent.WithInvocationEventFilterKey("test-agent"),
+			agent.WithInvocationMessage(model.NewUserMessage("current request")),
+		)
+		inv.AgentName = "test-agent"
+
+		req := &model.Request{
+			Messages: []model.Message{
+				model.NewSystemMessage("existing system prompt"),
+			},
+		}
+		p := NewContentRequestProcessor(
+			WithAddSessionSummary(true),
+			WithSessionSummaryInjectionMode(SessionSummaryInjectionUser),
+		)
+		p.ProcessRequest(context.Background(), inv, req, nil)
+
+		// System prompt should remain untouched (summary not merged into it).
+		require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+		require.Equal(t, "existing system prompt", req.Messages[0].Content)
+		// Summary should be a user message after system.
+		found := false
+		for _, msg := range req.Messages {
+			if msg.Role == model.RoleUser && strings.Contains(msg.Content, "user mode summary content") {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "should find summary content in a user message")
+	})
+
+	t.Run("merges_with_first_user_history", func(t *testing.T) {
+		historyTime := summaryTime.Add(time.Second)
+		sessWithHistory := &session.Session{
+			Summaries: map[string]*session.Summary{
+				"test-agent": {
+					Summary:   "summary to merge",
+					UpdatedAt: summaryTime,
+				},
+			},
+			Events: []event.Event{
+				{
+					Response: &model.Response{
+						Choices: []model.Choice{{
+							Message: model.NewUserMessage("hello from history"),
+						}},
+					},
+					Author:    "user",
+					Timestamp: historyTime,
+					FilterKey: "test-agent",
+					Version:   event.CurrentVersion,
+				},
+			},
+		}
+
+		inv := agent.NewInvocation(
+			agent.WithInvocationSession(sessWithHistory),
+			agent.WithInvocationEventFilterKey("test-agent"),
+			agent.WithInvocationMessage(model.NewUserMessage("current request")),
+		)
+		inv.AgentName = "test-agent"
+
+		req := &model.Request{}
+		p := NewContentRequestProcessor(
+			WithAddSessionSummary(true),
+			WithSessionSummaryInjectionMode(SessionSummaryInjectionUser),
+		)
+		p.ProcessRequest(context.Background(), inv, req, nil)
+
+		// The first user message in history should have the summary merged into it.
+		require.GreaterOrEqual(t, len(req.Messages), 1)
+		require.Equal(t, model.RoleUser, req.Messages[0].Role)
+		require.Contains(t, req.Messages[0].Content, "summary to merge",
+			"summary should be merged into first user history message")
+		require.Contains(t, req.Messages[0].Content, "hello from history",
+			"original history content should be preserved")
+	})
+
+	t.Run("system_mode_default_still_works", func(t *testing.T) {
+		inv := agent.NewInvocation(
+			agent.WithInvocationSession(sess),
+			agent.WithInvocationEventFilterKey("test-agent"),
+			agent.WithInvocationMessage(model.NewUserMessage("current request")),
+		)
+		inv.AgentName = "test-agent"
+
+		req := &model.Request{
+			Messages: []model.Message{
+				model.NewSystemMessage("existing system prompt"),
+			},
+		}
+		// Default mode (system) should merge into system message.
+		p := NewContentRequestProcessor(
+			WithAddSessionSummary(true),
+		)
+		p.ProcessRequest(context.Background(), inv, req, nil)
+
+		require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+		require.Contains(t, req.Messages[0].Content, "user mode summary content")
+		require.Contains(t, req.Messages[0].Content, "existing system prompt")
+	})
+}
+
+// Test formatSummaryForUser output.
+func TestFormatSummaryForUser(t *testing.T) {
+	p := NewContentRequestProcessor()
+	result := p.formatSummaryForUser("test summary")
+	require.Contains(t, result, "test summary")
+	require.Contains(t, result, "Context from previous interactions")
+	require.Contains(t, result, "summary_of_previous_interactions")
+}
+
+// Test prependSummaryUserMessage edge cases.
+func TestPrependSummaryUserMessage(t *testing.T) {
+	p := NewContentRequestProcessor()
+
+	t.Run("empty_summary", func(t *testing.T) {
+		msgs := []model.Message{model.NewUserMessage("hello")}
+		result := p.prependSummaryUserMessage("", msgs, nil)
+		require.Equal(t, msgs, result)
+	})
+
+	t.Run("empty_messages", func(t *testing.T) {
+		result := p.prependSummaryUserMessage("some summary", nil, nil)
+		require.Len(t, result, 1)
+		require.Equal(t, model.RoleUser, result[0].Role)
+		require.Contains(t, result[0].Content, "some summary")
+	})
+
+	t.Run("later_user_message_merges", func(t *testing.T) {
+		msgs := []model.Message{
+			model.NewAssistantMessage("hi"),
+			model.NewUserMessage("hello"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, nil)
+		require.Len(t, result, 2)
+		require.Equal(t, model.RoleAssistant, result[0].Role)
+		require.Equal(t, model.RoleUser, result[1].Role)
+		require.Contains(t, result[1].Content, "some summary")
+		require.Contains(t, result[1].Content, "hello")
+	})
+
+	t.Run("first_message_is_user_merges", func(t *testing.T) {
+		msgs := []model.Message{
+			model.NewUserMessage("hello"),
+			model.NewAssistantMessage("hi"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, nil)
+		require.Len(t, result, 2)
+		require.Equal(t, model.RoleUser, result[0].Role)
+		require.Contains(t, result[0].Content, "some summary")
+		require.Contains(t, result[0].Content, "hello")
+		require.Equal(t, model.RoleAssistant, result[1].Role)
+	})
+
+	t.Run("zero_role_history_message_merges_as_user", func(t *testing.T) {
+		msgs := []model.Message{
+			{Content: "zero role current request"},
+			model.NewAssistantMessage("hi"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, nil)
+		require.Len(t, result, 2)
+		require.Equal(t, model.Role(""), result[0].Role)
+		require.Contains(t, result[0].Content, "some summary")
+		require.Contains(t, result[0].Content, "zero role current request")
+		require.Equal(t, model.RoleAssistant, result[1].Role)
+	})
+
+	t.Run("does_not_mutate_original", func(t *testing.T) {
+		original := []model.Message{
+			model.NewUserMessage("original content"),
+		}
+		originalContent := original[0].Content
+		result := p.prependSummaryUserMessage("summary", original, nil)
+		// Original should not be mutated.
+		require.Equal(t, originalContent, original[0].Content)
+		// Result should have merged content.
+		require.Contains(t, result[0].Content, "summary")
+		require.Contains(t, result[0].Content, "original content")
+	})
+
+	t.Run("first_history_user_preferred_over_req_prefix_user", func(t *testing.T) {
+		prefix := []model.Message{
+			model.NewSystemMessage("system prompt"),
+			model.NewUserMessage("few-shot user example"),
+		}
+		msgs := []model.Message{
+			model.NewUserMessage("history user"),
+			model.NewAssistantMessage("history assistant"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, prefix)
+		// Summary should stay attached to the live history user message.
+		require.Equal(t, "few-shot user example", prefix[len(prefix)-1].Content)
+		require.Len(t, result, 2)
+		require.Contains(t, result[0].Content, "some summary")
+		require.Contains(t, result[0].Content, "history user")
+		require.Equal(t, model.RoleAssistant, result[1].Role)
+	})
+
+	t.Run("later_history_user_preferred_over_req_prefix_user", func(t *testing.T) {
+		prefix := []model.Message{
+			model.NewSystemMessage("system prompt"),
+			model.NewUserMessage("few-shot user example"),
+		}
+		msgs := []model.Message{
+			model.NewAssistantMessage("history assistant"),
+			model.NewUserMessage("current user"),
+			model.NewToolMessage("tool-1", "search", "tool result"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, prefix)
+		// Even when history starts with assistant/tool output, the summary
+		// should merge into the first available user message in history/current.
+		require.Equal(t, "few-shot user example", prefix[len(prefix)-1].Content)
+		require.Len(t, result, 3)
+		require.Equal(t, model.RoleAssistant, result[0].Role)
+		require.Contains(t, result[1].Content, "some summary")
+		require.Contains(t, result[1].Content, "current user")
+		require.Equal(t, model.RoleTool, result[2].Role)
+	})
+
+	t.Run("later_empty_history_user_preferred_over_req_prefix_user", func(t *testing.T) {
+		prefix := []model.Message{
+			model.NewSystemMessage("system prompt"),
+			model.NewUserMessage("few-shot user example"),
+		}
+		msgs := []model.Message{
+			model.NewAssistantMessage("history assistant"),
+			{Role: model.RoleUser, Content: ""},
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, prefix)
+		// An empty user message later in history/current should still win over
+		// the trailing prefix user, and the summary should become its content.
+		require.Equal(t, "few-shot user example", prefix[len(prefix)-1].Content)
+		require.Len(t, result, 2)
+		require.Equal(t, model.RoleAssistant, result[0].Role)
+		require.Equal(t, model.RoleUser, result[1].Role)
+		require.Contains(t, result[1].Content, "some summary")
+	})
+
+	t.Run("req_prefix_ends_with_user_merges_into_prefix_as_fallback", func(t *testing.T) {
+		prefix := []model.Message{
+			model.NewSystemMessage("system prompt"),
+			model.NewUserMessage("few-shot user example"),
+		}
+		msgs := []model.Message{
+			model.NewAssistantMessage("history assistant"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, prefix)
+		// With no user history/current message to attach to, fall back to the
+		// trailing prefix user message.
+		require.Contains(t, prefix[len(prefix)-1].Content, "some summary")
+		require.Contains(t, prefix[len(prefix)-1].Content, "few-shot user example")
+		require.Equal(t, msgs, result)
+	})
+
+	t.Run("req_prefix_ends_with_zero_role_user_merges_as_fallback", func(t *testing.T) {
+		prefix := []model.Message{
+			model.NewSystemMessage("system prompt"),
+			{Content: "zero role user example"},
+		}
+		msgs := []model.Message{
+			model.NewAssistantMessage("history assistant"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, prefix)
+		require.Equal(t, model.Role(""), prefix[len(prefix)-1].Role)
+		require.Contains(t, prefix[len(prefix)-1].Content, "some summary")
+		require.Contains(t, prefix[len(prefix)-1].Content, "zero role user example")
+		require.Equal(t, msgs, result)
+	})
+
+	t.Run("req_prefix_ends_with_system_no_merge_into_prefix", func(t *testing.T) {
+		prefix := []model.Message{
+			model.NewSystemMessage("system prompt"),
+		}
+		msgs := []model.Message{
+			model.NewUserMessage("history user"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, prefix)
+		// Should merge into first history user message instead.
+		require.Len(t, result, 1)
+		require.Contains(t, result[0].Content, "some summary")
+		require.Contains(t, result[0].Content, "history user")
+		// Prefix should be untouched.
+		require.Equal(t, "system prompt", prefix[0].Content)
+	})
+
+	t.Run("req_prefix_ends_with_empty_user_sets_content", func(t *testing.T) {
+		prefix := []model.Message{
+			model.NewSystemMessage("system prompt"),
+			{Role: model.RoleUser, Content: ""},
+		}
+		msgs := []model.Message{
+			model.NewAssistantMessage("history assistant"),
+		}
+		result := p.prependSummaryUserMessage("some summary", msgs, prefix)
+		// Summary should be set (not appended) on the empty user message.
+		require.Contains(t, prefix[len(prefix)-1].Content, "some summary")
+		require.Equal(t, msgs, result)
+	})
+
+	t.Run("custom_formatter_empty_return_skips", func(t *testing.T) {
+		custom := NewContentRequestProcessor(
+			WithSummaryFormatter(func(_ string) string { return "" }),
+		)
+		msgs := []model.Message{model.NewUserMessage("hello")}
+		result := custom.prependSummaryUserMessage("some summary", msgs, nil)
+		require.Equal(t, msgs, result)
+	})
+}
+
+// Test formatSummaryForUser with custom SummaryFormatter.
+func TestFormatSummaryForUser_CustomFormatter(t *testing.T) {
+	p := NewContentRequestProcessor(
+		WithSummaryFormatter(func(s string) string {
+			return "CUSTOM: " + s
+		}),
+	)
+	result := p.formatSummaryForUser("test summary")
+	require.Equal(t, "CUSTOM: test summary", result)
+}
+
+// Test WithSessionSummaryInjectionMode option.
+func TestWithSessionSummaryInjectionMode(t *testing.T) {
+	p := NewContentRequestProcessor(
+		WithSessionSummaryInjectionMode(SessionSummaryInjectionUser),
+	)
+	require.Equal(t, SessionSummaryInjectionUser, p.SessionSummaryInjectionMode)
+
+	p2 := NewContentRequestProcessor(
+		WithSessionSummaryInjectionMode(SessionSummaryInjectionSystem),
+	)
+	require.Equal(t, SessionSummaryInjectionSystem, p2.SessionSummaryInjectionMode)
+
+	// Unknown value defaults to system.
+	p3 := NewContentRequestProcessor(
+		WithSessionSummaryInjectionMode("unknown"),
+	)
+	require.Equal(t, SessionSummaryInjectionSystem, p3.SessionSummaryInjectionMode)
+}
+
+// Test user injection mode with injected context ending in user message.
+func TestProcessRequest_SessionSummary_UserMode_PrefersCurrentUserOverInjectedContext(t *testing.T) {
+	summaryTime := time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC)
+	sess := &session.Session{
+		Summaries: map[string]*session.Summary{
+			"test-agent": {
+				Summary:   "injected context summary",
+				UpdatedAt: summaryTime,
+			},
+		},
+	}
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("test-agent"),
+		agent.WithInvocationMessage(model.NewUserMessage("current request")),
+		agent.WithInvocationRunOptions(agent.RunOptions{
+			InjectedContextMessages: []model.Message{
+				model.NewUserMessage("injected context user msg"),
+			},
+		}),
+	)
+	inv.AgentName = "test-agent"
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("system prompt"),
+		},
+	}
+	p := NewContentRequestProcessor(
+		WithAddSessionSummary(true),
+		WithSessionSummaryInjectionMode(SessionSummaryInjectionUser),
+	)
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	// The summary should stay attached to the live current user message instead
+	// of being merged into the injected-context prefix user message.
+	// System prompt should NOT contain the summary.
+	require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+	require.NotContains(t, req.Messages[0].Content, "injected context summary",
+		"system prompt should not contain summary in user injection mode")
+
+	// Injected-context user message should remain untouched.
+	require.Equal(t, "injected context user msg", req.Messages[1].Content)
+
+	// Find the current user message and verify summary was merged into it.
+	foundMerged := false
+	for _, msg := range req.Messages {
+		if msg.Role == model.RoleUser &&
+			strings.Contains(msg.Content, "current request") &&
+			strings.Contains(msg.Content, "injected context summary") {
+			foundMerged = true
+			break
+		}
+	}
+	require.True(t, foundMerged,
+		"summary should be merged into the current user message")
+}
+
+func TestProcessRequest_SessionSummary_UserMode_FallsBackToInjectedContextUser(t *testing.T) {
+	summaryTime := time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC)
+	sess := &session.Session{
+		Summaries: map[string]*session.Summary{
+			"test-agent": {
+				Summary:   "fallback summary",
+				UpdatedAt: summaryTime,
+			},
+		},
+		Events: []event.Event{
+			{
+				Response: &model.Response{
+					Choices: []model.Choice{{
+						Message: model.NewAssistantMessage("history assistant"),
+					}},
+				},
+				Author:    "test-agent",
+				Timestamp: summaryTime.Add(time.Second),
+				FilterKey: "test-agent",
+				Version:   event.CurrentVersion,
+			},
+		},
+	}
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationEventFilterKey("test-agent"),
+		agent.WithInvocationMessage(model.NewToolMessage("tool-1", "search", "tool result")),
+		agent.WithInvocationRunOptions(agent.RunOptions{
+			InjectedContextMessages: []model.Message{
+				model.NewUserMessage("injected context user msg"),
+			},
+		}),
+	)
+	inv.AgentName = "test-agent"
+
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("system prompt"),
+		},
+	}
+	p := NewContentRequestProcessor(
+		WithAddSessionSummary(true),
+		WithSessionSummaryInjectionMode(SessionSummaryInjectionUser),
+	)
+	p.ProcessRequest(context.Background(), inv, req, nil)
+
+	require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+	require.NotContains(t, req.Messages[0].Content, "fallback summary")
+
+	// No user history/current message is available, so fallback merges into the
+	// injected-context user message instead of inserting a standalone user block.
+	require.Contains(t, req.Messages[1].Content, "injected context user msg")
+	require.Contains(t, req.Messages[1].Content, "fallback summary")
 }

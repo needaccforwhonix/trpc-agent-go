@@ -1,0 +1,1968 @@
+# Session Summary
+
+## Overview
+
+As conversations grow, maintaining complete event history can consume significant memory and may exceed the LLM's context window limit. The session summary feature uses LLM to automatically compress historical conversations into concise summaries, significantly reducing memory usage and token consumption while preserving important context.
+
+## Key Features
+
+- **Auto-trigger**: During summary checks, automatically generates summaries based on event count, token count, or time thresholds
+- **Incremental processing**: Only processes new events since the last summary, avoiding redundant computation
+- **LLM-driven**: Uses any configured LLM model to generate high-quality, context-aware summaries
+- **Non-destructive**: Original events are fully preserved; summaries are stored separately
+- **Async processing**: Executes asynchronously in the background without blocking conversation flow
+- **Flexible configuration**: Supports custom trigger conditions, prompts, and word limits
+
+## Basic Configuration
+
+### Step 1: Create Summarizer
+
+Create a summarizer with an LLM model and configure trigger conditions:
+
+```go
+import (
+    "time"
+
+    "trpc.group/trpc-go/trpc-agent-go/session/summary"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+summaryModel := openai.New("gpt-4", openai.WithAPIKey("your-api-key"))
+
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithChecksAny(
+        summary.CheckEventThreshold(20),
+        summary.CheckTokenThreshold(4000),
+        summary.CheckTimeThreshold(5*time.Minute), // Runner path: trigger when the idle gap before the next request exceeds 5 minutes
+    ),
+    summary.WithMaxSummaryWords(200),
+)
+```
+
+### Step 2: Configure Session Service
+
+Integrate the summarizer into a session service:
+
+```go
+import (
+    "context"
+    "time"
+    "trpc.group/trpc-go/trpc-agent-go/session/clickhouse"
+    "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+    "trpc.group/trpc-go/trpc-agent-go/session/mysql"
+    "trpc.group/trpc-go/trpc-agent-go/session/postgres"
+    "trpc.group/trpc-go/trpc-agent-go/session/redis"
+    "trpc.group/trpc-go/trpc-agent-go/session/summary"
+)
+
+// Memory storage (dev/test)
+sessionService := inmemory.NewSessionService(
+    inmemory.WithSummarizer(summarizer),
+    inmemory.WithAsyncSummaryNum(2),
+    inmemory.WithSummaryQueueSize(100),
+    inmemory.WithSummaryJobTimeout(60*time.Second),
+)
+
+// Redis storage (production)
+sessionService, err := redis.NewService(
+    redis.WithRedisClientURL("redis://localhost:6379"),
+    redis.WithSummarizer(summarizer),
+    redis.WithAsyncSummaryNum(4),
+    redis.WithSummaryQueueSize(200),
+)
+
+// PostgreSQL storage
+sessionService, err := postgres.NewService(
+    postgres.WithHost("localhost"),
+    postgres.WithPassword("your-password"),
+    postgres.WithSummarizer(summarizer),
+    postgres.WithAsyncSummaryNum(2),
+    postgres.WithSummaryQueueSize(100),
+)
+
+// MySQL storage
+sessionService, err := mysql.NewService(
+    mysql.WithMySQLClientDSN("user:password@tcp(localhost:3306)/db?charset=utf8mb4&parseTime=True&loc=Local"),
+    mysql.WithSummarizer(summarizer),
+    mysql.WithAsyncSummaryNum(2),
+    mysql.WithSummaryQueueSize(100),
+)
+
+// ClickHouse storage
+sessionService, err := clickhouse.NewService(
+    clickhouse.WithClickHouseDSN("clickhouse://default:password@localhost:9000/default"),
+    clickhouse.WithSummarizer(summarizer),
+    clickhouse.WithAsyncSummaryNum(2),
+)
+```
+
+`WithAsyncSummaryNum` only controls the concurrency of background async summary workers. It is not a sync/async mode switch, and it does not disable summary generation. To disable summaries, do not configure `WithSummarizer`. To make a long ReAct loop refresh the summary before the next LLM call within the same `Run`, configure `llmagent.WithSyncSummaryIntraRun(true)` on the Agent.
+
+### Step 3: Configure Agent and Runner
+
+Create an Agent and configure summary injection behavior:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+llmAgent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(summaryModel),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithMaxHistoryRuns(10),
+)
+
+r := runner.NewRunner(
+    "my-agent",
+    llmAgent,
+    runner.WithSessionService(sessionService),
+)
+
+eventChan, err := r.Run(ctx, userID, sessionID, userMessage)
+```
+
+Keep the main setup on the default async summary path. For long ReAct loops that must refresh the summary before the next LLM call in the same `Run`, add the sync intra-run option explicitly:
+
+```go
+llmAgent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(summaryModel),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithSyncSummaryIntraRun(true),
+    llmagent.WithMaxHistoryRuns(10),
+)
+```
+
+After completing the above configuration, the summary feature runs automatically.
+
+## Cache-Safe Summary Forking
+
+The summarizer has two request-construction modes.
+
+**Standalone request** is the default. The framework selects the events that
+should be summarized, converts them to conversation text, runs the
+`WithPreSummaryHook(...)` hook if configured, and sends a summary-model request
+with:
+
+- An optional system message rendered from `WithSystemPrompt(...)`.
+- One user message rendered from `WithPrompt(...)`, with
+  `{conversation_text}` replaced by the extracted conversation text. A custom
+  prompt may also use `{previous_summary}` to position the previous rolling
+  summary separately from newly uncovered conversation events.
+
+This request is independent from the main agent request, so it is simple and
+works for synchronous, asynchronous, and manual summary calls.
+
+For long sessions where prompt-cache reuse matters, you can opt in to
+**cache-safe forking**:
+
+```go
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithContextThreshold(),
+    summary.WithMaxSummaryWords(200),
+    summary.WithCacheSafeForking(true),
+)
+```
+
+When context compaction runs in the normal LLM flow, the framework has already
+built the parent `model.Request` for the current main-agent call. If
+`WithCacheSafeForking(true)` is enabled, the summarizer builds the summary
+request by:
+
+- Cloning that parent request, including its model-visible prefix such as
+  system context, injected summary, session history, user input, tool
+  definitions, headers, extra fields, and generation settings.
+- Appending one user message rendered from `WithCacheSafeForkPrompt(...)`.
+- Forcing the summary call to be non-streaming and clearing structured output,
+  because the summary call returns plain summary text.
+
+The request prefix remains the same as the parent request prefix, so providers
+with prompt caching can reuse more cached input. If no parent request is
+available, for example in manual or external summary calls, the summarizer
+falls back to the standalone request path. With cache-safe forking enabled,
+that standalone user message contains the rendered `WithPrompt(...)` output,
+followed by a fixed source-data boundary and the instruction rendered from
+`WithCacheSafeForkPrompt(...)`. The boundary tells the model to treat the
+preceding conversation as source data rather than as a task to continue. The
+same construction is used for other standalone fallbacks, including bounded
+and retry requests.
+
+Before sending either form of request, the summarizer admits it against the
+summary model's effective input budget. The framework uses the smaller of the
+provider-specific input budget, when the model exposes one, and a conservative
+ceiling of 70% of the model context window. An oversized fork is reduced without
+mutating the parent request: unused tool schemas are removed first, and large
+tool argument/result payloads are replaced with explicit omission markers as
+needed. Source conversation turns are not dropped. The complete rendered fork
+prompt, including a custom one, counts against this input budget in both fork
+and standalone forms. If the fork still cannot fit, the summarizer rebuilds a
+bounded standalone request. When that request can fit all newly uncovered
+conversation, the standalone path preserves it in full and, when
+`{previous_summary}` is used, may bound only that previous rolling summary; the
+fixed system prompt, user-prompt template, source boundary, and fork prompt
+remain intact.
+
+If all newly uncovered conversation cannot fit in one standalone request, the
+summarizer can process a complete older prefix and leave the remaining events
+uncovered for a later summary pass. A prefix must end at a stable event boundary
+and cannot split response chunks or an open tool call/result round. The summary
+boundary advances only through the selected prefix after model generation and
+post-summary processing are complete. If even the smallest complete prefix does
+not fit, the request fails before calling the model and the existing boundary
+remains unchanged. Partial-prefix fallback is disabled when
+`WithPreSummaryHook(...)` is configured because hook-rewritten text cannot be
+mapped safely back to an event boundary. Prefix summaries always use a
+standalone request; they do not reuse the cache-safe fork.
+
+Budget fitting and the fork-to-standalone decision happen before the
+`BeforeModel` callback. The callback therefore receives the actual request that
+will be sent. The framework counts the request again after the callback; if the
+callback makes it exceed the budget, the call fails explicitly instead of
+silently replacing the callback-modified request. If a provider still returns a
+context-length error, or a non-custom model call returns an empty summary, the
+summarizer makes one bounded standalone retry at half of the first attempt's
+input budget. That retry may select a smaller complete prefix under the same
+boundary rules.
+
+One important branch-summary behavior: after `WithCacheSafeForking(true)` is
+enabled, a non-empty branch trigger may fork the current parent request for the
+branch summary, but that same summary pass does not make a second standalone
+full-session LLM call. This applies to the common single-`filterKey` session as
+well as sessions that contain multiple filter keys. The framework skips that
+extra LLM target instead of falling back to a standalone full-session prompt or
+reusing the branch-scoped fork request. When every event loaded on the session
+has the same `filterKey`, a materialized branch summary is copied to
+`SummaryFilterKeyAllContents` in the same pass. This is a loaded-window
+optimization: a storage event limit can omit older events from other branches,
+so do not infer historical branch/full equivalence from the copy. On a
+multi-`filterKey` session, the full-session key is left untouched in that pass;
+trigger a full-session summary separately when you need an all-branch summary.
+
+More generally, a branch-triggered full-session cascade depends on the branch
+target producing a summary in that pass. If the branch gate declines to update
+its summary, the framework stops the cascade instead of independently advancing
+the full-session summary. A failed dependent target returns an error but does
+not create a separate durable recovery protocol. A later ordinary call must
+pass the branch gate again and can return `nil` without completing the earlier
+full target when that gate does not fire. To recover immediately, directly
+force `SummaryFilterKeyAllContents`, or retry the branch cascade with
+`force=true` from a context that does not carry a cache-safe parent fork.
+Forcing a branch cascade with a cache-safe parent still intentionally skips its
+dependent full-session LLM target.
+
+Asynchronous workers log dependent-target errors after processing. A successful
+enqueue only confirms that the job was accepted; it does not synchronously
+return errors produced later by the worker.
+
+`WithSummaryJobTimeout(...)` is the deadline for the entire summary job. A
+multi-`filterKey` cascade runs the branch and full-session targets sequentially,
+and both targets share that deadline. Size the timeout for their combined model
+and persistence latency.
+
+Prompt rules:
+
+- `WithPrompt(...)` configures the standalone user prompt. It must include
+  `{conversation_text}` and may include `{previous_summary}`. When the optional
+  placeholder is present, `{previous_summary}` receives the previous rolling
+  summary and `{conversation_text}` contains only newly uncovered events.
+  Without it, the previous summary remains merged into `{conversation_text}`
+  for backward compatibility. If `WithMaxSummaryWords(...)` is configured,
+  `{max_summary_words}` must appear in either `WithPrompt(...)` or
+  `WithSystemPrompt(...)`.
+- `WithSystemPrompt(...)` configures the optional standalone system message. It
+  must not include `{conversation_text}` or `{previous_summary}`. It may include
+  `{max_summary_words}`.
+- `WithCacheSafeForkPrompt(...)` configures the final summary instruction used
+  when cache-safe forking is enabled. In fork mode it is appended as a user
+  message to the cloned parent request. In standalone fallback it is appended
+  after a fixed source-data boundary in the standalone user message. It must
+  not include `{conversation_text}` or `{previous_summary}` because the source
+  conversation is already present before it in either request form. It may
+  include `{max_summary_words}`, and its complete rendered text counts against
+  the summary model's input budget.
+
+Keep the standalone prompt valid even when cache-safe forking is enabled,
+because fallback paths still use it. When writing a custom fork prompt, ask the
+model to summarize the conversation above for future continuation. It should
+preserve user goals, decisions, constraints, open tasks, tool results, and
+important facts. It should not call tools, answer the latest user request, or
+treat system and tool-use instructions as facts to summarize.
+
+`WithPreSummaryHook(...)` still runs before the summary model call. In
+standalone mode its modified text is rendered into `{conversation_text}`. When
+the prompt uses `{previous_summary}`, the hook receives newly uncovered events
+and text in `Events` and `Text`, plus the separately editable previous summary
+in `PreviousSummary`. In fork mode with a parent request available, those
+payload edits are not embedded into the request because the conversation is
+already present in the cloned parent request; the hook remains useful for
+context updates, side effects, and fallback standalone calls.
+
+In fork mode, `WithPreSummaryHook(...)` text or event edits do not sanitize,
+redact, or filter the cloned parent request. If the hook is used for redaction
+or filtering before summarization, use standalone mode for that flow or ensure
+the parent `model.Request` has already been sanitized before it is cloned.
+
+Cache-safe forking controls the request used to generate the summary. To make
+the next normal conversation request more cache friendly after a summary exists,
+prefer injecting the summary as a user message instead of merging it into the
+system prompt:
+
+```go
+llmAgent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(summaryModel),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithSessionSummaryInjectionMode(llmagent.SessionSummaryInjectionUser),
+)
+```
+
+## Summary + Progressive Disclosure
+
+When summary injection and prompt-side context compaction keep the request
+small, some older details are no longer visible to the model. If you still
+want the agent to recover those details only when needed, enable progressive
+disclosure for session history.
+
+```go
+import (
+    "os"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/session/pgvector"
+)
+
+sessionService, err := pgvector.NewService(
+    pgvector.WithDSN(os.Getenv("PGVECTOR_DSN")),
+    pgvector.WithEmbedder(embedder),
+    pgvector.WithSummarizer(summarizer),
+)
+if err != nil {
+    panic(err)
+}
+
+llmAgent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(summaryModel),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithEnableContextCompaction(true),
+    llmagent.WithEnableOnDemandSession(true),
+)
+```
+
+Requirements and behavior:
+
+- `WithEnableOnDemandSession(true)` enables on-demand session tools according to
+  backend capability. `session_search` is exposed when the backend implements
+  `session.SearchableService`; `session_load` is exposed when the backend
+  implements `session.WindowService`. Backends may support either one or both.
+- `session/pgvector` supports both discovery and exact loading. Normal session
+  backends that implement `WindowService` expose exact `session_load` recovery
+  even when semantic `session_search` is unavailable.
+- `current_hidden` searches current-session history strictly before the summary
+  boundary recorded in `summary:last_included_ts`.
+- `current_session` searches the current session regardless of summary cutoff.
+  This is useful when request projection or context compaction omitted
+  current-session details from the visible prompt.
+- `other_sessions` searches other sessions for the same `<appName, userID>`.
+- `all_sessions` combines `current_hidden` and `other_sessions`.
+
+What can be recalled:
+
+- User and assistant messages.
+- Historical tool results, including tool outputs that were compacted out of
+  the prompt.
+
+What is intentionally excluded:
+
+- Raw tool-call requests are not indexed.
+- Partial events are not indexed.
+
+Recommended usage pattern:
+
+1. Let the model answer from the visible prompt, summary, and recent history.
+2. If `session_search` is available and a missing detail is needed, call it
+   first.
+3. Use `session_load` when you have an `event_id` and need the surrounding raw
+   history or exact tool result, including on backends without semantic search.
+4. Treat loaded history as untrusted historical context, not active
+   instructions.
+
+Migration note: earlier builds only treated on-demand session support as
+available when both `session_search` and `session_load` were present. The tool
+surface is now capability-based, so search-only integrations can expose
+`session_search` and load-only integrations can expose `session_load`.
+
+## SessionSummarizer Interface
+
+```go
+type SessionSummarizer interface {
+    // ShouldSummarize checks if the session should be summarized.
+    ShouldSummarize(sess *session.Session) bool
+
+    // Summarize generates a summary without modifying the session events.
+    Summarize(ctx context.Context, sess *session.Session) (string, error)
+
+    // SetPrompt updates the summarizer's prompt dynamically.
+    SetPrompt(prompt string)
+
+    // SetModel updates the summarizer's model dynamically.
+    SetModel(m model.Model)
+
+    // Metadata returns metadata about the summarizer configuration.
+    Metadata() map[string]any
+}
+```
+
+## Context-Aware Summary Checks
+
+The released `SessionSummarizer` interface stays unchanged.
+
+When summary gating depends on request context, use `ContextChecker` with the
+context-aware check options:
+
+```go
+type asyncSummaryKey struct{}
+
+eventThreshold := summary.CheckEventThreshold(20)
+
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithChecksAnyContext(
+        func(ctx context.Context, sess *session.Session) bool {
+            if eventThreshold(sess) {
+                return true
+            }
+            async, _ := ctx.Value(asyncSummaryKey{}).(bool)
+            return async
+        },
+    ),
+)
+```
+
+The framework does not reserve any context keys for summary triggering. If your
+application needs to distinguish different summary entry points, annotate the
+context before calling the session APIs and read the value inside your
+`ContextChecker`.
+
+## Dynamic Summarizer
+
+Use `NewDynamicSummarizer` when the session service should be reused, but the
+summary model, prompt, or checks must vary per request. This is useful for
+multi-tenant systems and custom model routing. Keep the session service
+long-lived, especially for database-backed services such as MySQL, so the
+underlying connection pool can be reused.
+
+```go
+type summaryCfgKey struct{}
+
+type SummaryCfg struct {
+    ModelName string
+    Prompt    string
+}
+
+func WithSummaryCfg(ctx context.Context, cfg SummaryCfg) context.Context {
+    return context.WithValue(ctx, summaryCfgKey{}, cfg)
+}
+
+func SummaryCfgFromContext(ctx context.Context) (SummaryCfg, bool) {
+    cfg, ok := ctx.Value(summaryCfgKey{}).(SummaryCfg)
+    return cfg, ok
+}
+
+summarizer := summary.NewDynamicSummarizer(func(
+    ctx context.Context,
+    sess *session.Session,
+) (summary.SessionSummarizer, error) {
+    cfg, ok := SummaryCfgFromContext(ctx)
+    if !ok {
+        return nil, nil // Skip automatic summary for this call.
+    }
+    return BuildSummarizer(cfg)
+})
+
+sessionService, err := mysql.NewService(
+    mysql.WithMySQLClientDSN(dsn),
+    mysql.WithSummarizer(summarizer),
+)
+```
+
+Before running the request, attach the request-scoped configuration to `ctx`:
+
+```go
+ctx = WithSummaryCfg(ctx, SummaryCfg{
+    ModelName: req.SummaryModel,
+    Prompt:    req.SummaryPrompt,
+})
+```
+
+The resolver should be cheap and deterministic for the same `ctx` and session.
+During non-forced summary, it may be called once for the summary gate and once
+for actual summary generation. If constructing the summarizer is expensive,
+store the already-built summarizer in `ctx` and let the resolver only read it.
+Returning nil from the resolver skips automatic summary checks. Direct
+`Summarize` calls, or forced summary calls without a resolved summarizer, return
+an error. If the resolver returns an error while `ShouldSummarizeWithContext`
+is checking an automatic, non-forced summary, the gate treats it as `false` and
+skips summary generation; direct `Summarize` calls propagate resolver errors to
+the caller.
+
+## Summarizer Options
+
+### Trigger Conditions
+
+| Option | Description |
+| --- | --- |
+| `WithEventThreshold(eventCount int)` | Trigger when event count since last summary exceeds threshold |
+| `WithTokenThreshold(tokenCount int)` | Trigger when token count since last summary exceeds threshold |
+| `WithContextThreshold(opts ...ContextThresholdOption)` | Trigger when token count since last summary exceeds a ratio of the current model's context window |
+| `WithTimeThreshold(interval time.Duration)` | In the Runner path, triggers when the idle gap before the current top-level request exceeds the interval; standalone evaluation falls back to last-event age |
+
+Use `WithTokenThreshold` when you want a fixed application-defined token
+threshold, for example "summarize after 4000 new tokens" regardless of which
+model is serving the request. The threshold is captured in the summarizer
+configuration and does not change when your application switches models.
+
+Use `WithContextThreshold` when the summary trigger should follow the active
+model's context window. This is the recommended option for agents that can
+switch models within a session. At summary-check time, the framework resolves
+the context window in this order:
+
+1. Per-run override from `agent.WithModelContextWindow(tokens)`
+2. Model instance configuration from providers such as `openai.WithContextWindow(tokens)` or `provider.WithContextWindow(tokens)`
+3. Process-wide model-name registry from `model.RegisterModelContextWindow(name, tokens)`
+
+The threshold is then computed as `contextWindow * ratio` (default 50%). To
+avoid premature summarization on very small contexts, `WithContextThreshold`
+also applies a 2000-token minimum trigger threshold by default. In other words,
+the effective threshold is `max(contextWindow * ratio, minTokenThreshold)`, and
+the built-in checker only triggers when the estimated token count is **greater
+than** that threshold. If you set a very small ratio, for example `0.001`, and
+expect summarization around 1000 tokens, pass
+`summary.WithContextThresholdMinTokens(0)` explicitly, or set it to the
+application-specific minimum you want.
+
+### Trigger and Call Reporting
+
+Use `summary.WithReportHook` when you need to observe why summary generation
+was triggered and how large the summary model request was:
+
+```go
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithContextThreshold(),
+    summary.WithReportHook(func(ctx context.Context, report summary.Report) {
+        triggerTokens := report.Trigger.Value
+        summaryPromptTokens := report.Call.PromptTokens
+        _ = triggerTokens
+        _ = summaryPromptTokens
+    }),
+)
+```
+
+The report keeps two token counts separate:
+
+- `report.Trigger.Value`: the checker value that triggered summarization, such
+  as estimated delta tokens after the previous summary
+- `report.Call.EstimatedPromptTokens`: the framework's local estimate for the
+  complete summary model request
+- `report.Call.PromptTokens`: the provider-reported `usage.prompt_tokens` for
+  the summary model call
+
+For cache-safe forking, `report.Call.Mode` is `cache_safe_fork` and the request
+estimate is computed from the forked parent request plus the appended summary
+instruction. For standalone summary prompts, the mode is `standalone`. If a
+`BeforeModel` callback returns a custom response and no summary model request is
+sent for that attempt, the mode is `custom_response` and the prompt estimate
+remains zero. `Report.Call.Mode` describes the last summary attempt. In a mixed
+retry where an earlier attempt called the provider and the final attempt used a
+custom response, it is therefore `custom_response`; usage fields may still
+contain provider usage observed on the earlier attempt. The structured
+`model_call_status` diagnostic instead aggregates the whole summary operation
+and reports `called` when any attempt called the provider.
+
+Advanced integrations can attach a report before entering a higher-level
+summary flow with `summary.ContextWithReport(ctx, report)` and retrieve it with
+`summary.ReportFromContext(ctx)`. The framework reuses that report for a single
+summary path. Distinct branch and full-session targets in a multi-`filterKey`
+cascade each receive a cloned report so target-specific writes remain isolated.
+Those forked reports are emitted through their per-call hooks and are not merged
+back into the root report. The single-`filterKey` copy-persistence optimization
+does not create this pair of target reports.
+
+For private deployments, endpoint IDs, fine-tuned models, newly released
+models, or multi-tenant custom model configuration, prefer the instance or
+per-run option so different users do not overwrite a process-wide registry
+entry:
+
+```go
+modelInstance := openai.New(
+    "my-custom-model",
+    openai.WithAPIKey(apiKey),
+    openai.WithBaseURL(apiURI),
+    openai.WithContextWindow(204800),
+)
+
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    userMessage,
+    agent.WithModel(modelInstance),
+)
+
+eventChan, err = r.Run(
+    ctx,
+    userID,
+    sessionID,
+    userMessage,
+    agent.WithModelName("my-custom-model"),
+    agent.WithModelContextWindow(204800),
+)
+```
+
+Use global registration only when the model name has a stable process-wide
+meaning:
+
+```go
+model.RegisterModelContextWindow("my-custom-model", 32768)
+```
+
+Common `ContextThresholdOption` values:
+
+| Option | Description |
+| --- | --- |
+| `WithContextThresholdRatio(ratio float64)` | Sets the context-window ratio that triggers summarization; default `0.5` |
+| `WithContextThresholdMinTokens(tokens int)` | Sets the absolute minimum trigger token count; default `2000`. Pass `0` to remove this lower bound |
+| `WithContextThresholdFallbackWindow(tokens int)` | Sets the summary checker's fallback context window; default `8192`. In the `WithContextThreshold` path, omitting this option lets the framework derive the fallback from the summarizer model when possible; setting it explicitly uses your value and skips that summarizer-model fallback. At check time, the fallback is used only when the runtime context, model instance, and registry cannot resolve a context window. This is separate from token tailoring's `128000` unknown-model fallback |
+
+### Combined Conditions
+
+| Option | Description |
+| --- | --- |
+| `WithChecksAll(checks ...Checker)` | All conditions must be met (AND logic), use `Check*` functions |
+| `WithChecksAny(checks ...Checker)` | Any condition triggers (OR logic), use `Check*` functions |
+| `WithChecksAllContext(checks ...ContextChecker)` | All request-scoped conditions must be met (AND logic) |
+| `WithChecksAnyContext(checks ...ContextChecker)` | Any request-scoped condition triggers (OR logic) |
+
+`ContextChecker` receives `(ctx context.Context, sess *session.Session)`.
+
+**Note**: Use `Check*` functions (for example `CheckEventThreshold`) inside
+`WithChecksAll` and `WithChecksAny`, not `With*` functions.
+
+```go
+// AND logic: all conditions must be met
+summary.WithChecksAll(
+    summary.CheckEventThreshold(10),
+    summary.CheckTokenThreshold(2000),
+)
+
+// OR logic: any condition triggers
+summary.WithChecksAny(
+    summary.CheckEventThreshold(50),
+    summary.CheckTimeThreshold(10*time.Minute),
+)
+```
+
+### Summary Generation
+
+| Option | Description |
+| --- | --- |
+| `WithMaxSummaryWords(maxWords int)` | Limit summary word count; included in prompt to guide model |
+| `WithPrompt(prompt string)` | Custom summary prompt; must contain `{conversation_text}` and may contain `{previous_summary}` |
+| `WithSystemPrompt(prompt string)` | Add a separate system message for summarization instructions; must not contain `{conversation_text}` or `{previous_summary}` |
+| `WithCacheSafeForking(enable bool)` | Opt in to cache-safe summary request forking when a parent request is available. Disabled by default |
+| `WithCacheSafeForkPrompt(prompt string)` | Customize the final instruction used by cache-safe fork requests and appended after a source-data boundary in standalone fallbacks. Its rendered text counts against the input budget. May include `{max_summary_words}`, but not `{conversation_text}` or `{previous_summary}` |
+| `WithSkipRecent(skipFunc SkipRecentFunc)` | Custom function to skip recent events |
+
+### Hook Options
+
+| Option | Description |
+| --- | --- |
+| `WithPreSummaryHook(h PreSummaryHook)` | Pre-summary hook; can modify input text |
+| `WithPostSummaryHook(h PostSummaryHook)` | Post-summary hook; can modify output summary |
+| `WithSummaryHookAbortOnError(abort bool)` | Whether to abort on hook error; default `false` (ignore errors) |
+
+### Tool Call Formatting
+
+By default, the summarizer includes tool calls and tool results in the conversation text sent to the LLM for summarization. The default format is:
+
+- Tool calls: `[Called tool: toolName with args: {"arg": "value"}]`
+- Tool results: `[toolName returned: result content]`
+
+| Option | Description |
+| --- | --- |
+| `WithToolCallFormatter(f ToolCallFormatter)` | Customize how tool calls are formatted in summary input. Return empty string to exclude |
+| `WithToolResultFormatter(f ToolResultFormatter)` | Customize how tool results are formatted in summary input. Return empty string to exclude |
+
+```go
+// Truncate long tool arguments
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithToolCallFormatter(func(tc model.ToolCall) string {
+        name := tc.Function.Name
+        if name == "" {
+            return ""
+        }
+        args := string(tc.Function.Arguments)
+        const maxLen = 100
+        if len(args) > maxLen {
+            args = args[:maxLen] + "...(truncated)"
+        }
+        return fmt.Sprintf("[Tool: %s, Args: %s]", name, args)
+    }),
+    summary.WithEventThreshold(20),
+)
+
+// Exclude tool results from summary
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithToolResultFormatter(func(msg model.Message) string {
+        return ""
+    }),
+    summary.WithEventThreshold(20),
+)
+
+// Include only tool name, exclude arguments
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithToolCallFormatter(func(tc model.ToolCall) string {
+        if tc.Function.Name == "" {
+            return ""
+        }
+        return fmt.Sprintf("[Used tool: %s]", tc.Function.Name)
+    }),
+    summary.WithEventThreshold(20),
+)
+```
+
+### Model Callbacks (Before/After Model)
+
+The `summarizer` supports model callbacks around the underlying `model.GenerateContent` call, useful for modifying requests, short-circuiting with custom responses, or instrumentation.
+
+| Option | Description |
+| --- | --- |
+| `WithModelCallbacks(callbacks *model.Callbacks)` | Register Before/After callbacks for the summarizer's underlying model calls |
+
+```go
+callbacks := model.NewCallbacks().
+    RegisterBeforeModel(func(ctx context.Context, args *model.BeforeModelArgs) (*model.BeforeModelResult, error) {
+        // Modify args.Request, or return CustomResponse to skip the real model call
+        return nil, nil
+    }).
+    RegisterAfterModel(func(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
+        // Override model output via CustomResponse
+        return nil, nil
+    })
+
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithModelCallbacks(callbacks),
+)
+```
+
+## Checker Functions
+
+Checker is a function type for determining whether to trigger summarization:
+
+```go
+type Checker func(sess *session.Session) bool
+```
+
+### Built-in Checkers
+
+| Checker | Description |
+| --- | --- |
+| `CheckEventThreshold(eventCount int)` | Returns true when the number of delta events since the last summary exceeds the threshold |
+| `CheckTimeThreshold(interval time.Duration)` | In the Runner summary path, checks the idle gap before the current top-level request; direct calls without a Runner observation retain the last-event-age fallback |
+| `CheckTokenThreshold(tokenCount int)` | Returns true when the estimated token count of delta events since the last summary exceeds the threshold (estimated via `TokenCounter` from extracted conversation text, not `event.Response.Usage.TotalTokens`) |
+| `ChecksAll(checks []Checker)` | Combines multiple Checkers; returns true only when all return true (AND) |
+| `ChecksAny(checks []Checker)` | Combines multiple Checkers; returns true when any returns true (OR) |
+
+## Custom Prompt
+
+```go
+customPrompt := `Analyze the following conversation and provide a concise summary,
+focusing on key decisions, action items, and important context.
+Keep it within {max_summary_words} words.
+
+<conversation>
+{conversation_text}
+</conversation>
+
+Summary:`
+
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithPrompt(customPrompt),
+    summary.WithMaxSummaryWords(100),
+    summary.WithEventThreshold(15),
+)
+```
+
+**Prompt placeholders**:
+
+- `{conversation_text}`: Must be included; replaced with conversation content
+- `{previous_summary}`: Optional; separates the previous rolling summary from
+  conversation events discovered after its boundary. It is empty on the first
+  summary pass. Without this placeholder, the previous summary stays merged
+  into `{conversation_text}` for backward compatibility
+- `{max_summary_words}`: Must be included in either `WithPrompt(...)` or `WithSystemPrompt(...)` when `maxSummaryWords > 0`
+
+For incremental summaries where the previous summary needs a distinct position:
+
+```go
+userPrompt := `Update the previous summary with the new conversation.
+
+<previous_summary>
+{previous_summary}
+</previous_summary>
+
+<new_conversation>
+{conversation_text}
+</new_conversation>
+
+Updated summary:`
+```
+
+`{previous_summary}` applies to standalone requests and cache-safe fallback
+requests. A successful cache-safe fork uses the cloned parent request, which
+already determines where any injected summary appears.
+
+If you want to keep summarization instructions in a dedicated system message,
+combine `WithSystemPrompt` with a lighter user prompt that only carries the
+conversation payload:
+
+```go
+systemPrompt := `Summarize the conversation faithfully.
+Focus on key decisions and action items.
+Keep it within {max_summary_words} words.`
+
+userPrompt := `<conversation>
+{conversation_text}
+</conversation>
+
+Summary:`
+
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSystemPrompt(systemPrompt),
+    summary.WithPrompt(userPrompt),
+    summary.WithMaxSummaryWords(100),
+    summary.WithEventThreshold(15),
+)
+```
+
+Notes:
+
+- `WithPrompt` still renders into the **user message**
+- `WithSystemPrompt` renders into a dedicated **system message**
+- `WithSystemPrompt` must not include `{conversation_text}` or
+  `{previous_summary}`; keep conversation content in the user prompt
+
+## Token Counter Configuration
+
+By default, `CheckTokenThreshold` uses a built-in `SimpleTokenCounter` that estimates token count based on text length. To customize token counting behavior, use `summary.SetTokenCounter` to set a global token counter:
+
+For `SimpleTokenCounter`, `WithApproxRunesPerToken(v)` means roughly `v` UTF-8 characters per token. The formula is `estimatedTokens = countedUTF8Runes / v`. For example, `v=1.5` means about `1.5` characters per token; do not treat it as a token multiplier.
+
+> **Token estimation trade-off**
+>
+> The built-in `SimpleTokenCounter` is a lightweight local heuristic based on
+> UTF-8 character count. Its default `4.0` characters/token is mainly an
+> English-text approximation. Chinese, Japanese, Korean, and mixed-language
+> prompts often need a lower `WithApproxRunesPerToken` value calibrated from
+> workload tests or production traces, for example a more conservative range
+> around `1.2` to `2.0`.
+>
+> The framework does not call provider token-count APIs by default. Many model
+> tokenizers are not open source, tokenizers are model-version-specific, and a
+> remote token-count call on every summary check would add latency, cost, and
+> rate-limit risk while not being available consistently across providers.
+> Summary checkers therefore use a replaceable local estimator as a fast gate.
+> Applications that need tighter accounting should implement `model.TokenCounter`
+> and install it once during application initialization with
+> `summary.SetTokenCounter`.
+
+```go
+import (
+    "context"
+    "fmt"
+    "unicode/utf8"
+
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/session/summary"
+)
+
+// Use the built-in simple token counter
+summary.SetTokenCounter(model.NewSimpleTokenCounter())
+
+// Or use a custom implementation
+type MyCustomCounter struct{}
+
+func (c *MyCustomCounter) CountTokens(ctx context.Context, message model.Message) (int, error) {
+    _ = ctx
+    return utf8.RuneCountInString(message.Content), nil
+}
+
+func (c *MyCustomCounter) CountTokensRange(ctx context.Context, messages []model.Message, start, end int) (int, error) {
+    if start < 0 || end > len(messages) || start >= end {
+        return 0, fmt.Errorf("invalid range: start=%d, end=%d, len=%d",
+            start, end, len(messages))
+    }
+
+    total := 0
+    for i := start; i < end; i++ {
+        tokens, err := c.CountTokens(ctx, messages[i])
+        if err != nil {
+            return 0, err
+        }
+        total += tokens
+    }
+    return total, nil
+}
+
+summary.SetTokenCounter(&MyCustomCounter{})
+```
+
+**Notes**:
+
+- **Global effect**: `SetTokenCounter` affects all `CheckTokenThreshold` evaluations in the current process; set it once during application initialization
+- **Default counter**: If not set, the default `SimpleTokenCounter` is used (approximately 4 characters per token)
+- **Parameter meaning**: `v` in `WithApproxRunesPerToken(v)` is characters per token. Passing `2.0/3.0` means about `0.67` characters per token, which is about `1.5` tokens per character
+
+## Skip Recent Events
+
+Use `WithSkipRecent` to skip recent events during summarization:
+
+```go
+// Skip a fixed number of events
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(_ []event.Event) int { return 2 }),
+    summary.WithEventThreshold(10),
+)
+
+// Skip events from the last 5 minutes (time window)
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(events []event.Event) int {
+        cutoff := time.Now().Add(-5 * time.Minute)
+        skip := 0
+        for i := len(events) - 1; i >= 0; i-- {
+            if events[i].Timestamp.After(cutoff) {
+                skip++
+            } else {
+                break
+            }
+        }
+        return skip
+    }),
+    summary.WithEventThreshold(10),
+)
+
+// Skip only trailing tool call messages
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithSkipRecent(func(events []event.Event) int {
+        skip := 0
+        for i := len(events) - 1; i >= 0; i-- {
+            if events[i].Response != nil && len(events[i].Response.Choices) > 0 &&
+                events[i].Response.Choices[0].Message.Role == model.RoleTool {
+                skip++
+            } else {
+                break
+            }
+        }
+        return skip
+    }),
+    summary.WithEventThreshold(10),
+)
+```
+
+## Summary Hooks
+
+### PreSummaryHook
+
+Called before summary generation; can modify input text or events:
+
+```go
+type PreSummaryHookContext struct {
+    Ctx     context.Context
+    Session *session.Session
+    Events  []event.Event
+    Text    string
+}
+
+type PreSummaryHook func(in *PreSummaryHookContext) error
+```
+
+### PostSummaryHook
+
+Called after summary generation; can modify the output summary:
+
+```go
+type PostSummaryHookContext struct {
+    Ctx     context.Context
+    Session *session.Session
+    Summary string
+}
+
+type PostSummaryHook func(in *PostSummaryHookContext) error
+```
+
+The hook observes the provisional boundary for the source used to generate the
+summary. When the hook succeeds, or when its error is configured as non-aborting,
+the summarizer restores that exact source boundary after the hook; hook writes to
+the summary boundary state therefore do not persist. An aborting error or panic
+restores the boundary that existed before the summary attempt.
+
+### Usage Example
+
+```go
+summarizer := summary.NewSummarizer(
+    summaryModel,
+    summary.WithPreSummaryHook(func(ctx *summary.PreSummaryHookContext) error {
+        // Modify ctx.Text or ctx.Events before summary generation
+        return nil
+    }),
+    summary.WithPostSummaryHook(func(ctx *summary.PostSummaryHookContext) error {
+        // Modify ctx.Summary after summary generation
+        return nil
+    }),
+    summary.WithSummaryHookAbortOnError(true),
+)
+```
+
+## Summary Trigger Mechanism
+
+### Automatic Trigger (Recommended)
+
+The Runner automatically checks trigger conditions after each conversation completes, generating summaries asynchronously in the background when conditions are met.
+
+When `WithSyncSummaryIntraRun(true)` is enabled, the Flow synchronously calls `CreateSessionSummary(...)` between LLM iterations in the same `Run`, so the next LLM call can use the latest summary. Redundant async enqueueing for intermediate tool results is skipped; the final assistant response can still enqueue a summary job to refresh the turn-ending state. With an available async worker and queue capacity, that job runs in the background. If no async worker is configured or the queue is full, `EnqueueSummaryJob` may fall back to synchronous summary creation, so this is not a hard non-blocking guarantee. The sync path and async workers share the same boundary/delta checks and process-local session/filterKey serialization, which normally avoids duplicate expensive LLM summaries for the same events in a single process, but it is not a cross-instance distributed lock.
+
+**Trigger timing**:
+
+- Event count exceeds threshold (`WithEventThreshold`)
+- Token count exceeds threshold (`WithTokenThreshold`)
+- Token count exceeds the configured ratio of the active model's context window (`WithContextThreshold`)
+- The idle gap before the current top-level request exceeds the interval (`WithTimeThreshold` in the Runner path)
+- Custom combined conditions met (`WithChecksAny` / `WithChecksAll`)
+
+`WithTimeThreshold` is not a standalone background timer. In the automatic Runner path, the framework records when a top-level request arrives and compares that immutable time with the previous relevant event in the same summary scope. For example, `5*time.Minute` means "when the next top-level request arrives after more than five minutes of scoped inactivity, its summary check may trigger." Model latency and async worker queue time do not count toward the gap. Direct checker or summary API calls without a Runner request observation retain the legacy last-event-age behavior.
+
+### Same-Run Sync Summary for Long ReAct Loops
+
+The default automatic path is asynchronous: after the Runner appends a
+qualifying complete response event, such as a `tool result` or final assistant
+response, it enqueues a summary job and a background worker later checks whether
+a summary should be generated. User messages, tool-call responses, invalid
+content, `SkipSummarization` events, and sync-summary intermediate tool results
+do not enqueue async summary jobs. This keeps the main request path light, but
+it may be too late when one `Run` contains multiple LLM/tool iterations and the
+next LLM call needs the freshly summarized state immediately.
+
+For agents that frequently call tools repeatedly inside the same `Run`, and
+where tool results can quickly grow the prompt, enable same-run sync summary:
+
+```go
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithSyncSummaryIntraRun(true),
+)
+```
+
+When enabled, the Flow performs one synchronous summary check between LLM loop
+iterations in the same `Run`. It calls `CreateSessionSummary(..., force=false)`,
+so it still respects the summarizer's event, token, time, or context-window
+thresholds; it does not force summary generation. With
+`WithAddSessionSummary(true)`, the next LLM request can inject the refreshed
+summary and, for ordinary completed history, append only events after the
+summary boundary. During the same `Run`, the request builder may still preserve
+or compact pre-boundary tool-call/tool-result messages that are needed to keep
+the active ReAct chain valid.
+
+To avoid duplicate work, intermediate `tool result` events skip redundant async
+summary enqueueing when same-run sync summary is active. The final assistant
+response can still enqueue an async job so the persisted session summary is
+up-to-date after the run ends. This option does not replace the default
+cross-run async summary behavior.
+
+Same-run sync summary may put an extra summary LLM call on the main path. Use
+it for long ReAct loops, coding agents, repeated large tool outputs, or
+near-context-window situations. For general online Q&A and latency-sensitive
+traffic, prefer the default async summary path.
+
+### Manual Trigger
+
+In some scenarios, you may need to manually trigger summarization:
+
+```go
+// Async summary (recommended) - background processing, non-blocking
+err := sessionService.EnqueueSummaryJob(
+    ctx,
+    sess,
+    session.SummaryFilterKeyAllContents,
+    false,
+)
+
+// Sync summary - immediate processing, blocks current operation
+err := sessionService.CreateSessionSummary(
+    ctx,
+    sess,
+    session.SummaryFilterKeyAllContents,
+    false,
+)
+
+// Async forced summary - ignores trigger conditions
+err := sessionService.EnqueueSummaryJob(
+    ctx,
+    sess,
+    session.SummaryFilterKeyAllContents,
+    true,
+)
+
+// Sync forced summary - immediate forced generation
+err := sessionService.CreateSessionSummary(
+    ctx,
+    sess,
+    session.SummaryFilterKeyAllContents,
+    true,
+)
+```
+
+**API description:**
+
+- **`EnqueueSummaryJob`**: Async summary (recommended)
+  - Background processing, non-blocking
+  - Auto-fallback to sync on failure
+  - Suitable for production
+
+- **`CreateSessionSummary`**: Sync summary
+  - Immediate processing, blocks current operation
+  - Returns result directly
+  - Suitable for debugging or when immediate results are needed
+
+**Parameter description:**
+
+- **filterKey**: `session.SummaryFilterKeyAllContents` generates a summary for the full session
+- **force parameter**:
+  - `false`: Respects configured trigger conditions; only generates summary when conditions are met
+  - `true`: Forces summary generation, completely ignoring all trigger condition checks
+
+**Use cases:**
+
+| Scenario | Recommended API | force |
+| --- | --- | --- |
+| Normal conversation flow | Auto-trigger (no call needed) | - |
+| Background batch processing | `EnqueueSummaryJob` | `false` |
+| User-initiated request | `EnqueueSummaryJob` | `true` |
+| Debug/Test | `CreateSessionSummary` | `true` |
+| Session end | `EnqueueSummaryJob` | `true` |
+
+## Context Injection Mechanism
+
+The framework provides two modes for managing conversation context sent to the LLM:
+
+Before choosing a mode, distinguish the three context-reduction mechanisms:
+
+| Mechanism | Layer | What changes | Typical use |
+| --- | --- | --- | --- |
+| Summary | Session Service + prompt assembly | Uses an LLM to create a persisted summary of historical events. With `WithAddSessionSummary(true)`, the request injects that summary and appends only incremental events after the summary point | Preserve semantic continuity in long sessions while avoiding repeated full-history prompts |
+| Context compaction | Agent prompt assembly | Does not call an LLM and does not drop whole turns. It only rewrites `tool result` content during request projection, such as replacing old results with placeholders or truncating oversized results with head+tail preservation | Keep the conversation structure and active tool chain while shrinking large tool outputs |
+| Token tailoring | Model provider | Drops or keeps message rounds according to a token budget right before the provider call. The default strategy tries to preserve system messages and the latest turn, but preservation is still limited by the available budget | Final fallback to keep the request within the model context window |
+
+The normal call path is: the agent assembles the prompt, injects the summary when
+configured, and optionally compacts `tool result` content. If summary injection is
+enabled and the compacted request still approaches the context window, the flow
+may synchronously refresh the summary once and rebuild the request before the LLM
+call. Finally, model-layer token tailoring trims the message list by budget. In
+short, context compaction and token tailoring can both reduce prompt size, but
+compaction shrinks tool-output payloads inside messages, while tailoring drops
+message rounds. Summary is different again: it creates a semantic replacement for
+historical context.
+
+### Mode 1: Enable Summary Injection (Recommended)
+
+```go
+llmagent.WithAddSessionSummary(true)
+```
+
+**How it works**:
+
+- Session summary is **merged into the existing system message** if one exists, or prepended as a new system message if none exists
+- This ensures compatibility with models that require a single system message at the beginning (e.g., Qwen3.5 series)
+- Includes **all incremental events** after the summary point. When a synchronous intra-run summary advances the boundary inside the current invocation, request rebuilding also preserves the current user message and the latest complete pre-boundary tool round as a bounded resume tail
+- Preserves semantic continuity through compressed history, post-boundary events, and the bounded current-invocation resume tail; older covered tool rounds are represented only by the summary
+- **`WithMaxHistoryRuns` parameter is ignored**
+
+#### Summary Injection Mode
+
+By default, the summary is injected as a **system message** (merged into the existing system prompt). In this mode, the summary is protected by token tailoring's preserved head and will not be trimmed by the sliding window.
+
+To allow the summary to participate in token-budget trimming for a true **sliding-window** experience, switch the injection mode to `user`:
+
+```go
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithSessionSummaryInjectionMode(llmagent.SessionSummaryInjectionUser),
+)
+```
+
+**Injection mode comparison**:
+
+| Mode | Injection Position | Token Tailoring Behavior | Use Case |
+| --- | --- | --- | --- |
+| `SessionSummaryInjectionSystem` (default) | Merged into system message | Summary is in the preserved head and never trimmed | Summary must always be present |
+| `SessionSummaryInjectionUser` | Merged into the first user history/current message when possible; otherwise inserted near history | Summary participates in round trimming and can be evicted; stable system prefixes are easier to cache | Sliding window for very long conversations and prompt-cache-sensitive workloads |
+
+Memory preload and session recall preload keep their own placement settings.
+They default to system context for compatibility, so they remain in the
+preserved head during token tailoring. For cache-sensitive workloads, opt in to
+user/history placement explicitly:
+
+```go
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithPreloadMemory(10),
+    llmagent.WithPreloadMemoryInjectionMode(llmagent.PreloadMemoryInjectionUser),
+    llmagent.WithPreloadSessionRecall(5),
+    llmagent.WithPreloadSessionRecallInjectionMode(llmagent.PreloadSessionRecallInjectionUser),
+)
+```
+
+User placement keeps stable system prefixes more cache-friendly, but preloaded
+memory and recalled session events participate in token tailoring and can be
+trimmed.
+
+**User mode message structure**:
+
+When the first history message is a user role, the summary is merged into it:
+
+```text
+┌─────────────────────────────────────────┐
+│ System Prompt                           │ ← Does not contain summary
+├─────────────────────────────────────────┤
+│ [Few-shot examples, if any]             │
+├─────────────────────────────────────────┤
+│ User: [summary context] + [original    │
+│        first user message]              │ ← Summary merged into first user history
+├─────────────────────────────────────────┤
+│ Assistant: ...                          │
+│ User: ...                               │
+│ ...                                     │
+│ User: current message                   │
+└─────────────────────────────────────────┘
+```
+
+When the first history message is not a user role, the summary is a standalone user message:
+
+```text
+┌─────────────────────────────────────────┐
+│ System Prompt                           │ ← Does not contain summary
+├─────────────────────────────────────────┤
+│ [Few-shot examples, if any]             │
+├─────────────────────────────────────────┤
+│ User: Context from previous             │
+│ interactions: <summary>...</summary>    │ ← Standalone summary user message
+├─────────────────────────────────────────┤
+│ Assistant/Tool history events           │
+│ ...                                     │
+│ User: current message                   │
+└─────────────────────────────────────────┘
+```
+
+**Notes**:
+
+- In user mode, the processor first tries to merge the summary into the first user history/current message so it stays attached to the live user turn
+- If there is no user history/current message and the prompt prefix already ends with a user message (for example, injected context), the summary falls back to that trailing user message instead of adding another adjacent user block
+- User mode uses a more neutral default template ("Context from previous interactions") to avoid system-instruction tone in a user role message
+- Custom `WithSummaryFormatter` also applies to user mode
+- The summary **generation pipeline is unaffected** — injection mode only changes prompt assembly, not the summarizer itself
+
+> **Tip**: For very long conversations (hundreds of turns) where you want old summaries to naturally age out (replaced by newer summaries), use `SessionSummaryInjectionUser` mode.
+
+#### Context Compaction Details
+
+Context compaction is not another name for summary, and it is not token
+tailoring. It only targets `tool result` content, which is the part most likely
+to grow unexpectedly. It does not summarize ordinary user/assistant messages
+with an LLM, and it does not discard complete message rounds the way token
+tailoring may.
+
+> **Naming note**: "compaction" in `WithEnableContextCompaction(true)` means
+> prompt-side tool result compaction/pruning. Semantic summaries are still
+> controlled by `WithAddSessionSummary(true)` and the configured session
+> summarizer.
+
+When `WithEnableContextCompaction(true)` is enabled, the framework applies the following `tool result` compaction passes before the LLM call, depending on configuration:
+
+**Pass 0 — Tool-name forced placeholder** (`ForceCleanToolNames`, empty by default):
+
+- Applies only to historical `tool result` payloads whose tool name appears in `ForceCleanToolNames`; it does not require the payload to exceed `ContextCompactionToolResultMaxTokens`
+- The current request and recent protected request/invocation units are not affected; `KeepToolNames` has higher priority
+- Useful for noisy historical outputs from tools such as shell, grep, and log dump tools
+
+**Pass 1 — Historical tool result placeholder** (`ContextCompactionToolResultMaxTokens`, default 1024 tokens):
+
+- Tool results from **older** requests that exceed the threshold are replaced entirely with a short placeholder while keeping `ToolID` and `ToolName`
+- The current/recent protected set is never affected. This set includes the current request, the latest `ContextCompactionKeepRecentRequests` completed requests, and the request/invocation units that own the tail events returned by `ToolResultCompactionConfig.SkipRecentFunc`
+- `SkipRecentFunc` and `ContextCompactionKeepRecentRequests` are additive. Set `ContextCompactionKeepRecentRequests` to `0` if you want the custom recency function to define the recent boundary by itself
+- This cleans up accumulated long tool outputs from earlier conversation turns
+
+**Pass 2 — Oversized tool result truncation** (`ContextCompactionOversizedToolResultMaxTokens`, **default 0 / disabled**):
+
+- Applies to **nearly all** tool results including the current request. Tool results returned by `session_load` itself are skipped so recovered slices are not compacted again
+- Tool results exceeding this threshold are truncated using head+tail preservation: the beginning and end of the content are kept, with a `[...N characters truncated...]` marker in the middle
+- This is the safety net for single tool results large enough to overflow the context window on their own (e.g. `web_fetch` returning 800K+ chars of HTML)
+
+The passes have different roles: Pass 0 is an explicit tool-name policy; Pass 1 aggressively cleans old history (low threshold, full replacement); Pass 2 is a high-threshold guard that only kicks in for extreme cases and can also apply to the current request.
+
+Synchronous intra-run summary has one additional projection rule. If the new
+summary boundary covers events from the current invocation, the boundary is
+hard for ordinary covered history, but the rebuilt main-agent request keeps:
+
+1. The current invocation's user message.
+2. The latest complete tool round before the boundary, including all calls and
+   matching results in a parallel batch.
+3. All incremental events after the boundary.
+
+Only that latest complete pre-boundary round is restored; earlier covered tool
+rounds remain represented by the summary. This small resume tail prevents the
+main model from treating a completed tool step as missing and repeating a
+side-effecting call. When context compaction is enabled, each restored tool-call
+argument payload and each non-kept tool result is checked independently against
+`ContextCompactionToolResultMaxTokens`; only an item that exceeds the threshold
+is replaced with a protocol-preserving placeholder. When context compaction is
+disabled, the framework does not rewrite those payloads. If the boundary falls
+between a tool call and its result, the existing call/result pairing repair
+keeps the provider request valid without restoring unrelated covered history.
+
+Pass 2 is disabled by default (`0`). It only fires when both (1) `WithEnableContextCompaction(true)` is set and (2) `ContextCompactionOversizedToolResultMaxTokens > 0` (recommended opt-in value: `8192`, exposed as the constant `processor.DefaultContextCompactionOversizedToolResultMaxTokens`). This guarantees that `EnableContextCompaction=false` always means "the framework will not modify any tool result".
+
+Use `WithToolResultCompactionConfig(...)` when you need tool-name or recency policy:
+
+- `ForceCleanToolNames`: historical results from these tools are replaced by Pass 0 with a policy placeholder whenever context compaction is enabled, after current/recent protection is applied. This is useful for noisy tools such as shell, grep, or log dump tools.
+- `KeepToolNames`: results from these tools are left untouched by context compaction. This is useful for recovery tools such as `session_load` and `session_search` when the model may need to read the exact payload.
+- `SkipRecentFunc`: customizes how many tail events are considered recent. Together with `ContextCompactionKeepRecentRequests`, it forms the recent protected set used by Pass 0 force-clean and Pass 1 historical classification; Pass 2 can still truncate oversized recent/current tool results.
+
+If the same tool name appears in both `ForceCleanToolNames` and `KeepToolNames`, `KeepToolNames` wins.
+
+When a Pass 1 placeholder or Pass 2 truncation marker is created from an event with an `event_id`, it includes recovery hints such as `event_id`, `tool_call_id`, and `tool_name`; Pass 0 policy placeholders do not include these recovery hints. With `WithEnableOnDemandSession(true)` and a session backend that implements `session.WindowService`, the model can call `session_load` with `content_offset` / `content_limit` to reload a precise slice of the original tool result. `session_load` output size is controlled by its own window parameters and `content_limit`; reload very large results in slices instead of requesting the full payload at once.
+
+Additionally:
+
+- If `WithAddSessionSummary(true)` is also enabled and the rebuilt request still approaches the model context window, the framework performs one synchronous `CreateSessionSummary(...)` retry before calling the model
+- Model-layer token tailoring remains the final fallback. It trims whole message rounds, so keep recovered slices small enough that they still fit in the final provider request
+- Context compaction uses `SimpleTokenCounter` by default. If your application
+  uses a custom counter for CJK-heavy prompts or provider-specific tokenization,
+  pass the same counter with `WithContextCompactionTokenCounter(...)` so Pass 1
+  decisions and Pass 2 truncation use the same estimate as token tailoring.
+
+```go
+counter := model.NewSimpleTokenCounter(
+    model.WithApproxRunesPerToken(1.6), // About 1.6 chars/token; this value is a divisor, not a multiplier.
+)
+
+modelInstance := openai.New(
+    "deepseek-v4-flash",
+    openai.WithEnableTokenTailoring(true),
+    openai.WithTokenCounter(counter),
+)
+
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithEnableContextCompaction(true), // only shrinks tool results; does not generate a summary
+    llmagent.WithContextCompactionThresholdRatio(0.7),
+    llmagent.WithContextCompactionToolResultMaxTokens(1024),  // Pass 1: old tool results → placeholder
+    llmagent.WithContextCompactionOversizedToolResultMaxTokens(8192),  // Pass 2: any huge result → head+tail
+    llmagent.WithContextCompactionKeepRecentRequests(1),
+    llmagent.WithContextCompactionTokenCounter(counter),
+    llmagent.WithToolResultCompactionConfig(&llmagent.ToolResultCompactionConfig{
+        ForceCleanToolNames: []string{"shell", "grep"},
+        KeepToolNames:       []string{"session_load", "session_search"},
+        SkipRecentFunc: func(events []event.Event) int {
+            // For example, protect the request/invocation units that own the
+            // last 3 events so an in-flight tool chain is not treated as old
+            // history by Pass 1.
+            return 3
+        },
+    }),
+)
+```
+
+See
+[examples/context_compaction](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/context_compaction)
+for a full example. It calls a real model and prints the exact request sent to
+the model by default with `-debug=true`, which makes it easy to verify whether
+large historical `tool result` payloads were replaced with placeholders.
+
+**Context structure**:
+
+```
+┌─────────────────────────────────────────┐
+│ System Prompt                           │
+│ (merged with Session Summary)           │ ← System prompt + compressed history
+├─────────────────────────────────────────┤
+│ User: current invocation message        │ ← Preserved across an intra-run cutoff
+├─────────────────────────────────────────┤
+│ Latest complete pre-cutoff tool round   │ ← At most one; oversized payloads may be placeholders
+├─────────────────────────────────────────┤
+│ Event 1 (after summary)                 │ ┐
+│ Event 2                                 │ │ Incremental events after summary
+│ ...                                     │ │ (subject to configured compaction/tailoring)
+│ Event N                                 │ ┘
+└─────────────────────────────────────────┘
+```
+
+**Model Compatibility**:
+
+Some LLM providers have strict requirements for system message placement and count:
+
+- **Qwen3.5 series** and similar models require the system message to be at the beginning and do not support multiple system messages
+- The default merging behavior prevents errors like `System message must be at the beginning`
+- Preloaded memory content is also merged into the system message using the same mechanism
+
+### Mode 2: Without Summary
+
+```go
+llmagent.WithAddSessionSummary(false)
+llmagent.WithMaxHistoryRuns(10)
+```
+
+**How it works**:
+
+- No summary message added
+- Only includes the most recent `MaxHistoryRuns` conversation turns
+- `MaxHistoryRuns=0` means no limit, includes all history
+- If `WithEnableContextCompaction(true)` is enabled, oversized tool results in older retained requests can still be compacted during request projection (Pass 1). If you also explicitly set `WithContextCompactionOversizedToolResultMaxTokens(8192)` (or another positive value), extremely large tool results in any request (including the current one) will be head+tail truncated (Pass 2). Both passes require the `EnableContextCompaction=true` master switch.
+- The pre-LLM synchronous summary retry is disabled in this mode
+
+**Context structure**:
+
+```
+┌─────────────────────────────────────────┐
+│ System Prompt                           │
+├─────────────────────────────────────────┤
+│ Event N-k+1                             │ ┐
+│ Event N-k+2                             │ │ Last k runs
+│ ...                                     │ │ (MaxHistoryRuns=k)
+│ Event N (current message)               │ ┘
+└─────────────────────────────────────────┘
+```
+
+### Mode Selection Guide
+
+| Scenario | Recommended Config | Description |
+| --- | --- | --- |
+| Long sessions (support, assistant) | `AddSessionSummary=true` | Maintain full context, optimize tokens |
+| Short sessions (single consultation) | `AddSessionSummary=false`<br>`MaxHistoryRuns=10` | Simple and direct, no summary overhead |
+| Debug/Test | `AddSessionSummary=false`<br>`MaxHistoryRuns=5` | Quick validation, reduce noise |
+| High concurrency | `AddSessionSummary=true`<br>Increase worker count | Async processing, no impact on response speed |
+
+If your long sessions frequently contain large tool outputs such as search results, logs, or code scan output, enable `EnableContextCompaction=true`. Pair it with `AddSessionSummary=true` when you also want the pre-LLM synchronous summary retry.
+
+> **Tip**: If your agent uses tools like `web_fetch` that can return extremely large results in a single call, `ContextCompactionOversizedToolResultMaxTokens` is particularly valuable — it prevents a single tool result from consuming the entire context window, even when that result belongs to the current (protected) request. It is **disabled by default**; opt in by enabling `WithEnableContextCompaction(true)` and passing a positive threshold (recommended: `8192`).
+
+## Summary Format Customization
+
+By default, session summaries are formatted with context tags and a note about prioritizing current conversation information:
+
+**Default format**:
+
+```
+Here is a brief summary of your previous interactions:
+
+<summary_of_previous_interactions>
+[Summary content]
+</summary_of_previous_interactions>
+
+Note: this information is from previous interactions and may be outdated. You should ALWAYS prefer information from this conversation over the past summary.
+```
+
+You can use `WithSummaryFormatter` to customize the summary format:
+
+```go
+agent := llmagent.New(
+    "my-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithAddSessionSummary(true),
+    llmagent.WithSummaryFormatter(func(summary string) string {
+        return fmt.Sprintf("## Previous Context\n\n%s", summary)
+    }),
+)
+```
+
+**Use cases**:
+
+- **Simplified format**: Use concise titles and minimal context hints to reduce token consumption
+- **Language localization**: Translate context hints to the target language
+- **Role-specific format**: Provide different formats for different Agent roles
+- **Model optimization**: Adjust format based on specific model preferences
+
+## Retrieving Summaries
+
+```go
+// Get full session summary (default)
+summaryText, found := sessionService.GetSessionSummaryText(ctx, sess)
+if found {
+    fmt.Printf("Summary: %s\n", summaryText)
+}
+
+// Get summary for a specific filter key
+userSummary, found := sessionService.GetSessionSummaryText(
+    ctx, sess, session.WithSummaryFilterKey("user-messages"),
+)
+if found {
+    fmt.Printf("User message summary: %s\n", userSummary)
+}
+```
+
+**Filter Key support**:
+
+- When no option is provided, returns the full session summary (`SummaryFilterKeyAllContents`)
+- When a specific filter key is provided but not found, falls back to the full session summary
+- If neither exists, falls back to any available summary
+
+## Summary by Event Type
+
+In practice, you may want to generate independent summaries for different types of events.
+
+### Setting FilterKey with AppendEventHook
+
+```go
+sessionService := inmemory.NewSessionService(
+    inmemory.WithAppendEventHook(func(ctx *session.AppendEventContext, next func() error) error {
+        prefix := "my-app/"
+        switch ctx.Event.Author {
+        case "user":
+            ctx.Event.FilterKey = prefix + "user-messages"
+        case "tool":
+            ctx.Event.FilterKey = prefix + "tool-calls"
+        default:
+            ctx.Event.FilterKey = prefix + "misc"
+        }
+        return next()
+    }),
+)
+```
+
+### FilterKey Prefix Convention
+
+**Important: FilterKey must include the `appName + "/"` prefix.**
+
+**Reason**: The Runner uses `appName + "/"` as the filter prefix when filtering events. If the FilterKey doesn't have this prefix, events will be filtered out.
+
+```go
+// Correct: with appName prefix
+evt.FilterKey = "my-app/user-messages"
+
+// Wrong: no prefix, events will be filtered out
+evt.FilterKey = "user-messages"
+```
+
+`EventFilterKey` / `filter_key` is a caller-supplied scope identifier. Do not
+put credentials, secrets, or user-private data in it. Diagnostic logs may
+include the original value, subject to the length limit described in
+[Diagnosing Summaries in Production](#diagnosing-summaries-in-production).
+
+### Generating Summaries by Type
+
+```go
+// Generate summary for user messages
+err := sessionService.CreateSessionSummary(ctx, sess, "my-app/user-messages", false)
+
+// Generate summary for tool calls
+err := sessionService.CreateSessionSummary(ctx, sess, "my-app/tool-calls", false)
+
+// Get summary for a specific type
+userSummary, found := sessionService.GetSessionSummaryText(
+    ctx, sess, session.WithSummaryFilterKey("my-app/user-messages"))
+```
+
+### Restricting Summary Targets
+
+By default, when a non-empty branch `FilterKey` triggers summarization, the
+session service refreshes both that branch summary and the full-session summary
+(`SummaryFilterKeyAllContents`). If some branches do not need summaries, you can
+reduce LLM usage with an allowlist and optionally disable the full-session
+cascade:
+
+```go
+sessionService := inmemory.NewSessionService(
+    inmemory.WithSummarizer(summarizer),
+    inmemory.WithSummaryFilterAllowlist(
+        "my-app/user-messages",
+        "my-app/tool-calls",
+    ),
+    inmemory.WithCascadeFullSessionSummary(false),
+)
+```
+
+Behavior notes:
+
+- `WithSummaryFilterAllowlist(...)` only controls non-empty branch summary
+  targets. It does not block `session.SummaryFilterKeyAllContents`.
+- `WithCascadeFullSessionSummary(...)` controls whether a non-empty branch
+  trigger also refreshes the full-session summary.
+- With `WithCacheSafeForking(true)`, a branch-triggered summary pass only runs
+  the branch summary LLM target when a parent fork request is available. It
+  does not fall back to a standalone full-session prompt and does not reuse the
+  branch-scoped fork request for a second LLM call. When every event loaded on
+  the session has the same `filterKey`, a materialized branch summary is copied
+  to `SummaryFilterKeyAllContents` in that pass. This loaded-window optimization
+  does not prove that older, unloaded history contains no other branches. On a
+  multi-`filterKey` session, the full-session cascade target is skipped; request
+  a full-session summary separately when you need one for all branches.
+- A full-session cascade is conditional on the branch target producing a
+  summary in the same pass. If the branch is not updated, the full-session
+  target is not run independently. Failed dependent targets are not retried
+  from inferred or framework-persisted recovery state; a later pass must
+  materialize the branch again. For immediate recovery, force the full-session
+  key directly, or force the branch cascade without a cache-safe parent fork.
+- Async enqueue success does not report later worker failures; dependent-target
+  errors are logged by the worker.
+- `WithSummaryJobTimeout(...)` applies to the complete summary job. Branch and
+  full-session targets run sequentially and share the same deadline, so allow
+  for their combined model and persistence latency.
+- To keep only full-session summaries from branch-triggered automatic summary,
+  pass an explicit empty allowlist and leave cascade enabled:
+
+```go
+sessionService, err := mysql.NewService(
+    mysql.WithMySQLClientDSN(dsn),
+    mysql.WithSummarizer(summarizer),
+    mysql.WithSummaryFilterAllowlist(""),
+)
+```
+
+- `mysql.WithSummaryFilterAllowlist("")` and
+  `mysql.WithSummaryFilterAllowlist()` both mean "no branch keys are allowed";
+  with the default cascade behavior, the full-session summary still refreshes.
+- If you also set `mysql.WithCascadeFullSessionSummary(false)`, non-empty branch
+  triggers have no summary target and no summary is generated.
+- Allowlist matching is hierarchical and segment-aware, not a raw string prefix
+  check. Internally the framework appends the filter-key delimiter (`"/"`) to
+  both sides and then checks whether either key is an ancestor/descendant of
+  the other.
+- Examples:
+  - Allowing `my-app/tool` matches `my-app/tool` and `my-app/tool/search`.
+  - Allowing `my-app/tool/search` also matches `my-app/tool`.
+  - Allowing `my-app/tool` does not match `my-app/toolbox`.
+  - Allowing `my-app/tool` does not match `other-app/tool`.
+- `session.SummaryFilterKeyAllContents` remains available for direct
+  full-session summaries even when an allowlist is configured.
+- Leaving the allowlist unset preserves the legacy behavior and allows every
+  branch `FilterKey` to trigger summaries.
+- Passing an explicit empty allowlist blocks branch summary targets; with
+  cascade enabled, branch triggers still refresh the full-session summary.
+
+## How It Works
+
+1. **Incremental processing**: The summarizer tracks the last summary time for each session; subsequent runs only process events after the last summary
+2. **Incremental summary**: New events are combined with the previous summary to generate an updated summary containing both old context and new information
+3. **Trigger condition evaluation**: Before generating a summary, configured trigger conditions are evaluated. If conditions are not met and `force=false`, summarization is skipped
+4. **Async workers**: Summary tasks are distributed to multiple worker goroutines using a hash-based distribution strategy, ensuring tasks for the same session are processed in order
+5. **Fallback mechanism**: If async enqueue fails (queue full, context cancelled, or workers not initialized), the system automatically falls back to synchronous processing
+
+## Best Practices
+
+1. **Choose appropriate thresholds**: Use `WithContextThreshold` for agents whose model can change at runtime, and use `WithTokenThreshold` when you intentionally want a fixed token budget. For custom or tenant-provided models, prefer per-model `WithContextWindow` or per-run `agent.WithModelContextWindow`; use global registration only for stable process-wide model names
+2. **Use async processing**: Always use `EnqueueSummaryJob` instead of `CreateSessionSummary` in production to avoid blocking conversation flow
+3. **Monitor queue size**: If you frequently see "queue is full" warnings, increase `WithSummaryQueueSize` or `WithAsyncSummaryNum`
+4. **Customize prompts**: Tailor summary prompts to your application needs. For example, if building a customer support Agent, focus on key issues and solutions
+5. **Balance word limits**: Set `WithMaxSummaryWords` to balance context preservation and token usage. Typical range is 100-300 words
+6. **Test trigger conditions**: Experiment with different `WithChecksAny` and `WithChecksAll` combinations to find the optimal balance between summary frequency and cost
+
+## Diagnosing Summaries in Production
+
+Summary generation and persistence diagnostics are not returned as the
+user-visible model response. Generation may run in a background async worker
+or synchronously inside a request, for example pre-LLM context compaction.
+The framework emits four stable log records that let you follow one session
+summary from generation to injection. All of them are emitted on the request
+or job context, so they share your existing trace correlation.
+
+**No record contains prompt text, summary text, event content, model output,
+raw error text, connection strings, or credentials.** Framework-owned user
+and session identifiers are never logged. Caller-supplied `filter_key` values
+are logged and are outside that guarantee. Caller-supplied `agent` names are
+also logged. Do not put credentials, secrets, or user-private data in an agent
+name. The framework does not hash or redact these names.
+
+`EventFilterKey` / `filter_key` is a caller-supplied scope identifier. It must
+not contain credentials, secrets, or user-private data. Diagnostic records log
+the original value (never hashed). The displayed value is at most 255 Unicode
+code points, matching the common `session_summaries.filter_key VARCHAR(255)`
+schema, and that budget includes the truncation marker. Keys within the limit
+are logged unchanged. Oversize keys keep a leading prefix so that prefix plus
+the `...` marker still totals 255 code points, and the record sets
+`filter_key_truncated=true` (or `trigger_filter_key_truncated=true` on cascade
+records). Empty keys stay visible as `filter_key=""`. Truncation affects
+diagnostic display only; stored keys and queries are unchanged. `agent` uses
+the same bounded `%q` display rules and an `agent_truncated` flag.
+
+Every record starts with `schema_version=1` immediately after the record name
+so collectors can detect a later incompatible field change. The version stays
+at 1 until this diagnostic schema is formally published.
+
+These records observe generation, persistence, cascade, injection, and pre-LLM
+compaction. They do not add a public SessionService API and they do not add a
+diagnostics enable switch.
+
+Proven return contracts against the pre-diagnostics Redis path:
+
+- `CreateSessionSummary` still returns a nil error when the set-if-newer Lua
+  script itself succeeds, including when the reply is not `int64` 0 or 1. An
+  unrecognized reply is classified as `persist_result=unknown` /
+  `outcome=unknown_write` at Debug. It is not stored, stale, `success`, or
+  `persistence_error`, and it does not change the method's return value.
+- A real script, marshal, or expire failure still returns an error and is
+  reported as `persist_result=error` / `outcome=persistence_error`.
+
+Summary selection, cutoff, cascade call order, `force` values, error wrapping,
+injection text, and compaction decisions stay on their existing code paths.
+
+### Diagnostic cost
+
+- An ordinary summary-attempt record is constant-size metadata: counts, enums,
+  timings, and a truncated filter-key display. It does not copy events,
+  prompts, or summary text.
+- Checking whether a selected injection block is still present is
+  `O(total request message bytes)`. That scan runs only when session-summary
+  injection is enabled for the request. The request is not copied.
+
+### Record names and key fields
+
+| Record | Emitted when | Key fields |
+| --- | --- | --- |
+| `Session summary result` | Once per summary target, after the summary attempt completes | `schema_version`, `outcome`, `dispatch`, `target_kind`, `filter_key`, `filter_key_truncated`, `triggered`, `trigger`, `trigger_metric`, `trigger_value`, `trigger_threshold`, `threshold_ratio`, `context_window`, `summary_view_present`, `summary_view_bound`, `binding_reason`, `input_source`, `selection_reason`, `eligible_events`, `skip_recent_requested`, `skip_recent_applied`, `selected_events`, `model_call_status`, `updated`, `boundary_advanced`, `persist_result` |
+| `Session summary cascade result` | Once per cascade dispatch that fans a branch trigger out to the full-session target | `schema_version`, `outcome`, `mode`, `trigger_filter_key`, `trigger_filter_key_truncated`, `targets`, `source_materialized`, `action`, `invariant` |
+| `Session summary injection result` | Once per model request that uses session summaries, after the returned response sequence finishes or is stopped early; if the model call fails before returning a response sequence, the record is emitted immediately | `schema_version`, `outcome`, `agent`, `agent_truncated`, `filter_key`, `filter_key_truncated`, `lookup_strategy`, `lookup_result`, `selected`, `block_text_present`, `stored_summaries`, `matching_candidates`, `full_session_summary`, `session_events`, `history_messages`, `request_messages` |
+| `Pre-LLM context compaction result` | Once per synchronous compaction attempt before an LLM call | `schema_version`, `outcome`, `agent`, `agent_truncated`, `filter_key`, `filter_key_truncated`, `request_tokens`, `threshold`, `context_window`, `messages`, `summary_view_bound`, `binding_reason` |
+
+`Session summary result` outcomes:
+
+| Outcome | Level | Meaning |
+| --- | --- | --- |
+| `success` | Info | A new summary was generated and the backend confirmed the write |
+| `copied` | Debug | A cascade reused an existing summary for this target without a model call |
+| `below_threshold` | Debug | A trigger check ran and stayed below its threshold |
+| `no_delta` | Debug | No event was appended after the recorded summary boundary |
+| `no_content` | Debug | The built-in summarizer published a trigger observation and no eligible content reached the summary model |
+| `unobserved` | Debug | The gate did not fire and this attempt published no trigger observation. This is diagnostic uncertainty, not `no_content` or `below_threshold` |
+| `cascade_suppressed` | Debug | A full-session target was skipped because it was only requested as a branch cascade |
+| `unsafe_view` | Warn | Content existed, but the model-visible view was not bound to the request the model answered, so nothing could be summarized safely |
+| `summary_error` | Warn | The summarization stage failed. `model_call_status` separates a failed model call from a pre-model build, a custom response, or an unobserved custom summarizer |
+| `context_error` | Warn | The summary context was canceled or expired |
+| `persistence_error` | Warn | The backend write failed |
+| `stale_write` | Debug | The backend skipped the payload write because a newer summary is already persisted. This is a successful set-if-newer skip and can happen under normal concurrency. The Redis zset path may still refresh the summary key TTL; the hashidx path keeps the remaining TTL. TTL refresh is not a stored write |
+| `unknown_write` | Debug | The backend write finished without error, but the result could not be classified as stored or stale. This includes an unrecognized set-if-newer reply and a Mongo nil or zero-count UpdateResult. This is diagnostic uncertainty, not a business failure |
+| `not_stored` | Warn | A summary was generated but the backend neither stored nor rejected it |
+| `no_update` | Warn | A triggered attempt produced no summary to store |
+
+`model_call_status` is a closed three-state field. Do not treat
+`unobserved` as "the model was not called":
+
+| `model_call_status` | Meaning |
+| --- | --- |
+| `called` | The built-in summarizer reached the summary model (`standalone` or `cache_safe_fork`) |
+| `custom_response` | A before-model callback supplied the summary response, so the provider was not called |
+| `unobserved` | This attempt's ModelCall recorder published no call mode, so a model call cannot be proven. Typical of a custom summarizer that does not publish the recorder. Do not treat a leftover `Report.Call.Mode` as this attempt's observation |
+
+`Session summary injection result` outcomes:
+
+| Outcome | Level | Meaning |
+| --- | --- | --- |
+| `block_text_present` | Debug | After the returned response sequence finishes or is stopped early, the recorded summary block text still appears as a substring of some message `Content` in the same framework `model.Request` (`block_text_present=true`). This does not prove the original injection slot is intact and does not describe a provider payload. If the model call fails before returning a response sequence, this is observed immediately |
+| `not_selected` | Debug | The session stores no summary yet |
+| `lookup_miss` | Debug | Summaries exist for other branches, but none in this request's scope |
+| `scope_mismatch` | Debug | A branch-scoped request found nothing in scope while a full-session summary exists outside it. Because no in-scope summary was selected, this request's summary cutoff stays zero, so the raw scoped history is kept at this stage. That does not depend on whether the unused full-session summary has a boundary |
+| `block_text_missing` | Warn | A summary was selected (`selected=true`), but the recorded block text is not observable in any message `Content` of the same framework `model.Request` after the returned response sequence finishes or is stopped early. If the model call fails before returning a response sequence, this is observed immediately. This does not claim the provider's final payload, and it does not mean the summary was never written into the request. For built-in providers that mutate the shared request in place, including OpenAI, this is usually in-place token tailoring |
+
+### How much history was selected before the summary hook
+
+When `outcome` is `no_content` or `unsafe_view`, `selection_reason` names the
+exact stage that emptied the input, which is otherwise indistinguishable from
+an idle session:
+
+| `selection_reason` | Meaning |
+| --- | --- |
+| `selected` | Events were selected before the hook; this does not prove they were the later model payload |
+| `no_candidates` | The stage had no candidate event to consider at all |
+| `skip_recent_all` | The `WithSkipRecent` callback asked to skip at least as many events as were available |
+| `unsafe_prefix` | Events remained after skip-recent, but the retained prefix had neither a user message nor a prepended previous summary to anchor the summary, so it was dropped |
+| `session_filter_empty` | Candidates survived skip-recent and were then all removed by the summary's branch scoping |
+| `unbound_view` | A model-visible view existed but was not bound to the request the model answered |
+| `boundary_unmapped` | Selected items had no structural mapping to a stored event, so the summary was dropped rather than advance the boundary past content that cannot be located again |
+| `custom` | The summary call did not publish the built-in event selection, so counts are unknown |
+| `none` | No summarizer ran, so no selection was observed |
+
+The accompanying counts describe the stage that receives the `WithSkipRecent`
+callback:
+
+- `eligible_events` is the number of candidate events handed to that stage,
+  counted before skip-recent runs. For a bound model-visible view it includes a
+  prepended previous summary; for an unbound view it is the number of view items
+  that were not considered.
+- `skip_recent_requested` is the raw count your callback returned, so a callback
+  returning a nonsensical value stays visible. It is `0` when no callback is
+  configured.
+- `skip_recent_applied` is how many events skip-recent itself removed:
+  `clamp(skip_recent_requested, 0, eligible_events)`. An unsafe retained prefix,
+  session scoping, or an unmapped boundary is named by `selection_reason` and
+  `selected_events`, not counted here. For example `eligible_events=3`,
+  `skip_recent_requested=1`, `unsafe_prefix` reports `skip_recent_applied=1` and
+  `selected_events=0`.
+- `selected_events` is the event count chosen after skip-recent, branch
+  scoping, and boundary mapping, before a `PreSummaryHook` or before-model
+  callback may rewrite the prompt. It is not a count of the payload that later
+  reached the summary model.
+
+All four counts are `-1` when `selection_reason` is `custom` or `none`.
+
+`trigger` and `trigger_metric` are taken only from this attempt's internal
+trigger recorder. Writing `summary.Report.Trigger` from a custom summarizer or
+a caller-supplied report is not an observation: a fired unpublished gate
+reports `triggered=true` with `trigger=none`, and an unfired unpublished gate
+reports `outcome=unobserved` and `trigger=none`. Leftover `Report.Trigger`
+values are never copied into the record. When a trigger observation is
+published, names and metrics outside the framework vocabulary are normalized
+to `custom`, so these fields stay bounded and never carry application
+strings. `trigger_value`, `trigger_threshold`, `threshold_ratio`, and
+`context_window` are reported unchanged.
+
+### Tracing one incident
+
+Follow the records in this order for a single request or session:
+
+1. **`Session summary result`** answers whether a summary was produced at all.
+   `triggered` plus the `trigger*` fields explain the gate decision;
+   `input_source`, `selection_reason`, and the event counts explain how much
+   history was selected before the hook and which stage removed the rest;
+   `binding_reason` explains an `unsafe_view`; `persist_result` distinguishes a
+   backend-confirmed store from a stale skip, an unclassified write, or a
+   failed write.
+2. **`Session summary cascade result`** explains how a branch trigger reached
+   the full-session target. `source_materialized` is this-pass branch
+   materialization only. `action=copied` requires a successful copy;
+   `action=dependent` requires that the full-session target started. Otherwise,
+   when the full-session target did not advance independently, the cascade is
+   `action=skipped` and `invariant=ok`, including a branch that did not update
+   and a materialized source that never copied or started the dependent target.
+   `mode=dependent` is a sequential multi-filter cascade, not concurrent
+   generation. `invariant=violation` is reserved for a full-session target that
+   advanced without this-pass branch materialization.
+3. **`Session summary injection result`** answers whether a later request
+   still carries the stored summary in the framework `model.Request` after
+   the returned response sequence finishes or is stopped early. If the model
+   call fails before returning a response sequence, this is observed
+   immediately. Compare `lookup_strategy` (the scope you
+   configured, driven by `WithBranchFilterMode`) with `lookup_result` (what
+   that scope found) and `full_session_summary`. `scope_mismatch` means a
+   full-session summary was unused, not that scoped history was dropped:
+   because nothing in scope was selected, this request's summary cutoff stays
+   zero and the raw scoped history is kept at this stage.
+4. **`Pre-LLM context compaction result`** and the token tailoring records
+   explain what happened to the request after injection. A
+   `block_text_missing` record next to a tailoring record, for a built-in
+   provider that mutates the shared request in place, means the original
+   summary block is no longer observable in the framework `model.Request`. A
+   custom `Model` that copies the request may leave the framework copy
+   unchanged, so this record still does not describe the provider payload.
+
+Routine Debug records such as `block_text_present`, healthy cascade results, `copied`,
+and `below_threshold` require the framework log level to be `debug`. At the
+normal Info level only the Info and Warn outcomes listed above are visible.
+
+## Performance Considerations
+
+- **LLM cost**: Each summary generation calls the LLM. Monitor trigger conditions to balance cost and context preservation
+- **Memory usage**: Summaries are stored alongside events. Configure appropriate TTL to manage memory in long-running sessions
+- **Async workers**: More workers increase throughput but consume more resources. Start with 2-4 workers and scale based on load
+- **Queue capacity**: Adjust queue size based on expected concurrency and summary generation time
+
+## Complete Example
+
+Here is a complete example demonstrating how all components work together:
+
+```go
+package main
+
+import (
+    "context"
+    "time"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+    "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+    "trpc.group/trpc-go/trpc-agent-go/session/summary"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // Create LLM model for chat and summary
+    llm := openai.New("gpt-4", openai.WithAPIKey("your-api-key"))
+
+    // Create summarizer with flexible trigger conditions
+    summarizer := summary.NewSummarizer(
+        llm,
+        summary.WithMaxSummaryWords(200),
+        summary.WithChecksAny(
+            summary.CheckEventThreshold(20),
+            summary.CheckTokenThreshold(4000),
+            summary.CheckTimeThreshold(5*time.Minute), // Runner path: trigger when the idle gap before the next request exceeds 5 minutes
+        ),
+    )
+
+    // Create session service with summarizer
+    sessionService := inmemory.NewSessionService(
+        inmemory.WithSummarizer(summarizer),
+        inmemory.WithAsyncSummaryNum(2),
+        inmemory.WithSummaryQueueSize(100),
+        inmemory.WithSummaryJobTimeout(60*time.Second),
+    )
+
+    // Create agent with summary injection enabled
+    agent := llmagent.New(
+        "my-agent",
+        llmagent.WithModel(llm),
+        llmagent.WithAddSessionSummary(true),
+        llmagent.WithMaxHistoryRuns(10),
+    )
+
+    // Create runner
+    r := runner.NewRunner("my-app", agent,
+        runner.WithSessionService(sessionService))
+
+    // Run conversation - summary will be managed automatically
+    userMsg := model.NewUserMessage("Tell me about AI")
+    eventChan, _ := r.Run(ctx, "user123", "session456", userMsg)
+
+    // Consume events
+    for event := range eventChan {
+        _ = event
+    }
+}
+```
+
+## References
+
+- [Summary Examples](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/summary)
+- [FilterKey Examples](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/summary/filterkey)
+- [Injection Mode Examples](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/summary/injection)

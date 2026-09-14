@@ -55,6 +55,10 @@ func TestSelectDocsTool_ReplaceAndAll(t *testing.T) {
 	repo, err := skill.NewFSRepository(root)
 	require.NoError(t, err)
 	sd := NewSelectDocsTool(repo)
+	inv := &agent.Invocation{
+		AgentName: "tester",
+		Session:   &session.Session{State: session.StateMap{}},
+	}
 
 	// replace with specific doc
 	out, err := sd.Call(context.Background(), []byte(
@@ -69,10 +73,17 @@ func TestSelectDocsTool_ReplaceAndAll(t *testing.T) {
 	require.Equal(t, 1, len(arr))
 	require.Equal(t, usageDoc, arr[0].(string))
 
-	delta := sd.StateDelta(nil, b)
+	delta := sd.StateDeltaForInvocation(inv, "call-1", nil, b)
 	require.NotNil(t, delta)
 	require.Contains(t,
-		string(delta[skill.StateKeyDocsPrefix+demoSkill]), usageDoc)
+		string(delta[skill.DocsKey("tester", demoSkill)]), usageDoc)
+	require.Equal(
+		t,
+		`["demo"]`,
+		string(delta[skill.LoadedOrderKey("tester")]),
+	)
+	inv.Session.State[skill.LoadedOrderKey("tester")] =
+		delta[skill.LoadedOrderKey("tester")]
 
 	// include all
 	out, err = sd.Call(context.Background(), []byte(
@@ -80,9 +91,14 @@ func TestSelectDocsTool_ReplaceAndAll(t *testing.T) {
 	))
 	require.NoError(t, err)
 	b, _ = json.Marshal(out)
-	delta = sd.StateDelta(nil, b)
+	delta = sd.StateDeltaForInvocation(inv, "call-2", nil, b)
 	require.Equal(t, []byte("*"),
-		delta[skill.StateKeyDocsPrefix+demoSkill])
+		delta[skill.DocsKey("tester", demoSkill)])
+	require.Equal(
+		t,
+		`["demo"]`,
+		string(delta[skill.LoadedOrderKey("tester")]),
+	)
 }
 
 func TestSelectDocsTool_AddAndClear(t *testing.T) {
@@ -93,9 +109,10 @@ func TestSelectDocsTool_AddAndClear(t *testing.T) {
 
 	// Prepare context with previous selection
 	inv := &agent.Invocation{
-		Session: &session.Session{State: session.StateMap{}},
+		AgentName: "tester",
+		Session:   &session.Session{State: session.StateMap{}},
 	}
-	key := skill.StateKeyDocsPrefix + demoSkill
+	key := skill.DocsKey("tester", demoSkill)
 	inv.Session.State[key] = []byte(`["` + usageDoc + `"]`)
 	ctx := agent.NewInvocationContext(context.Background(), inv)
 
@@ -123,9 +140,14 @@ func TestSelectDocsTool_AddAndClear(t *testing.T) {
 	))
 	require.NoError(t, err)
 	b, _ = json.Marshal(out)
-	delta := sd.StateDelta(nil, b)
+	delta := sd.StateDeltaForInvocation(inv, "call-3", nil, b)
 	require.Equal(t, "[]",
-		string(delta[skill.StateKeyDocsPrefix+demoSkill]))
+		string(delta[skill.DocsKey("tester", demoSkill)]))
+	require.Equal(
+		t,
+		`["demo"]`,
+		string(delta[skill.LoadedOrderKey("tester")]),
+	)
 }
 
 // stubRepo returns error for any Get. Others are unused in tests.
@@ -150,6 +172,20 @@ func TestSelectDocsTool_DeclarationSchema(t *testing.T) {
 	require.Contains(t, inProps, "docs")
 	require.Contains(t, inProps, "include_all_docs")
 	require.Contains(t, inProps, "mode")
+	require.Equal(
+		t,
+		[]any{modeAdd, modeReplace, modeClear},
+		inProps["mode"].Enum,
+	)
+	require.Equal(t, modeReplace, inProps["mode"].Default)
+	require.Contains(t, d.Description, "current selected-doc set")
+	require.Contains(t, d.Description, "defaults to replace")
+	require.Contains(t, inProps["docs"].Description, "every doc")
+	require.Contains(
+		t,
+		inProps["mode"].Description,
+		"non-enum value reaches the runtime",
+	)
 }
 
 func TestSelectDocsTool_ParseErrors(t *testing.T) {
@@ -178,14 +214,24 @@ func TestSelectDocsTool_ModeNormalization(t *testing.T) {
 	require.NoError(t, err)
 	sd := NewSelectDocsTool(repo)
 
-	// default/invalid -> replace
+	// omitted -> replace
 	out, err := sd.Call(context.Background(), []byte(
-		`{"skill":"`+demoSkill+`","docs":["`+usageDoc+`"],`+
-			`"mode":"invalid"}`,
+		`{"skill":"`+demoSkill+`","docs":["`+usageDoc+`"]}`,
 	))
 	require.NoError(t, err)
 	b, _ := json.Marshal(out)
 	var m map[string]any
+	require.NoError(t, json.Unmarshal(b, &m))
+	require.Equal(t, "replace", m["mode"])
+
+	// invalid -> replace
+	out, err = sd.Call(context.Background(), []byte(
+		`{"skill":"`+demoSkill+`","docs":["`+usageDoc+`"],`+
+			`"mode":"invalid"}`,
+	))
+	require.NoError(t, err)
+	b, _ = json.Marshal(out)
+	m = map[string]any{}
 	require.NoError(t, json.Unmarshal(b, &m))
 	require.Equal(t, "replace", m["mode"])
 
@@ -286,17 +332,17 @@ func TestSelectDocsTool_StateDeltaEdges(t *testing.T) {
 	sd := NewSelectDocsTool(nil)
 
 	// invalid JSON -> nil
-	delta := sd.StateDelta(nil, []byte("{"))
+	delta := sd.StateDelta("call-edge-1", nil, []byte("{"))
 	require.Nil(t, delta)
 
 	// empty skill -> nil
-	delta = sd.StateDelta(nil, []byte(`{"skill":""}`))
+	delta = sd.StateDelta("call-edge-2", nil, []byte(`{"skill":""}`))
 	require.Nil(t, delta)
 
 	// selected is null and include_all_docs false -> []
 	// We craft the JSON directly to hit this branch.
 	key := skill.StateKeyDocsPrefix + demoSkill
-	delta = sd.StateDelta(nil, []byte(
+	delta = sd.StateDelta("call-edge-3", nil, []byte(
 		`{"skill":"`+demoSkill+`","selected_docs":null,`+
 			`"include_all_docs":false}`,
 	))
@@ -304,7 +350,7 @@ func TestSelectDocsTool_StateDeltaEdges(t *testing.T) {
 	require.Equal(t, "[]", string(delta[key]))
 
 	// include_all_docs true -> "*"
-	delta = sd.StateDelta(nil, []byte(
+	delta = sd.StateDelta("call-edge-4", nil, []byte(
 		`{"skill":"`+demoSkill+`","include_all_docs":true}`,
 	))
 	require.Equal(t, []byte("*"), delta[key])
@@ -327,4 +373,58 @@ func TestSelectDocsTool_AddWithIncludeAll(t *testing.T) {
 	// When include_all_docs is true, selected should be omitted (nil).
 	_, ok := m["selected_docs"]
 	require.False(t, ok)
+}
+
+func TestSelectDocsTool_ContextAwareRepoHonorsFilter(t *testing.T) {
+	root1 := createDocsTestSkill(t, demoSkill)
+	root2 := createDocsTestSkill(t, otherSkill)
+	base, err := skill.NewFSRepository(root1, root2)
+	require.NoError(t, err)
+	repo := skill.NewFilteredRepository(
+		base,
+		func(ctx context.Context, summary skill.Summary) bool {
+			userID, _ := agent.GetRuntimeStateValueFromContext[string](
+				ctx,
+				"user_id",
+			)
+			if userID == "user-a" {
+				return summary.Name == demoSkill
+			}
+			return summary.Name == otherSkill
+		},
+	)
+	sd := NewSelectDocsTool(repo)
+	ctxA := agent.NewInvocationContext(
+		context.Background(),
+		agent.NewInvocation(agent.WithInvocationRunOptions(agent.RunOptions{
+			RuntimeState: map[string]any{"user_id": "user-a"},
+		})),
+	)
+
+	_, err = sd.Call(ctxA, []byte(
+		`{"skill":"`+demoSkill+`","docs":["`+usageDoc+`"]}`,
+	))
+	require.NoError(t, err)
+
+	_, err = sd.Call(ctxA, []byte(
+		`{"skill":"`+otherSkill+`","docs":["`+usageDoc+`"]}`,
+	))
+	require.ErrorContains(t, err, "unknown skill: "+otherSkill)
+
+	ctxB := agent.NewInvocationContext(
+		context.Background(),
+		agent.NewInvocation(agent.WithInvocationRunOptions(agent.RunOptions{
+			RuntimeState: map[string]any{"user_id": "user-b"},
+		})),
+	)
+
+	_, err = sd.Call(ctxB, []byte(
+		`{"skill":"`+otherSkill+`","docs":["`+usageDoc+`"]}`,
+	))
+	require.NoError(t, err)
+
+	_, err = sd.Call(ctxB, []byte(
+		`{"skill":"`+demoSkill+`","docs":["`+usageDoc+`"]}`,
+	))
+	require.ErrorContains(t, err, "unknown skill: "+demoSkill)
 }

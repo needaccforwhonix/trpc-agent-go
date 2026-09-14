@@ -14,10 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"trpc.group/trpc-go/trpc-agent-go/agent/trace"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -50,7 +52,48 @@ const (
 
 	// TransferTag is the tag for transfer event.
 	TransferTag = "transfer"
+
+	// ToolCallArgsExtensionKey stores tool call arguments keyed by tool call ID
+	// on tool result events.
+	ToolCallArgsExtensionKey = "trpc_agent.tool_call_args"
 )
+
+// TriggerType enumerates how a child invocation was created from its parent.
+// These values are carried in ParentInvocationMetadata.TriggerType.
+const (
+	// TriggerTypeToolCall indicates the child invocation was created because
+	// the parent agent invoked an AgentTool (sub-task delegation pattern).
+	TriggerTypeToolCall = "tool_call"
+	// TriggerTypeTransfer indicates the child invocation was created because
+	// the parent agent invoked the transfer_to_agent tool (handoff pattern).
+	TriggerTypeTransfer = "transfer"
+	// TriggerTypeDynamicWorkflow indicates the child invocation was created by
+	// one dynamic workflow script calling a registered child agent.
+	TriggerTypeDynamicWorkflow = "dynamic_workflow"
+)
+
+// ParentInvocationMetadata describes how a child invocation was triggered by
+// its parent. It is set on the child Invocation and propagated into events
+// the child emits (via InjectIntoEvent), so downstream consumers (e.g., AGUI)
+// can correlate child events with the specific parent action that spawned
+// them.
+//
+// This is critical when a parent agent issues parallel AgentTool calls to
+// the same sub-agent: ParentInvocationID alone cannot disambiguate the
+// parallel branches; ParentMetadata.TriggerID can.
+type ParentInvocationMetadata struct {
+	// TriggerType identifies the framework mechanism that created the child
+	// invocation. See TriggerType* constants.
+	TriggerType string `json:"triggerType,omitempty"`
+	// TriggerID is the ID of the specific parent action that created the
+	// child invocation. For TriggerTypeToolCall and TriggerTypeTransfer this
+	// is the originating toolCallId.
+	TriggerID string `json:"triggerId,omitempty"`
+	// TriggerName is the human-readable name of the parent action. For
+	// TriggerTypeToolCall this is the AgentTool's tool name; for
+	// TriggerTypeTransfer this is "transfer_to_agent".
+	TriggerName string `json:"triggerName,omitempty"`
+}
 
 // Event represents an event in conversation between agents and users.
 type Event struct {
@@ -65,6 +108,16 @@ type Event struct {
 
 	// ParentInvocationID is the parent invocation ID of the event.
 	ParentInvocationID string `json:"parentInvocationId,omitempty"`
+
+	// ParentMetadata describes how this event's invocation was triggered by
+	// its parent (e.g., AgentTool call, transfer). It enables correlating
+	// sub-agent events with the specific parent action that spawned them—
+	// notably for parallel tool calls to the same sub-agent, where
+	// ParentInvocationID alone cannot disambiguate the parallel branches.
+	//
+	// Nil when the invocation was started directly (top-level Runner.Run)
+	// or the framework mechanism that spawned it is unknown.
+	ParentMetadata *ParentInvocationMetadata `json:"parentMetadata,omitempty"`
 
 	// Author is the author of the event.
 	Author string `json:"author"`
@@ -93,9 +146,16 @@ type Event struct {
 	// StateDelta contains state changes to be applied to the session.
 	StateDelta map[string][]byte `json:"stateDelta,omitempty"`
 
+	// Extensions stores optional event metadata in a namespaced,
+	// versioned JSON format.
+	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
+
 	// StructuredOutput carries a typed, in-memory structured output payload.
 	// This is not serialized and is meant for immediate consumer access.
 	StructuredOutput any `json:"-"`
+	// ExecutionTrace carries an in-memory execution trace artifact for this run.
+	// This is not serialized and is meant for immediate consumer access.
+	ExecutionTrace *trace.Trace `json:"-"`
 
 	// Actions carry flow-level hints that influence how this event is treated
 	// by the runner/flow (e.g., skip summarization after a tool response).
@@ -143,6 +203,7 @@ func (e *Event) Clone() *Event {
 	clone.LongRunningToolIDs = make(map[string]struct{})
 	clone.Version = CurrentVersion
 	clone.ID = uuid.NewString()
+	clone.ExecutionTrace = cloneExecutionTrace(e.ExecutionTrace)
 	if e.Version != CurrentVersion {
 		clone.FilterKey = e.Branch
 	}
@@ -156,12 +217,130 @@ func (e *Event) Clone() *Event {
 			copy(clone.StateDelta[k], v)
 		}
 	}
+	if e.Extensions != nil {
+		clone.Extensions = make(map[string]json.RawMessage)
+		for k, v := range e.Extensions {
+			clone.Extensions[k] = cloneRawMessage(v)
+		}
+	}
 	if e.Actions != nil {
 		clone.Actions = &EventActions{
 			SkipSummarization: e.Actions.SkipSummarization,
 		}
 	}
 	return &clone
+}
+
+func cloneRawMessage(raw json.RawMessage) json.RawMessage {
+	if raw == nil {
+		return nil
+	}
+	cloned := make([]byte, len(raw))
+	copy(cloned, raw)
+	return json.RawMessage(cloned)
+}
+
+func cloneExecutionTrace(executionTrace *trace.Trace) *trace.Trace {
+	if executionTrace == nil {
+		return nil
+	}
+	clonedTrace := &trace.Trace{
+		RootAgentName:    executionTrace.RootAgentName,
+		RootInvocationID: executionTrace.RootInvocationID,
+		SessionID:        executionTrace.SessionID,
+		StartedAt:        executionTrace.StartedAt,
+		EndedAt:          executionTrace.EndedAt,
+		Status:           executionTrace.Status,
+		Input:            cloneExecutionTraceSnapshot(executionTrace.Input),
+		Output:           cloneExecutionTraceSnapshot(executionTrace.Output),
+		Usage:            cloneUsage(executionTrace.Usage),
+		Steps:            make([]trace.Step, 0, len(executionTrace.Steps)),
+	}
+	for _, step := range executionTrace.Steps {
+		clonedTrace.Steps = append(
+			clonedTrace.Steps,
+			cloneExecutionTraceStep(step),
+		)
+	}
+	return clonedTrace
+}
+
+func cloneExecutionTraceStep(step trace.Step) trace.Step {
+	return trace.Step{
+		StepID:             step.StepID,
+		InvocationID:       step.InvocationID,
+		ParentInvocationID: step.ParentInvocationID,
+		AgentName:          step.AgentName,
+		Branch:             step.Branch,
+		NodeID:             step.NodeID,
+		NodeType:           step.NodeType,
+		StartedAt:          step.StartedAt,
+		EndedAt:            step.EndedAt,
+		PredecessorStepIDs: append(
+			[]string(nil),
+			step.PredecessorStepIDs...,
+		),
+		AppliedSurfaceIDs: append([]string(nil), step.AppliedSurfaceIDs...),
+		Input:             cloneExecutionTraceSnapshot(step.Input),
+		Output:            cloneExecutionTraceSnapshot(step.Output),
+		Usage:             cloneUsage(step.Usage),
+		Tools:             cloneExecutionTraceTools(step.Tools),
+		Skills:            append([]trace.Skill(nil), step.Skills...),
+		Error:             step.Error,
+	}
+}
+
+func cloneExecutionTraceTools(tools []trace.Tool) []trace.Tool {
+	if tools == nil {
+		return nil
+	}
+	cloned := make([]trace.Tool, len(tools))
+	for i, tool := range tools {
+		cloned[i] = tool
+		cloned[i].Arguments = cloneExecutionTraceValue(tool.Arguments)
+		cloned[i].Result = cloneExecutionTraceValue(tool.Result)
+	}
+	return cloned
+}
+
+func cloneExecutionTraceValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(v))
+		for key, item := range v {
+			cloned[key] = cloneExecutionTraceValue(item)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(v))
+		for i, item := range v {
+			cloned[i] = cloneExecutionTraceValue(item)
+		}
+		return cloned
+	case []byte:
+		return append([]byte(nil), v...)
+	default:
+		return value
+	}
+}
+
+func cloneExecutionTraceSnapshot(snapshot *trace.Snapshot) *trace.Snapshot {
+	if snapshot == nil {
+		return nil
+	}
+	return &trace.Snapshot{Text: snapshot.Text}
+}
+
+func cloneUsage(usage *model.Usage) *model.Usage {
+	if usage == nil {
+		return nil
+	}
+	cloned := *usage
+	if usage.TimingInfo != nil {
+		timingInfo := *usage.TimingInfo
+		cloned.TimingInfo = &timingInfo
+	}
+	return &cloned
 }
 
 // Filter checks if the event matches the specified filter key.
@@ -260,9 +439,72 @@ func (e *Event) IsRunnerCompletion() bool {
 	return e.Done && e.Object == model.ObjectTypeRunnerCompletion
 }
 
+// IsError reports whether this event carries any error signal.
+// It is broader than IsTerminalError and also matches non-terminal graph
+// observability events such as graph.node.error.
+func (e *Event) IsError() bool {
+	if e == nil || e.Response == nil {
+		return false
+	}
+	return e.Object == model.ObjectTypeError || e.Error != nil
+}
+
+// IsTerminalError reports whether this event represents a terminal failure for
+// the overall run.
+func (e *Event) IsTerminalError() bool {
+	if e == nil || e.Response == nil || e.Response.Error == nil {
+		return false
+	}
+	return e.Object == model.ObjectTypeError || e.Done
+}
+
 // EmitEvent sends an event to the channel without timeout.
 func EmitEvent(ctx context.Context, ch chan<- *Event, e *Event) error {
 	return EmitEventWithTimeout(ctx, ch, e, EmitWithoutTimeout)
+}
+
+// snapshotEvent returns a string representation of e if trace logging is
+// enabled, or an empty string otherwise. The snapshot must be taken while the
+// caller still holds exclusive ownership of *e — before ch <- e — because
+// once the send completes the receiver may mutate the struct concurrently.
+func snapshotEvent(e *Event) string {
+	if !log.IsTraceEnabled() {
+		return ""
+	}
+	return fmt.Sprintf("%+v", redactedEventForLogging(e))
+}
+
+func redactedEventForLogging(e *Event) Event {
+	if e == nil {
+		return Event{}
+	}
+	redacted := *e
+	redacted.ExecutionTrace = nil
+	return redacted
+}
+
+func tryEmitReadyEvent(ctx context.Context, ch chan<- *Event, e *Event) (bool, error) {
+	// Snapshot before send: once ch <- e returns, the receiver owns *e and
+	// may mutate it concurrently (runner.backfillEventMetadata). Reading
+	// *e after the send for logging is a data race.
+	eventStr := snapshotEvent(e)
+	select {
+	case ch <- e:
+		log.TracefContext(ctx, "EmitEventWithTimeout: event sent, event: %s", eventStr)
+		return true, nil
+	case <-ctx.Done():
+		err := ctx.Err()
+		redactedEvent := redactedEventForLogging(e)
+		log.WarnfContext(
+			ctx,
+			"EmitEventWithTimeout: context error: %v, event: %+v",
+			err,
+			redactedEvent,
+		)
+		return true, err
+	default:
+		return false, nil
+	}
 }
 
 // EmitEventWithTimeout sends an event to the channel with optional timeout.
@@ -277,11 +519,12 @@ func EmitEventWithTimeout(ctx context.Context, ch chan<- *Event,
 	// the send and the ctx.Done() cases are ready, which could otherwise
 	// result in emitting an event after cancellation.
 	if err := ctx.Err(); err != nil {
+		redactedEvent := redactedEventForLogging(e)
 		log.WarnfContext(
 			ctx,
 			"EmitEventWithTimeout: context error: %v, event: %+v",
 			err,
-			*e,
+			redactedEvent,
 		)
 		return err
 	}
@@ -290,39 +533,55 @@ func EmitEventWithTimeout(ctx context.Context, ch chan<- *Event,
 		e.RequestID, cap(ch), len(ch), e.Branch)
 
 	if timeout == EmitWithoutTimeout {
+		if handled, err := tryEmitReadyEvent(ctx, ch, e); handled {
+			return err
+		}
+		// Fall back to a blocking send. Snapshot before send — same race as above.
+		eventStr := snapshotEvent(e)
 		select {
 		case ch <- e:
-			log.TracefContext(ctx, "EmitEventWithTimeout: event sent, event: %+v", *e)
+			log.TracefContext(ctx, "EmitEventWithTimeout: event sent, event: %s", eventStr)
 		case <-ctx.Done():
 			err := ctx.Err()
+			redactedEvent := redactedEventForLogging(e)
 			log.WarnfContext(
 				ctx,
 				"EmitEventWithTimeout: context error: %v, event: %+v",
 				err,
-				*e,
+				redactedEvent,
 			)
 			return err
 		}
 		return nil
 	}
 
+	if handled, err := tryEmitReadyEvent(ctx, ch, e); handled {
+		return err
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	// Snapshot before send — same race as above.
+	eventStr := snapshotEvent(e)
 	select {
 	case ch <- e:
-		log.TracefContext(ctx, "EmitEventWithTimeout: event sent, event: %+v", *e)
+		log.TracefContext(ctx, "EmitEventWithTimeout: event sent, event: %s", eventStr)
 	case <-ctx.Done():
 		err := ctx.Err()
+		redactedEvent := redactedEventForLogging(e)
 		log.WarnfContext(
 			ctx,
 			"EmitEventWithTimeout: context error: %v, event: %+v",
 			err,
-			*e,
+			redactedEvent,
 		)
 		return err
-	case <-time.After(timeout):
+	case <-timer.C:
+		redactedEvent := redactedEventForLogging(e)
 		log.WarnfContext(
 			ctx,
 			"EmitEventWithTimeout: timeout, event: %+v",
-			*e,
+			redactedEvent,
 		)
 		return DefaultEmitTimeoutErr
 	}

@@ -12,8 +12,10 @@ package graphagent
 
 import (
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 const (
@@ -39,13 +41,24 @@ const (
 	// ReasoningContentModeKeepAll keeps all reasoning_content in messages.
 	// Use this for debugging or when you need to retain thinking chains.
 	ReasoningContentModeKeepAll = processor.ReasoningContentModeKeepAll
-	// ReasoningContentModeDiscardPreviousTurns discards reasoning_content from previous
-	// request turns while keeping the current request's reasoning_content.
+	// ReasoningContentModeDiscardPreviousTurns discards reasoning_content from
+	// ordinary previous request turns while keeping the current request's
+	// reasoning_content and previous tool-call request reasoning.
 	// This is the default mode, recommended for DeepSeek thinking mode.
 	ReasoningContentModeDiscardPreviousTurns = processor.ReasoningContentModeDiscardPreviousTurns
 	// ReasoningContentModeDiscardAll discards all reasoning_content from all messages.
 	ReasoningContentModeDiscardAll = processor.ReasoningContentModeDiscardAll
+
+	// SessionSummaryInjectionSystem injects the session summary as system
+	// context (default behavior).
+	SessionSummaryInjectionSystem = processor.SessionSummaryInjectionSystem
+	// SessionSummaryInjectionUser injects the session summary near user/history
+	// messages.
+	SessionSummaryInjectionUser = processor.SessionSummaryInjectionUser
 )
+
+// SessionSummaryInjectionMode controls where session summaries are injected.
+type SessionSummaryInjectionMode = processor.SessionSummaryInjectionMode
 
 // MessageFilterMode is the mode for filtering messages.
 type MessageFilterMode int
@@ -64,6 +77,14 @@ const (
 	// equivalent to TimelineFilterCurrentInvocation + BranchFilterModeExact.
 	IsolatedInvocation
 )
+
+// EventMessageProjector projects one event-derived message into the
+// model-facing request view.
+type EventMessageProjector func(
+	inv *agent.Invocation,
+	evt event.Event,
+	msg model.Message,
+) model.Message
 
 // Option is a function that configures a GraphAgent.
 type Option func(*Options)
@@ -85,13 +106,43 @@ type Options struct {
 	MaxConcurrency int
 	// CheckpointSaver is the checkpoint saver for the executor.
 	CheckpointSaver graph.CheckpointSaver
+	// ExecutionEngine controls how the graph is scheduled and executed.
+	// When empty, GraphAgent uses the Executor default (BSP).
+	ExecutionEngine graph.ExecutionEngine
 
-	// AddSessionSummary controls whether to prepend the current branch summary
-	// as a system message when available.
+	// AddSessionSummary controls whether to include the current branch summary
+	// when available.
 	AddSessionSummary bool
+	// SessionSummaryInjectionMode controls where session summaries are injected.
+	// Default is "system" (SessionSummaryInjectionSystem). In user mode, the
+	// summary participates in token-budget trimming.
+	SessionSummaryInjectionMode processor.SessionSummaryInjectionMode
 	// MaxHistoryRuns sets the maximum number of history messages when AddSessionSummary is false.
 	// When 0 (default), no limit is applied.
 	MaxHistoryRuns int
+	// EnableContextCompaction enables prompt-side context compaction.
+	// Historical oversized tool results can be compacted during request
+	// projection even when AddSessionSummary is false.
+	EnableContextCompaction bool
+	// ContextCompactionToolResultMaxTokens sets the token threshold above
+	// which
+	// historical tool results are replaced with a placeholder.
+	ContextCompactionToolResultMaxTokens int
+	// ContextCompactionKeepRecentRequests preserves the latest N completed
+	// requests in full when request-side context compaction is enabled.
+	ContextCompactionKeepRecentRequests int
+	// ContextCompactionOversizedToolResultMaxTokens sets the token threshold
+	// above which any tool result (including from the current request) is
+	// truncated using head+tail preservation. Like Pass 1, this also requires
+	// EnableContextCompaction=true to take effect; it will not fire when
+	// context compaction is disabled, even if a positive threshold is
+	// configured. 0 disables it regardless of EnableContextCompaction.
+	// Default is 0; the recommended value to pass when opting in is
+	// processor.DefaultContextCompactionOversizedToolResultMaxTokens (8192).
+	ContextCompactionOversizedToolResultMaxTokens int
+	// ContextCompactionTokenCounter estimates tool-result size for context
+	// compaction. When nil, SimpleTokenCounter is used.
+	ContextCompactionTokenCounter model.TokenCounter
 	// summaryFormatter allows custom formatting of session summary content.
 	// When nil (default), uses default formatSummaryContent function.
 	summaryFormatter func(summary string) string
@@ -104,6 +155,14 @@ type Options struct {
 	// conversations. This is useful for models like DeepSeek that output reasoning_content
 	// in thinking mode.
 	ReasoningContentMode string
+	// PreserveForeignMessages keeps messages authored by other agents in their
+	// original roles/order instead of rewriting them into user-context messages
+	// when graph history is seeded into state.
+	PreserveForeignMessages bool
+	// EventMessageProjector rewrites one event-derived message before it
+	// is appended to the model request.
+	EventMessageProjector         EventMessageProjector
+	includeSyntheticErrorMessages bool
 
 	// ExecutorOptions allows passing additional executor options directly.
 	// These options are applied after the mapped options (ChannelBufferSize,
@@ -114,7 +173,17 @@ type Options struct {
 }
 
 var (
-	defaultOptions = Options{ChannelBufferSize: defaultChannelBufferSize}
+	defaultOptions = Options{
+		ChannelBufferSize:                    defaultChannelBufferSize,
+		ContextCompactionToolResultMaxTokens: processor.DefaultContextCompactionToolResultMaxTokens,
+		ContextCompactionKeepRecentRequests:  processor.DefaultContextCompactionKeepRecentRequests,
+		// Pass 2 is opt-in. Defaulting to 0 keeps EnableContextCompaction=false
+		// truly equivalent to "framework does not modify tool results". Users
+		// who want the head+tail truncation safety net should explicitly call
+		// WithContextCompactionOversizedToolResultMaxTokens (the recommended
+		// value is processor.DefaultContextCompactionOversizedToolResultMaxTokens).
+		ContextCompactionOversizedToolResultMaxTokens: 0,
+	}
 )
 
 // WithDescription sets the description of the agent.
@@ -172,6 +241,15 @@ func WithCheckpointSaver(saver graph.CheckpointSaver) Option {
 	}
 }
 
+// WithExecutionEngine sets the execution engine for graph scheduling.
+//
+// When not set, GraphAgent uses the Executor default (BSP).
+func WithExecutionEngine(engine graph.ExecutionEngine) Option {
+	return func(opts *Options) {
+		opts.ExecutionEngine = engine
+	}
+}
+
 // WithAddSessionSummary controls whether to prepend the current-branch summary
 // as a system message when available (default: false).
 func WithAddSessionSummary(addSummary bool) Option {
@@ -180,11 +258,80 @@ func WithAddSessionSummary(addSummary bool) Option {
 	}
 }
 
+// WithSessionSummaryInjectionMode sets the injection mode for session summaries.
+//
+// Available modes:
+//   - processor.SessionSummaryInjectionSystem (default): injects as system message.
+//   - processor.SessionSummaryInjectionUser: injects as a user message that
+//     participates in token-budget trimming for sliding-window behavior.
+func WithSessionSummaryInjectionMode(mode processor.SessionSummaryInjectionMode) Option {
+	return func(opts *Options) {
+		opts.SessionSummaryInjectionMode = mode
+	}
+}
+
 // WithMaxHistoryRuns sets the maximum number of history messages when AddSessionSummary is false.
 // When 0 (default), no limit is applied.
 func WithMaxHistoryRuns(maxRuns int) Option {
 	return func(opts *Options) {
 		opts.MaxHistoryRuns = maxRuns
+	}
+}
+
+// WithEnableContextCompaction enables prompt-side context compaction.
+// Historical oversized tool results can be compacted during request
+// projection even when AddSessionSummary is false.
+func WithEnableContextCompaction(enable bool) Option {
+	return func(opts *Options) {
+		opts.EnableContextCompaction = enable
+	}
+}
+
+// WithContextCompactionToolResultMaxTokens sets the token threshold above
+// which
+// historical tool results are replaced with a placeholder.
+func WithContextCompactionToolResultMaxTokens(tokens int) Option {
+	return func(opts *Options) {
+		if tokens >= 0 {
+			opts.ContextCompactionToolResultMaxTokens = tokens
+		}
+	}
+}
+
+// WithContextCompactionKeepRecentRequests preserves the latest N completed
+// requests in full when request-side context compaction is enabled.
+func WithContextCompactionKeepRecentRequests(n int) Option {
+	return func(opts *Options) {
+		if n >= 0 {
+			opts.ContextCompactionKeepRecentRequests = n
+		}
+	}
+}
+
+// WithContextCompactionOversizedToolResultMaxTokens sets the token threshold
+// above which any tool result (including from the current request) is truncated
+// using head+tail preservation. Like Pass 1, this requires
+// WithEnableContextCompaction(true) to take effect; the framework will not
+// modify tool results when context compaction is disabled, even if a positive
+// threshold is configured here. 0 disables it regardless of
+// EnableContextCompaction. The default is 0; the recommended value to pass
+// when opting in is processor.DefaultContextCompactionOversizedToolResultMaxTokens
+// (8192).
+func WithContextCompactionOversizedToolResultMaxTokens(tokens int) Option {
+	return func(opts *Options) {
+		if tokens >= 0 {
+			opts.ContextCompactionOversizedToolResultMaxTokens = tokens
+		}
+	}
+}
+
+// WithContextCompactionTokenCounter sets the token counter used by context
+// compaction to decide whether tool results exceed configured budgets.
+func WithContextCompactionTokenCounter(counter model.TokenCounter) Option {
+	return func(opts *Options) {
+		if counter != nil {
+			opts.ContextCompactionTokenCounter = counter
+		}
 	}
 }
 
@@ -243,6 +390,38 @@ func WithReasoningContentMode(mode string) Option {
 func WithSummaryFormatter(formatter func(summary string) string) Option {
 	return func(opts *Options) {
 		opts.summaryFormatter = formatter
+	}
+}
+
+// WithPreserveForeignMessages controls whether messages authored by other
+// agents should preserve their original assistant/tool roles and order instead
+// of being rewritten into user context when graph history is seeded.
+func WithPreserveForeignMessages(preserve bool) Option {
+	return func(opts *Options) {
+		opts.PreserveForeignMessages = preserve
+	}
+}
+
+// WithEventMessageProjector rewrites one event-derived message before
+// it is appended to the model request.
+func WithEventMessageProjector(
+	projector EventMessageProjector,
+) Option {
+	return func(opts *Options) {
+		opts.EventMessageProjector = projector
+	}
+}
+
+// WithIncludeSyntheticErrorMessages controls whether assistant content
+// synthesized by Runner or the error-message plugin is included when
+// GraphAgent seeds model-facing messages from session history. By default,
+// synthesized content remains emitted and persisted but is omitted from the
+// model-facing history. When omission leaves adjacent user messages, the
+// messages are merged to preserve a provider-valid sequence. Set include to
+// true to restore the previous model-context behavior.
+func WithIncludeSyntheticErrorMessages(include bool) Option {
+	return func(opts *Options) {
+		opts.includeSyntheticErrorMessages = include
 	}
 }
 

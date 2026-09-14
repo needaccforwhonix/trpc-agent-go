@@ -17,9 +17,10 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,17 +33,17 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/artifact/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
 	containerexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/container"
+	e2bexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/e2b"
 	localexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/local"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/skill"
-	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
 var (
-	flagModel          = flag.String("model", "deepseek-chat", "model name")
+	flagModel          = flag.String("model", "deepseek-v4-flash", "model name")
 	flagStream         = flag.Bool("stream", true, "stream responses")
 	flagSkills         = flag.String("skills-root", "", "skills root dir")
 	flagSkillsGuidance = flag.Bool(
@@ -50,9 +51,14 @@ var (
 		true,
 		"include built-in skills tooling/workspace guidance",
 	)
+	flagSendFileInputs = flag.Bool(
+		"send-file-inputs",
+		false,
+		"send file inputs to the model provider (may be unsupported)",
+	)
 	flagExec = flag.String(
 		"executor", "local",
-		"workspace executor: local|container",
+		"workspace executor: local|container|e2b",
 	)
 	flagTrustedLocal = flag.Bool(
 		"trusted-local",
@@ -64,12 +70,6 @@ var (
 		"",
 		"trusted-local workspace root (default: ./skill_workspace)",
 	)
-	flagArtifacts = flag.Bool("artifacts", true,
-		"save output files via artifact service")
-	flagOmitInline = flag.Bool("omit-inline", false,
-		"omit inline file contents when saving artifacts")
-	flagArtifactPref = flag.String("artifact-prefix", "",
-		"artifact filename prefix (e.g., user:)")
 	flagInputsHost = flag.String(
 		"inputs-host", "",
 		"host dir to bind as /opt/trpc-agent/inputs "+
@@ -80,25 +80,34 @@ var (
 const defaultSkillsDir = "skills"
 const appName = "skill-run-chat"
 
+const (
+	artifactRefPrefix    = "artifact://"
+	artifactUploadPrefix = "uploads/"
+)
+
 // instructionText guides the assistant behavior in a general way so it
 // works with different skills repositories without assuming specifics.
 const instructionText = `
 Be a concise, helpful assistant that can use Agent Skills.
 
 When a task may need tools, first ask to list skills or suggest one.
-Load a skill only when needed, then run commands from its docs exactly.
-Prefer safe defaults; ask clarifying questions if anything is ambiguous.
-When running, include output_files patterns if files are expected.
-Summarize results, note saved files, and propose next steps briefly.
+Load a skill with skill_load, then run the commands from its docs by
+calling workspace_exec inside the loaded skill working copy
+(cwd: skills/<name>). Prefer safe defaults; ask clarifying questions
+if anything is ambiguous. Summarize results, note saved files, and
+propose next steps briefly.
 
-Inside a skill workspace, treat inputs/ and work/inputs/ as read-only
+Inside the workspace, treat inputs/ and work/inputs/ as read-only
 views of host files unless skill docs say they are writable. Do not
 create, move, or modify files under inputs/ or work/inputs/.
+User-uploaded file inputs from the conversation are staged under
+work/inputs/ before scripts run.
 
 When chaining multiple skills, read previous results directly from
-out/ (or $OUTPUT_DIR) and write new files back to out/. Prefer using
-skill_run inputs/outputs fields to map files instead of shell commands
-like cp or mv where possible.`
+out/ (or $OUTPUT_DIR) and write new files back to out/. If you need
+a stable reference to an output file (for example to hand it to
+another tool or to surface it back to the user), call
+workspace_save_artifact on the workspace path.`
 
 func main() {
 	flag.Parse()
@@ -135,6 +144,8 @@ type skillChat struct {
 	sessionID  string
 	executor   string
 	artSvc     artifact.Service
+	model      *openai.Model
+	uploaded   []string
 }
 
 func (c *skillChat) run() error {
@@ -142,12 +153,21 @@ func (c *skillChat) run() error {
 	if err := c.setup(ctx); err != nil {
 		return err
 	}
+	defer c.cleanupUploads(ctx)
 	return c.startChat(ctx)
 }
 
 func (c *skillChat) setup(_ context.Context) error {
 	// Model.
-	mdl := openai.New(c.modelName)
+	var mdlOpts []openai.Option
+	if !*flagSendFileInputs {
+		mdlOpts = append(
+			mdlOpts,
+			openai.WithOmitFileContentParts(true),
+		)
+	}
+	mdl := openai.New(c.modelName, mdlOpts...)
+	c.model = mdl
 
 	// Skills repository.
 	repo, err := skill.NewFSRepository(c.skillsRoot)
@@ -159,6 +179,12 @@ func (c *skillChat) setup(_ context.Context) error {
 	var we codeexecutor.CodeExecutor
 	execUsed := "local"
 	switch strings.ToLower(strings.TrimSpace(*flagExec)) {
+	case "e2b":
+		we, err = e2bexec.New()
+		if err != nil {
+			return fmt.Errorf("e2b executor: %w", err)
+		}
+		execUsed = "e2b"
 	case "container":
 		// Bind the skills root read-only into the container to
 		// enable fast in-container copy when staging directories.
@@ -211,11 +237,14 @@ func (c *skillChat) setup(_ context.Context) error {
 	}
 	c.executor = execUsed
 
-	// Agent with skills enabled; skill_load + skill_run get registered.
+	// Agent with skills enabled. The default knowledge_only skill tool
+	// profile registers skill_load / skill_list_docs / skill_select_docs;
+	// the explicit code executor wires workspace_exec (and
+	// workspace_save_artifact when an artifact service is present) on
+	// top of it, which is the recommended execution surface.
 	gen := model.GenerationConfig{
-		MaxTokens:   intPtr(2000),
-		Temperature: floatPtr(0.4),
-		Stream:      c.stream,
+		MaxTokens: intPtr(2000),
+		Stream:    c.stream,
 	}
 
 	llm := llmagent.New(
@@ -252,10 +281,20 @@ func (c *skillChat) setup(_ context.Context) error {
 			"needed.",
 	)
 	fmt.Println(
+		" - /upload <path> attaches a local file (inline bytes).",
+	)
+	fmt.Println(
+		" - /upload_id <path> uploads a file and attaches file_id.",
+	)
+	fmt.Println(
+		" - /upload_artifact <path> uploads to the artifact " +
+			"service and attaches artifact:// file_id.",
+	)
+	fmt.Println(
 		" - Ask to run a command exactly as in the docs.",
 	)
 	fmt.Println(
-		" - Prefer writing files to $OUTPUT_DIR (collector reads out/).",
+		" - Prefer writing files to $OUTPUT_DIR (i.e. out/).",
 	)
 	fmt.Println(
 		" - Use $WORK_DIR/inputs for inputs and $OUTPUT_DIR for outputs.",
@@ -264,7 +303,8 @@ func (c *skillChat) setup(_ context.Context) error {
 		" - Reference skill files via $SKILLS_DIR/<name>/...",
 	)
 	fmt.Println(
-		" - Optional: add inputs/outputs fields to skill_run.",
+		" - Ask the assistant to call workspace_save_artifact when " +
+			"you want a stable artifact reference for an output file.",
 	)
 	fmt.Println(" - /artifacts lists saved artifact keys.")
 	fmt.Println(" - /pull <name> [version] downloads an artifact.")
@@ -295,7 +335,10 @@ func buildAgentOptions(
 		llmagent.WithGenerationConfig(gen),
 		llmagent.WithSkills(repo),
 		llmagent.WithCodeExecutor(exec),
-		llmagent.WithToolCallbacks(buildToolCallbacks()),
+		// Disable fenced-code auto-execution so the model has to go
+		// through workspace_exec instead of having ```sh blocks
+		// scraped out of its prose.
+		llmagent.WithEnableCodeExecutionResponseProcessor(false),
 	}
 	if !*flagSkillsGuidance {
 		opts = append(
@@ -304,45 +347,6 @@ func buildAgentOptions(
 		)
 	}
 	return opts
-}
-
-// buildToolCallbacks injects default artifact parameters into
-// skill_run calls based on CLI flags, without overriding explicit
-// arguments the model already provided.
-func buildToolCallbacks() *tool.Callbacks {
-	cbs := tool.NewCallbacks()
-	cbs.RegisterBeforeTool(func(
-		_ context.Context, name string, _ *tool.Declaration, args *[]byte,
-	) (any, error) {
-		if name != "skill_run" || args == nil {
-			return nil, nil
-		}
-		if !*flagArtifacts && !*flagOmitInline && *flagArtifactPref == "" {
-			return nil, nil
-		}
-		// Parse JSON args to a small map and merge defaults.
-		var m map[string]any
-		if err := json.Unmarshal(*args, &m); err != nil {
-			return nil, nil
-		}
-		if *flagArtifacts {
-			m["save_as_artifacts"] = true
-			if *flagOmitInline {
-				m["omit_inline_content"] = true
-			}
-			if *flagArtifactPref != "" {
-				if _, ok := m["artifact_prefix"]; !ok {
-					m["artifact_prefix"] = *flagArtifactPref
-				}
-			}
-		}
-		b, err := json.Marshal(m)
-		if err == nil {
-			*args = b
-		}
-		return nil, nil
-	})
-	return cbs
 }
 
 func (c *skillChat) startChat(ctx context.Context) error {
@@ -359,6 +363,27 @@ func (c *skillChat) startChat(ctx context.Context) error {
 		if strings.EqualFold(text, "/exit") {
 			fmt.Println("👋 Bye!")
 			return nil
+		}
+		if strings.HasPrefix(text, "/upload_artifact ") {
+			if err := c.handleUploadArtifact(ctx, text); err != nil {
+				fmt.Printf("❌ Upload error: %v\n", err)
+			}
+			fmt.Println()
+			continue
+		}
+		if strings.HasPrefix(text, "/upload_id ") {
+			if err := c.handleUpload(ctx, text, true); err != nil {
+				fmt.Printf("❌ Upload error: %v\n", err)
+			}
+			fmt.Println()
+			continue
+		}
+		if strings.HasPrefix(text, "/upload ") {
+			if err := c.handleUpload(ctx, text, false); err != nil {
+				fmt.Printf("❌ Upload error: %v\n", err)
+			}
+			fmt.Println()
+			continue
 		}
 		if strings.HasPrefix(text, "/pull ") {
 			if err := c.handlePull(text); err != nil {
@@ -386,6 +411,12 @@ func (c *skillChat) processMessage(
 	ctx context.Context, userMessage string,
 ) error {
 	msg := model.NewUserMessage(userMessage)
+	return c.processModelMessage(ctx, msg)
+}
+
+func (c *skillChat) processModelMessage(
+	ctx context.Context, msg model.Message,
+) error {
 	reqID := uuid.New().String()
 	ch, err := c.runner.Run(
 		ctx, c.userID, c.sessionID, msg, agent.WithRequestID(reqID),
@@ -415,6 +446,118 @@ func (c *skillChat) processResponse(
 		}
 	}
 	return nil
+}
+
+func (c *skillChat) handleUpload(
+	ctx context.Context,
+	text string,
+	useFileIDs bool,
+) error {
+	cmd := "/upload "
+	if useFileIDs {
+		cmd = "/upload_id "
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(text, cmd))
+	if raw == "" {
+		return fmt.Errorf("usage: %s<path>", cmd)
+	}
+	base := filepath.Base(raw)
+	msg := model.NewUserMessage("Uploaded file: " + base)
+	if useFileIDs {
+		if c.model == nil {
+			return fmt.Errorf("model is not configured")
+		}
+		id, err := c.model.UploadFile(ctx, raw)
+		if err != nil {
+			return err
+		}
+		c.uploaded = append(c.uploaded, id)
+		msg.AddFileIDWithName(id, base)
+		fmt.Printf("📤 Uploaded as %s\n", id)
+		return c.processModelMessage(ctx, msg)
+	}
+	data, err := os.ReadFile(raw)
+	if err != nil {
+		return err
+	}
+	msg.AddFileData(base, data, guessMimeType(base, data))
+	fmt.Printf("📎 Attached %s (%d bytes)\n", base, len(data))
+	return c.processModelMessage(ctx, msg)
+}
+
+func (c *skillChat) handleUploadArtifact(
+	ctx context.Context,
+	text string,
+) error {
+	if c.artSvc == nil {
+		return fmt.Errorf("artifact service not available")
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(
+		text,
+		"/upload_artifact ",
+	))
+	if raw == "" {
+		return fmt.Errorf("usage: /upload_artifact <path>")
+	}
+	base := filepath.Base(raw)
+	data, err := os.ReadFile(raw)
+	if err != nil {
+		return err
+	}
+	name := artifactUploadPrefix + uuid.NewString() + "_" +
+		base
+	info := artifact.SessionInfo{
+		AppName:   appName,
+		UserID:    c.userID,
+		SessionID: c.sessionID,
+	}
+	mt := guessMimeType(base, data)
+	ver, err := c.artSvc.SaveArtifact(
+		ctx,
+		info,
+		name,
+		&artifact.Artifact{
+			Data:     data,
+			MimeType: mt,
+			Name:     base,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	ref := fmt.Sprintf(
+		"%s%s@%d",
+		artifactRefPrefix,
+		name,
+		ver,
+	)
+	msg := model.NewUserMessage("Uploaded file: " + base)
+	msg.AddFileIDWithName(ref, base)
+	fmt.Printf("📤 Uploaded to %s@%d\n", name, ver)
+	return c.processModelMessage(ctx, msg)
+}
+
+func guessMimeType(name string, data []byte) string {
+	mt := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
+	if i := strings.Index(mt, ";"); i >= 0 {
+		mt = mt[:i]
+	}
+	if strings.TrimSpace(mt) != "" {
+		return mt
+	}
+	if len(data) == 0 {
+		return "application/octet-stream"
+	}
+	return http.DetectContentType(data)
+}
+
+func (c *skillChat) cleanupUploads(ctx context.Context) {
+	if c.model == nil || len(c.uploaded) == 0 {
+		return
+	}
+	for _, id := range c.uploaded {
+		_ = c.model.DeleteFile(ctx, id)
+	}
 }
 
 // handlePull downloads an artifact from the service and writes it to disk.
@@ -539,20 +682,6 @@ func (c *skillChat) handleToolResponses(ev *event.Event) bool {
 				fmt.Printf("✅ CallableTool response (ID: %s): %s\n",
 					ch.Message.ToolID,
 					strings.TrimSpace(ch.Message.Content))
-				// Try to surface artifact refs if present.
-				var v struct {
-					ArtifactFiles []struct {
-						Name    string `json:"name"`
-						Version int    `json:"version"`
-					} `json:"artifact_files"`
-				}
-				if json.Unmarshal([]byte(ch.Message.Content), &v) == nil &&
-					len(v.ArtifactFiles) > 0 {
-					fmt.Printf("   Saved artifacts:\n")
-					for _, a := range v.ArtifactFiles {
-						fmt.Printf("   - %s (v%d)\n", a.Name, a.Version)
-					}
-				}
 				has = true
 			}
 		}
@@ -589,5 +718,4 @@ func (c *skillChat) handleContent(
 	*full += content
 }
 
-func intPtr(i int) *int           { return &i }
-func floatPtr(f float64) *float64 { return &f }
+func intPtr(i int) *int { return &i }

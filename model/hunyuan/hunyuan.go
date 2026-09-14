@@ -17,13 +17,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
+	"strings"
 	"time"
 
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
+	"trpc.group/trpc-go/trpc-agent-go/internal/toolorder"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/hunyuan/internal/hunyuan"
 	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
+	"trpc.group/trpc-go/trpc-agent-go/model/internal/modeltailoring"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -32,20 +35,12 @@ const (
 	functionToolType         = "function"
 )
 
-var (
-	protocolOverheadTokens = imodel.DefaultProtocolOverheadTokens
-	reserveOutputTokens    = imodel.DefaultReserveOutputTokens
-	inputTokensFloor       = imodel.DefaultInputTokensFloor
-	outputTokensFloor      = imodel.DefaultOutputTokensFloor
-	safetyMarginRatio      = imodel.DefaultSafetyMarginRatio
-	maxInputTokensRatio    = imodel.DefaultMaxInputTokensRatio
-)
-
 // Model implements the model.Model interface for Hunyuan API.
 type Model struct {
 	client                     *hunyuan.Client
 	name                       string
 	contextWindow              int
+	contextWindowConfigured    bool
 	channelBufferSize          int
 	chatRequestCallback        ChatRequestCallbackFunc
 	chatResponseCallback       ChatResponseCallbackFunc
@@ -53,15 +48,12 @@ type Model struct {
 	chatStreamCompleteCallback ChatStreamCompleteCallbackFunc
 	enableTokenTailoring       bool                    // Enable automatic token tailoring.
 	maxInputTokens             int                     // Max input tokens for token tailoring.
-	tokenCounterOnce           sync.Once               // sync.Once for lazy initialization of tokenCounter.
 	tokenCounter               model.TokenCounter      // Token counter for token tailoring.
-	tailoringStrategyOnce      sync.Once               // sync.Once for lazy initialization of tailoringStrategy.
 	tailoringStrategy          model.TailoringStrategy // Tailoring strategy for token tailoring.
 	// Token tailoring budget parameters (instance-level overrides).
 	protocolOverheadTokens int
 	reserveOutputTokens    int
 	inputTokensFloor       int
-	outputTokensFloor      int
 	safetyMarginRatio      float64
 	maxInputTokensRatio    float64
 }
@@ -123,6 +115,9 @@ type options struct {
 	tailoringStrategy model.TailoringStrategy
 	// maxInputTokens is the max input tokens for token tailoring.
 	maxInputTokens int
+	// contextWindow is the model context window size in tokens.
+	contextWindow           int
+	contextWindowConfigured bool
 	// tokenTailoringConfig allows customization of token tailoring parameters.
 	tokenTailoringConfig *model.TokenTailoringConfig
 }
@@ -172,25 +167,84 @@ func New(name string, opts ...Option) *Model {
 		tokenCounter:               o.tokenCounter,
 		tailoringStrategy:          o.tailoringStrategy,
 		maxInputTokens:             o.maxInputTokens,
+		contextWindow:              o.contextWindow,
+		contextWindowConfigured:    o.contextWindowConfigured,
 		protocolOverheadTokens:     o.tokenTailoringConfig.ProtocolOverheadTokens,
 		reserveOutputTokens:        o.tokenTailoringConfig.ReserveOutputTokens,
 		inputTokensFloor:           o.tokenTailoringConfig.InputTokensFloor,
-		outputTokensFloor:          o.tokenTailoringConfig.OutputTokensFloor,
 		safetyMarginRatio:          o.tokenTailoringConfig.SafetyMarginRatio,
 		maxInputTokensRatio:        o.tokenTailoringConfig.MaxInputTokensRatio,
 	}
-
-	// Resolve context window for the model.
-	m.contextWindow = imodel.ResolveContextWindow(m.name)
 
 	return m
 }
 
 // Info returns the model information.
 func (m *Model) Info() model.Info {
-	return model.Info{
-		Name: m.name,
+	contextWindow := 0
+	if m.contextWindowConfigured {
+		contextWindow = m.contextWindow
 	}
+	return model.Info{
+		Name:          m.name,
+		ContextWindow: contextWindow,
+	}
+}
+
+func (m *Model) runChatRequestCallback(
+	ctx context.Context,
+	chatRequest *hunyuan.ChatCompletionNewParams,
+) {
+	if m.chatRequestCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat request callback")
+	m.chatRequestCallback(ctx, chatRequest)
+}
+
+func disableChatRequestTools(request *hunyuan.ChatCompletionNewParams) {
+	if request == nil {
+		return
+	}
+	request.Tools = nil
+	request.ToolChoice = ""
+	request.CustomTool = nil
+}
+
+func (m *Model) runChatResponseCallback(
+	ctx context.Context,
+	chatRequest *hunyuan.ChatCompletionNewParams,
+	chatResponse *hunyuan.ChatCompletionResponse,
+) {
+	if m.chatResponseCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat response callback")
+	m.chatResponseCallback(ctx, chatRequest, chatResponse)
+}
+
+func (m *Model) runChatChunkCallback(
+	ctx context.Context,
+	chatRequest *hunyuan.ChatCompletionNewParams,
+	chatChunk *hunyuan.ChatCompletionResponse,
+) {
+	if m.chatChunkCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat chunk callback")
+	m.chatChunkCallback(ctx, chatRequest, chatChunk)
+}
+
+func (m *Model) runChatStreamCompleteCallback(
+	ctx context.Context,
+	chatRequest *hunyuan.ChatCompletionNewParams,
+	streamErr error,
+) {
+	if m.chatStreamCompleteCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat stream complete callback")
+	m.chatStreamCompleteCallback(ctx, chatRequest, streamErr)
 }
 
 // GenerateContent generates content from the model.
@@ -210,13 +264,17 @@ func (m *Model) GenerateContent(
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
 
+	// Execute callback synchronously before starting the goroutine
+	// to avoid a race where the runner and HTTP handler finish
+	// (closing the SSE writer) while the callback is still running.
+	m.runChatRequestCallback(ctx, chatRequest)
+	if imodelrequest.ToolsDisabled(ctx) {
+		disableChatRequestTools(chatRequest)
+	}
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
 	go func() {
 		defer close(responseChan)
-		if m.chatRequestCallback != nil {
-			m.chatRequestCallback(ctx, chatRequest)
-		}
 		if request.Stream {
 			m.handleStreamingResponse(ctx, chatRequest, responseChan)
 			return
@@ -233,67 +291,55 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	// Determine max input tokens using priority: user config > auto calculation > default.
-	maxInputTokens := m.maxInputTokens
-	if maxInputTokens <= 0 {
-		// Auto-calculate based on model context window with custom or default parameters.
-		contextWindow := imodel.ResolveContextWindow(m.name)
-		if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
-			// Use custom parameters if any are set.
-			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
-				contextWindow,
-				m.protocolOverheadTokens,
-				m.reserveOutputTokens,
-				m.inputTokensFloor,
-				m.safetyMarginRatio,
-				m.maxInputTokensRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
-		}
-		log.DebugfContext(ctx, "auto-calculated max input tokens: model=%s, contextWindow=%d, maxInputTokens=%d",
-			m.name, contextWindow, maxInputTokens)
+	maxInputTokens := m.InputTokenBudget(ctx, request)
+	if m.maxInputTokens <= 0 {
+		log.DebugfContext(ctx, "auto-calculated max input tokens: model=%s, maxInputTokens=%d",
+			m.name, maxInputTokens)
 	}
+	finishObservation := modeltailoring.ObserveChanges(
+		ctx, "hunyuan.Model", request, maxInputTokens,
+	)
+	defer finishObservation()
 
 	// Apply token tailoring.
 	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
 	if err != nil {
+		if len(tailored) > 0 {
+			log.WarnContext(ctx, "token tailoring returned best-effort messages in hunyuan.Model", err)
+			modeltailoring.ApplyResult(
+				ctx, "hunyuan.Model", request, tailored,
+			)
+			return
+		}
 		log.WarnContext(ctx, "token tailoring failed in hunyuan.Model", "error", err)
 		return
 	}
 
-	request.Messages = tailored
+	modeltailoring.ApplyResult(
+		ctx, "hunyuan.Model", request, tailored,
+	)
+}
 
-	// Calculate remaining tokens for output based on context window.
-	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
-	if err != nil {
-		log.WarnContext(ctx, "failed to count tokens after tailoring", "error", err)
-		return
+// InputTokenBudget returns the same input budget used by token tailoring.
+func (m *Model) InputTokenBudget(_ context.Context, _ *model.Request) int {
+	if m.maxInputTokens > 0 {
+		return m.maxInputTokens
 	}
-
-	// Set max output tokens only if user hasn't specified it.
-	if request.GenerationConfig.MaxTokens == nil {
-		var maxOutputTokens int
-		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
-			// Use custom parameters if any are set.
-			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
-				m.contextWindow,
-				usedTokens,
-				m.protocolOverheadTokens,
-				m.outputTokensFloor,
-				m.safetyMarginRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxOutputTokens = imodel.CalculateMaxOutputTokens(m.contextWindow, usedTokens)
-		}
-		if maxOutputTokens > 0 {
-			request.GenerationConfig.MaxTokens = &maxOutputTokens
-			log.DebugfContext(ctx, "token tailoring: contextWindow=%d, usedTokens=%d, maxOutputTokens=%d",
-				m.contextWindow, usedTokens, maxOutputTokens)
-		}
+	contextWindow := m.contextWindow
+	if contextWindow <= 0 {
+		contextWindow = imodel.ResolveContextWindow(m.name)
 	}
+	if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
+		return imodel.CalculateMaxInputTokensWithParams(
+			contextWindow,
+			m.protocolOverheadTokens,
+			m.reserveOutputTokens,
+			m.inputTokensFloor,
+			m.safetyMarginRatio,
+			m.maxInputTokensRatio,
+		)
+	}
+	return imodel.CalculateMaxInputTokens(contextWindow)
 }
 
 // buildChatRequest builds the chat request for the Hunyuan API.
@@ -354,9 +400,7 @@ func (m *Model) handleNonStreamingResponse(
 		return
 	}
 
-	if m.chatResponseCallback != nil {
-		m.chatResponseCallback(ctx, chatRequest, chatResponse)
-	}
+	m.runChatResponseCallback(ctx, chatRequest, chatResponse)
 
 	response, err := convertChatResponse(chatResponse)
 	if err != nil {
@@ -378,18 +422,23 @@ func (m *Model) handleStreamingResponse(
 	chatRequest *hunyuan.ChatCompletionNewParams,
 	responseChan chan<- *model.Response,
 ) {
-	var streamErr error
+	var (
+		streamErr     error
+		finalResponse *model.Response
+	)
 
 	err := m.client.ChatCompletionStream(ctx, chatRequest, func(chunk *hunyuan.ChatCompletionResponse) error {
-		if m.chatChunkCallback != nil {
-			m.chatChunkCallback(ctx, chatRequest, chunk)
-		}
+		m.runChatChunkCallback(ctx, chatRequest, chunk)
 
 		response, err := convertChatResponse(chunk)
 		if err != nil {
 			return err
 		}
 		response.Model = m.name
+		if response.Done {
+			finalResponse = response
+			return nil
+		}
 
 		// Emit partial response.
 		select {
@@ -403,12 +452,21 @@ func (m *Model) handleStreamingResponse(
 
 	if err != nil {
 		streamErr = err
-		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
 	}
 
-	// Call the stream complete callback.
-	if m.chatStreamCompleteCallback != nil {
-		m.chatStreamCompleteCallback(ctx, chatRequest, streamErr)
+	// Call the stream complete callback before surfacing the terminal result.
+	m.runChatStreamCompleteCallback(ctx, chatRequest, streamErr)
+
+	if streamErr != nil {
+		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, streamErr)
+		return
+	}
+	if finalResponse == nil {
+		return
+	}
+	select {
+	case responseChan <- finalResponse:
+	case <-ctx.Done():
 	}
 }
 
@@ -576,7 +634,16 @@ func convertMessage(msg model.Message) (*hunyuan.ChatCompletionMessageParam, err
 					contents = append(contents, &hunyuan.ChatCompletionMessageContentParam{
 						Type: "audio_url",
 						VideoUrl: &hunyuan.ChatCompletionContentVideoUrlParam{
-							Url: audioToBase64(part.Audio),
+							Url: audioToURLOrBase64(part.Audio),
+						},
+					})
+				}
+			case model.ContentTypeVideo:
+				if part.Video != nil {
+					contents = append(contents, &hunyuan.ChatCompletionMessageContentParam{
+						Type: "video_url",
+						VideoUrl: &hunyuan.ChatCompletionContentVideoUrlParam{
+							Url: videoToURLOrBase64(part.Video),
 						},
 					})
 				}
@@ -596,7 +663,7 @@ func convertMessage(msg model.Message) (*hunyuan.ChatCompletionMessageParam, err
 // convertTools converts our tool declarations to Hunyuan tool parameters.
 func convertTools(tools map[string]tool.Tool) []*hunyuan.ChatCompletionMessageTool {
 	var result []*hunyuan.ChatCompletionMessageTool
-	for _, tl := range tools {
+	for _, tl := range toolorder.SortedTools(tools) {
 		decl := tl.Declaration()
 
 		schemaBytes, err := json.Marshal(decl.InputSchema)
@@ -637,9 +704,31 @@ func imageToURLOrBase64(image *model.Image) string {
 	if image.URL != "" {
 		return image.URL
 	}
-	return "data:image/" + image.Format + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
+	format := image.Format
+	if strings.HasPrefix(format, "image/") {
+		return "data:" + format + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
+	}
+	return "data:image/" + format + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
 }
 
-func audioToBase64(audio *model.Audio) string {
-	return "data:" + audio.Format + ";base64," + base64.StdEncoding.EncodeToString(audio.Data)
+func audioToURLOrBase64(audio *model.Audio) string {
+	if audio.URL != "" {
+		return audio.URL
+	}
+	return mediaToBase64("audio", audio.Format, audio.Data)
+}
+
+func videoToURLOrBase64(video *model.Video) string {
+	if video.URL != "" {
+		return video.URL
+	}
+	return mediaToBase64("video", video.Format, video.Data)
+}
+
+func mediaToBase64(mediaType, format string, data []byte) string {
+	mimeType := format
+	if !strings.HasPrefix(mimeType, mediaType+"/") {
+		mimeType = mediaType + "/" + mimeType
+	}
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
 }

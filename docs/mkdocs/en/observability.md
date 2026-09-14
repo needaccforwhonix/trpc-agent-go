@@ -64,6 +64,8 @@ go run .
 
 You can view tracing data in the Langfuse console.
 
+For message payload compatibility and the recommended OTel `role + parts` fields, see [Multimodal Telemetry Messages](telemetry-multimodal.md).
+
 ##### Integration Code Description
 Langfuse supports receiving Trace data via the `/api/public/otel` (OTLP) endpoint, supporting HTTP/protobuf only, not gRPC.
 The above code integrates with Langfuse by setting `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`.
@@ -257,6 +259,85 @@ Trace data can be used to analyze:
 - **Error Localization**: Quickly locate the exact failing step.
 - **Dependencies**: Understand relationships between components.
 - **Concurrency Analysis**: Observe the effects of concurrent execution.
+
+## Span Attribute Policy (Production Side)
+
+`telemetry/trace` provides an opt-in `SpanAttributePolicy` that controls collection and size of large payload **span attributes** at span creation time.
+
+Default (unset) behavior is unchanged.
+
+### Two capabilities
+
+- `Drop()` and unconditional `Omit()` (without `MaxBytes`) skip `json.Marshal`.
+- `MaxBytes()` + `Omit()`: raw `[]byte` paths (for example `execute_tool` tool arguments) compare length without an extra marshal; **JSON-backed** paths (chat / workflow / invoke_agent) still require a full marshal and **do not** reduce heap peaks.
+- `Truncate()` always marshals the full payload; it only limits the value written to the span.
+
+| Rule | Reduces marshal heap peak? | Notes |
+|------|----------------------------|-------|
+| `Drop()` | Yes | Skips marshaling; attribute not written |
+| `Omit()` (no `MaxBytes`) | Yes | Skips payload marshaling |
+| `MaxBytes(n)` + `Omit()` | JSON: no; `[]byte`: yes | JSON paths marshal fully before comparing size; `[]byte` paths use `len` only |
+| `Truncate(n)` | No | Full marshal, then truncate on export |
+
+To reduce memory, prefer `Drop()` on attributes **this backend will not read**. Do not copy another backend's sample blindly: Langfuse and Jaeger / generic OTLP consume different keys.
+
+### Coverage
+
+Large payload attributes are wired for `chat`, `invoke_agent`, `workflow`, and `execute_tool` (messages, llm request/response, workflow request/response, tool arguments/result, and related keys).
+
+### Configuration
+
+```go
+import atrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
+
+// Langfuse: keep *.otel (including multimodal parts). Drop deprecated legacy messages.
+// On chat/generation spans, do not Drop .otel, legacy messages, and llm_request/llm_response together, or Input/Output may be empty.
+clean, err := atrace.Start(ctx,
+    atrace.WithSpanAttributePolicy(
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrInputMessages, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrOutputMessages, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrInputMessages, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrOutputMessages, atrace.Drop()),
+    ),
+)
+```
+
+Jaeger / Galileo / generic OTLP consume raw span attributes. If the UI only uses `gen_ai.input.messages` / `gen_ai.output.messages`, Drop `*.otel` to skip that marshal:
+
+```go
+clean, err := atrace.Start(ctx,
+    atrace.WithSpanAttributePolicy(
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrInputMessagesOTel, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrOutputMessagesOTel, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrInputMessagesOTel, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrOutputMessagesOTel, atrace.Drop()),
+    ),
+)
+```
+
+If `trace.Start` is not used, call `atrace.SetSpanAttributePolicy(...)` before the first LLM invocation. `trace.Start` installs the policy only after tracer initialization succeeds; `clean()` restores the previous policy.
+
+`MaxBytes` + `Omit()` example (limits attribute size; JSON paths still marshal):
+
+```go
+atrace.WithAttributeRule(atrace.OperationWorkflow, atrace.AttributeKey("gen_ai.workflow.request"),
+    atrace.MaxBytes(16<<10), atrace.Omit(),
+)
+```
+
+`Truncate` example (full marshal, limited export size):
+
+```go
+atrace.WithAttributeRule(atrace.OperationWorkflow, atrace.AttributeKey("gen_ai.workflow.response"), atrace.Truncate(64<<10))
+```
+
+### Compatibility
+
+Drop/Omit/Truncate may prevent some backends from reconstructing structured full text from attributes. Opt in based on **the keys your backend actually reads** and your memory budget.
+
+- On chat/generation spans, the Langfuse exporter reads `*.otel` first, then legacy `gen_ai.*.messages`, then `trpc.go.agent.llm_request` / `llm_response`. InvokeAgent only falls back from `*.otel` to legacy messages. If none of the applicable sources are present, Input/Output may be empty.
+- Jaeger / generic OTLP usually display raw keys. The official GenAI field is `gen_ai.input.messages`; `*.otel` is a framework extension.
+- When fanning out to Langfuse **and** Jaeger, do not Drop a family that either backend still needs.
 
 ## Advanced Features
 

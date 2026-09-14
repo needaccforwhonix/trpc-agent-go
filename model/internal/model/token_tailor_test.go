@@ -13,90 +13,6 @@ import (
 	"testing"
 )
 
-func TestCalculateMaxOutputTokens(t *testing.T) {
-	tests := []struct {
-		name            string
-		contextWindow   int
-		usedInputTokens int
-		expectedOutput  int
-		expectZero      bool
-	}{
-		{
-			name:            "Normal case - deepseek-chat with heavy input",
-			contextWindow:   131072,
-			usedInputTokens: 115383,
-			// 131072 - 115383 - 512 - 13107 = 2070
-			expectedOutput: 2070,
-		},
-		{
-			name:            "Normal case - moderate input",
-			contextWindow:   131072,
-			usedInputTokens: 50000,
-			// 131072 - 50000 - 512 - 13107 = 67453
-			expectedOutput: 67453,
-		},
-		{
-			name:            "Edge case - very low remaining tokens",
-			contextWindow:   8192,
-			usedInputTokens: 7500,
-			// 8192 - 7500 - 512 - 819 = -639 (negative)
-			// Should return max(negative, floor) = 0
-			expectZero: true,
-		},
-		{
-			name:            "Edge case - exactly at floor",
-			contextWindow:   8192,
-			usedInputTokens: 7000,
-			// 8192 - 7000 - 512 - 819 = -139 (negative)
-			// But if close, should return floor (256)
-			expectZero: true,
-		},
-		{
-			name:            "Small context window",
-			contextWindow:   4096,
-			usedInputTokens: 1000,
-			// 4096 - 1000 - 512 - 409 = 2175
-			expectedOutput: 2175,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := CalculateMaxOutputTokens(tt.contextWindow, tt.usedInputTokens)
-
-			if tt.expectZero {
-				if result != 0 {
-					t.Errorf("Expected 0 tokens, got %d", result)
-				}
-				return
-			}
-
-			if result != tt.expectedOutput {
-				safetyMargin := int(float64(tt.contextWindow) * DefaultSafetyMarginRatio)
-				remaining := tt.contextWindow - tt.usedInputTokens - DefaultProtocolOverheadTokens - safetyMargin
-				t.Errorf("Expected %d tokens, got %d\n"+
-					"  contextWindow=%d, usedInputTokens=%d\n"+
-					"  safetyMargin=%d, protocolOverhead=%d\n"+
-					"  remaining=%d",
-					tt.expectedOutput, result,
-					tt.contextWindow, tt.usedInputTokens,
-					safetyMargin, DefaultProtocolOverheadTokens,
-					remaining)
-			}
-
-			// Verify total tokens don't exceed context window.
-			safetyMargin := int(float64(tt.contextWindow) * DefaultSafetyMarginRatio)
-			totalTokens := tt.usedInputTokens + result + DefaultProtocolOverheadTokens + safetyMargin
-			if totalTokens > tt.contextWindow {
-				t.Errorf("Total tokens (%d) exceed context window (%d)\n"+
-					"  usedInputTokens=%d, maxOutputTokens=%d, protocolOverhead=%d, safetyMargin=%d",
-					totalTokens, tt.contextWindow,
-					tt.usedInputTokens, result, DefaultProtocolOverheadTokens, safetyMargin)
-			}
-		})
-	}
-}
-
 func TestCalculateMaxInputTokens(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -140,5 +56,27 @@ func TestCalculateMaxInputTokens(t *testing.T) {
 					tt.expectedOutput, result, tt.contextWindow)
 			}
 		})
+	}
+}
+
+func TestCalculateMaxOutputTokens(t *testing.T) {
+	// context 128000, used 100000 -> remaining 28000
+	// safetyMargin = 12800, maxOut = 28000 - 512 - 12800 = 14688
+	out := CalculateMaxOutputTokens(128000, 100000)
+	if out != 14688 {
+		t.Fatalf("expected 14688 output tokens, got %d", out)
+	}
+
+	zero := CalculateMaxOutputTokens(128000, 200000)
+	if zero != 0 {
+		t.Fatalf("expected 0 when input exceeds context, got %d", zero)
+	}
+}
+
+func TestCalculateMaxOutputTokensWithParams_FloorCappedByRemaining(t *testing.T) {
+	// remaining=100, floor=4096 -> capped floor 100
+	out := CalculateMaxOutputTokensWithParams(1000, 900, 0, 4096, 0)
+	if out != 100 {
+		t.Fatalf("expected floor capped to remaining (100), got %d", out)
 	}
 }

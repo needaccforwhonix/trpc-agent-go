@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/modelcontext"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
@@ -34,11 +35,60 @@ type SkipRecentFunc func(events []event.Event) int
 
 // WithPrompt sets the custom prompt for summarization.
 // The prompt must include the placeholder {conversation_text}, which will be
-// replaced with the extracted conversation when generating the summary.
+// replaced with the extracted conversation when generating the summary. It may
+// also include {previous_summary} to position the previous rolling summary
+// separately from newly uncovered conversation text. When WithMaxSummaryWords
+// is configured, {max_summary_words} must be included in either this prompt or
+// WithSystemPrompt.
 func WithPrompt(prompt string) Option {
 	return func(s *sessionSummarizer) {
 		if prompt != "" {
 			s.prompt = prompt
+		}
+	}
+}
+
+// WithSystemPrompt sets an additional system prompt for summarization.
+// The prompt is rendered into a dedicated system message before the user prompt.
+// It must not include the {conversation_text} or {previous_summary}
+// placeholders; keep conversation content in the user prompt instead. When
+// WithMaxSummaryWords is configured, {max_summary_words} may be included here
+// instead of the user prompt.
+func WithSystemPrompt(prompt string) Option {
+	return func(s *sessionSummarizer) {
+		if prompt != "" {
+			s.systemPrompt = prompt
+		}
+	}
+}
+
+// WithCacheSafeForking enables cache-safe summary request construction when a
+// parent model request is available in the context. When enabled, the
+// summarizer clones the parent request and appends a compacting user message
+// instead of sending a standalone summary prompt. If no parent request is
+// available, or the parent cannot fit the summary model's input budget,
+// summarization falls back to a bounded standalone prompt. Framework-provided
+// model-request views restrict the fork to the same history prefix selected by
+// WithSkipRecent, excluding later responses appended after that request.
+//
+// This is disabled by default.
+func WithCacheSafeForking(enable bool) Option {
+	return func(s *sessionSummarizer) {
+		s.cacheSafeForking = enable
+	}
+}
+
+// WithCacheSafeForkPrompt sets the final summary instruction used when
+// cache-safe forking is enabled. It is appended as a user message to a cloned
+// parent request. When cache-safe forking falls back to a standalone request,
+// it is appended after a source boundary in the standalone user message. The
+// prompt may include {max_summary_words}, but it must not include
+// {conversation_text} or {previous_summary}; the request already contains the
+// conversation prefix, including any injected summary.
+func WithCacheSafeForkPrompt(prompt string) Option {
+	return func(s *sessionSummarizer) {
+		if prompt != "" {
+			s.cacheSafeForkPrompt = prompt
 		}
 	}
 }
@@ -55,9 +105,11 @@ func WithMaxSummaryWords(maxWords int) Option {
 }
 
 // WithSkipRecent sets a custom function to determine how many of the most recent
-// events (from the tail) should be skipped during summarization. The function
-// receives all events and returns the count of tail events to skip. Return 0 to
-// skip none.
+// events (from the tail) should be skipped during summarization. In the normal
+// Runner LLM flow, the function receives the projected session history visible
+// to the model, after history filtering and request-side compaction. Standalone
+// summarization without a model-request view preserves the legacy raw-session
+// input. Return 0 to skip none.
 //
 // Example:
 //
@@ -85,24 +137,35 @@ func WithSkipRecent(skipFunc SkipRecentFunc) Option {
 	}
 }
 
-// WithTokenThreshold creates a token-based check function.
+// WithTokenThreshold appends a token-based check. When the normal Runner LLM
+// flow provides a finalized model-request view, the check uses that request's
+// estimated token count, including the retained recent tail. Standalone
+// summarization preserves legacy event-text estimation.
+// Note: all checks in a summarizer are combined with global AND semantics.
+// If you call multiple threshold options (e.g. token + event), all must pass.
 func WithTokenThreshold(tokenCount int) Option {
 	return func(s *sessionSummarizer) {
-		s.checks = append(s.checks, CheckTokenThreshold(tokenCount))
+		s.checks = append(s.checks, evaluateTokenThreshold(tokenCount))
 	}
 }
 
-// WithEventThreshold creates an event-count-based check function.
+// WithEventThreshold appends an event-count-based check.
+// Note: all checks in a summarizer are combined with global AND semantics.
+// If you call multiple threshold options (e.g. token + event), all must pass.
 func WithEventThreshold(eventCount int) Option {
 	return func(s *sessionSummarizer) {
-		s.checks = append(s.checks, CheckEventThreshold(eventCount))
+		s.checks = append(s.checks, evaluateEventThreshold(eventCount))
 	}
 }
 
-// WithTimeThreshold creates a time-based check function.
+// WithTimeThreshold appends a time-based check. The built-in Runner path uses
+// the idle gap before the current top-level request; standalone evaluation
+// preserves CheckTimeThreshold's last-event-age fallback.
+// Note: all checks in a summarizer are combined with global AND semantics.
+// If you call multiple threshold options (e.g. event + time), all must pass.
 func WithTimeThreshold(interval time.Duration) Option {
 	return func(s *sessionSummarizer) {
-		s.checks = append(s.checks, CheckTimeThreshold(interval))
+		s.checks = append(s.checks, evaluateTimeThreshold(interval))
 	}
 }
 
@@ -110,7 +173,7 @@ func WithTimeThreshold(interval time.Duration) Option {
 func WithChecksAll(checks ...Checker) Option {
 	return func(s *sessionSummarizer) {
 		if len(checks) > 0 {
-			s.checks = append(s.checks, ChecksAll(checks))
+			s.checks = append(s.checks, wrapChecker(ChecksAll(checks)))
 		}
 	}
 }
@@ -119,8 +182,36 @@ func WithChecksAll(checks ...Checker) Option {
 func WithChecksAny(checks ...Checker) Option {
 	return func(s *sessionSummarizer) {
 		if len(checks) > 0 {
-			s.checks = append(s.checks, ChecksAny(checks))
+			s.checks = append(s.checks, wrapChecker(ChecksAny(checks)))
 		}
+	}
+}
+
+// WithChecksAllContext appends a single composite context-aware check that
+// requires all provided checks (AND logic).
+func WithChecksAllContext(checks ...ContextChecker) Option {
+	return func(s *sessionSummarizer) {
+		if len(checks) > 0 {
+			s.checks = append(s.checks, wrapContextChecker(allContextChecks(checks)))
+		}
+	}
+}
+
+// WithChecksAnyContext appends a single composite context-aware check that
+// passes if any provided check passes (OR logic).
+func WithChecksAnyContext(checks ...ContextChecker) Option {
+	return func(s *sessionSummarizer) {
+		if len(checks) > 0 {
+			s.checks = append(s.checks, wrapContextChecker(anyContextChecks(checks)))
+		}
+	}
+}
+
+// WithReportHook observes summary trigger and model-call accounting after a
+// summary attempt finishes.
+func WithReportHook(h ReportHook) Option {
+	return func(s *sessionSummarizer) {
+		s.reportHook = h
 	}
 }
 
@@ -131,7 +222,11 @@ func WithPreSummaryHook(h PreSummaryHook) Option {
 	}
 }
 
-// WithPostSummaryHook sets a post-summary hook to modify the summary before returning.
+// WithPostSummaryHook sets a post-summary hook to modify the summary before
+// returning. The hook observes the provisional boundary for the summarized
+// source. A successful or non-aborting hook keeps that exact boundary, replacing
+// any hook changes to the summary boundary state. An aborting or panicking hook
+// restores the boundary that existed before the summary attempt.
 func WithPostSummaryHook(h PostSummaryHook) Option {
 	return func(s *sessionSummarizer) {
 		s.postHook = h
@@ -158,6 +253,9 @@ func WithSummaryHookAbortOnError(abort bool) Option {
 // WithToolCallFormatter sets a custom formatter for tool calls in the summary input.
 // The formatter receives a ToolCall and returns a formatted string.
 // Return empty string to exclude the tool call from the summary.
+// For non-empty summary input, this does not affect token threshold counting
+// used by ShouldSummarize. Returning empty for all included content suppresses
+// summarization because there is no effective summary input.
 //
 // Example:
 //
@@ -174,6 +272,9 @@ func WithToolCallFormatter(f ToolCallFormatter) Option {
 // WithToolResultFormatter sets a custom formatter for tool results in the summary input.
 // The formatter receives the Message containing the tool result and returns a formatted string.
 // Return empty string to exclude the tool result from the summary.
+// For non-empty summary input, this does not affect token threshold counting
+// used by ShouldSummarize. Returning empty for all included content suppresses
+// summarization because there is no effective summary input.
 //
 // Example:
 //
@@ -188,5 +289,43 @@ func WithToolCallFormatter(f ToolCallFormatter) Option {
 func WithToolResultFormatter(f ToolResultFormatter) Option {
 	return func(s *sessionSummarizer) {
 		s.toolResultFormatter = f
+	}
+}
+
+// WithContextThreshold enables automatic summarization based on the model's
+// context window, resolved dynamically at runtime from the invocation
+// context. This is the recommended zero-configuration option for most
+// use cases.
+//
+// The summarizer does not need to know the model name at creation time.
+// When the user switches models mid-session, the threshold adjusts
+// automatically because the checker reads the current model from the
+// invocation attached to each request's context.
+//
+// Usage:
+//
+//	summary.NewSummarizer(model, summary.WithContextThreshold())
+//	summary.NewSummarizer(model, summary.WithContextThreshold(
+//	    summary.WithContextThresholdRatio(0.6)))
+func WithContextThreshold(opts ...ContextThresholdOption) Option {
+	return func(s *sessionSummarizer) {
+		effectiveOpts := append([]ContextThresholdOption(nil), opts...)
+		// If no explicit fallback window is configured, try to resolve one
+		// from the summarizer's own model. This ensures that when invocation
+		// context is unavailable (e.g. manual CreateSessionSummary calls),
+		// the checker uses the summarizer model's context window instead of
+		// the conservative framework default (8192).
+		o := contextThresholdOptions{
+			fallbackContextWindow: defaultContextThresholdFallbackWindow,
+		}
+		for _, opt := range effectiveOpts {
+			opt(&o)
+		}
+		if !o.fallbackContextWindowSet && s.model != nil {
+			if w, ok := modelcontext.ResolveContextWindow(s.model); ok {
+				effectiveOpts = append(effectiveOpts, WithContextThresholdFallbackWindow(w))
+			}
+		}
+		s.checks = append(s.checks, evaluateContextThreshold(effectiveOpts...))
 	}
 }

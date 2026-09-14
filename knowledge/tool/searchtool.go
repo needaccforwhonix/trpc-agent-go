@@ -17,18 +17,73 @@ import (
 	"strings"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/source"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
 	"trpc.group/trpc-go/trpc-agent-go/log"
+	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
 const (
-	defaultMaxResults = 10
-	defaultMinScore   = 0.0
+	defaultMaxResults        = 10
+	defaultMinScore          = 0.0
+	defaultSearchHistorySize = 10
+	agenticFilterPromptIntro = "You are a helpful assistant that can search for relevant information in the knowledge base."
+
+	// metadataFilterHint is appended to the tool description when no explicit
+	// agenticFilterInfo is provided. It teaches the LLM that metadata fields
+	// from search results can be used to construct filter conditions.
+	metadataFilterHint = `Each search result contains two types of filterable fields:
+
+  1. Document text — shown as "text" in results, but use field name
+     "content" when constructing filters. Use the "like" operator for
+     substring matching against the original document content.
+
+  2. "metadata.*" — structured metadata fields. Keys in results appear
+     without prefix (e.g. "source", "topic"), but when constructing
+     filters, prefix them with "metadata." (e.g. "metadata.source").
+
+You can use these field names and values from previous search results
+to construct filter conditions for more precise subsequent searches.
+
+Example — given a search result like:
+  {
+    "text": "Graph state is the core mechanism...",
+    "metadata": {"source": "docs/graph.md", "topic": "architecture"},
+    "score": 0.87
+  }
+
+  Filter by document text (use "content" as field name, not "text";
+  use %% wildcards for substring matching):
+    {"field": "content", "operator": "like", "value": "%graph state%"}
+
+  Filter by metadata (note the "metadata." prefix):
+    {"field": "metadata.topic", "operator": "eq", "value": "architecture"}
+
+  Filter by metadata (multiple values):
+    {"field": "metadata.topic", "operator": "in", "value": ["architecture", "api"]}
+
+  Combine content and metadata:
+    {"operator": "and", "value": [
+      {"field": "content", "operator": "like", "value": "%graph state%"},
+      {"field": "metadata.source", "operator": "eq", "value": "docs/graph.md"}
+    ]}
+
+Available operators:
+  eq, ne, gt, gte, lt, lte, in, not in, like, not like, between, and, or
+
+Usage modes:
+  - query + filter: use together for semantic search narrowed by metadata constraints.
+  - filter only: omit query and use filter alone for pure metadata-based retrieval.
+  - query only: omit filter for standard semantic search.
+  At least one of query or filter must be provided.
+
+Note:
+  For logical operators (and/or), use "value" to specify an array of sub-conditions.`
 )
 
 // KnowledgeSearchRequest represents the input for the knowledge search tool.
@@ -44,6 +99,7 @@ type KnowledgeSearchResponse struct {
 
 // DocumentResult represents a single document result with metadata and score.
 type DocumentResult struct {
+	ID       string         `json:"id,omitempty"`
 	Text     string         `json:"text"`
 	Metadata map[string]any `json:"metadata,omitempty"`
 	Score    float64        `json:"score"`
@@ -52,13 +108,30 @@ type DocumentResult struct {
 // Option is a function that configures the knowledge search tool.
 type Option func(*options)
 
+// ResultPostProcessor post-processes the search response before it is returned
+// to the LLM. It receives the current invocation context and the raw response,
+// and may mutate the response (e.g. filter out duplicate documents) or rewrite
+// the Message field. Implementations must be safe for concurrent use.
+type ResultPostProcessor func(ctx context.Context, resp *KnowledgeSearchResponse) *KnowledgeSearchResponse
+
+type autoMemoryPollutingTool struct {
+	tool.CallableTool
+}
+
+func (t *autoMemoryPollutingTool) PollutesAutoMemory() bool {
+	return true
+}
+
 type options struct {
-	toolName          string
-	toolDescription   string
-	staticFilter      map[string]any
-	conditionedFilter *searchfilter.UniversalFilterCondition
-	maxResults        int
-	minScore          float64
+	toolName            string
+	toolDescription     string
+	staticFilter        map[string]any
+	conditionedFilter   *searchfilter.UniversalFilterCondition
+	maxResults          int
+	minScore            float64
+	excludeMetadataKeys map[string]struct{}
+	postProcessor       ResultPostProcessor
+	includeContent      bool
 }
 
 // WithToolName sets the name of the knowledge search tool.
@@ -110,13 +183,61 @@ func WithMinScore(minScore float64) Option {
 	}
 }
 
+// WithExcludeMetadataKeys excludes the specified metadata keys from each
+// returned document before the result is handed to the LLM. This is useful
+// when certain metadata fields are verbose or low-value for the model
+// (e.g. import lists, raw language tag, chunk index).
+//
+// Semantics: this option is additive. Multiple calls to WithExcludeMetadataKeys
+// accumulate into a single exclusion set on the underlying options, rather
+// than replacing the previously-configured keys. Empty or duplicate keys are
+// ignored. This makes it safe for higher-level helpers (for example, the code
+// search tool constructor) to pass a default exclusion list and still let
+// callers extend it.
+func WithExcludeMetadataKeys(keys ...string) Option {
+	return func(opts *options) {
+		if len(keys) == 0 {
+			return
+		}
+		if opts.excludeMetadataKeys == nil {
+			opts.excludeMetadataKeys = make(map[string]struct{}, len(keys))
+		}
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			opts.excludeMetadataKeys[k] = struct{}{}
+		}
+	}
+}
+
+// WithResultPostProcessor registers a post-processor that is invoked right
+// before the knowledge search response is returned to the LLM. Typical use
+// cases include cross-call deduplication and result rewriting. Passing nil is
+// a no-op.
+func WithResultPostProcessor(p ResultPostProcessor) Option {
+	return func(opts *options) {
+		if p == nil {
+			return
+		}
+		opts.postProcessor = p
+	}
+}
+
+func withIncludeContentDefault(include bool) Option {
+	return func(opts *options) {
+		opts.includeContent = include
+	}
+}
+
 // NewKnowledgeSearchTool creates a function tool for knowledge search using
 // the Knowledge interface.
 // This tool allows agents to search for relevant information in the knowledge base.
 func NewKnowledgeSearchTool(kb knowledge.Knowledge, opts ...Option) tool.Tool {
 	opt := &options{
-		maxResults: defaultMaxResults,
-		minScore:   defaultMinScore,
+		maxResults:     defaultMaxResults,
+		minScore:       defaultMinScore,
+		includeContent: true,
 	}
 	for _, o := range opts {
 		o(opt)
@@ -128,7 +249,7 @@ func NewKnowledgeSearchTool(kb knowledge.Knowledge, opts ...Option) tool.Tool {
 		invocation, ok := agent.InvocationFromContext(ctx)
 		var runnerFilter map[string]any
 		var runnerConditionedFilter *searchfilter.UniversalFilterCondition
-		if !ok {
+		if !ok || invocation == nil {
 			log.DebugfContext(ctx, "knowledge search tool: no invocation found in context")
 		} else {
 			runnerFilter = invocation.RunOptions.KnowledgeFilter
@@ -138,17 +259,18 @@ func NewKnowledgeSearchTool(kb knowledge.Knowledge, opts ...Option) tool.Tool {
 		agentFilterCondition := convertMetadataToFilterCondition(opt.staticFilter)
 		runnerFilterCondition := convertMetadataToFilterCondition(runnerFilter)
 		finalFilter := mergeFilterConditions(agentFilterCondition, opt.conditionedFilter, runnerFilterCondition, runnerConditionedFilter)
+		history, userID, sessionID := searchContextFromInvocation(invocation)
 
-		// Create search request - for tools, we don't have conversation history yet.
-		// This could be enhanced in the future to extract context from the agent's session.
 		searchReq := &knowledge.SearchRequest{
-			Query: req.Query,
+			Query:     req.Query,
+			History:   history,
+			UserID:    userID,
+			SessionID: sessionID,
 			SearchFilter: &knowledge.SearchFilter{
 				FilterCondition: finalFilter,
 			},
 			MaxResults: opt.maxResults,
 			MinScore:   opt.minScore,
-			// History, UserID, SessionID could be filled from agent context in the future.
 		}
 
 		result, err := kb.Search(ctx, searchReq)
@@ -156,7 +278,11 @@ func NewKnowledgeSearchTool(kb knowledge.Knowledge, opts ...Option) tool.Tool {
 			return nil, fmt.Errorf("search failed: %w", err)
 		}
 
-		return convertSearchResults(result)
+		resp, err := convertSearchResults(result, opt.excludeMetadataKeys, opt.includeContent)
+		if err != nil {
+			return nil, err
+		}
+		return applyPostProcessor(ctx, resp, opt.postProcessor), nil
 	}
 
 	toolName := opt.toolName
@@ -168,17 +294,20 @@ func NewKnowledgeSearchTool(kb knowledge.Knowledge, opts ...Option) tool.Tool {
 		description = "Search for relevant information in the knowledge base. " +
 			"Use this tool to find context and facts to help answer user questions."
 	}
-	return function.NewFunctionTool(
-		searchFunc,
-		function.WithName(toolName),
-		function.WithDescription(description),
-	)
+	return &autoMemoryPollutingTool{
+		CallableTool: function.NewFunctionTool(
+			searchFunc,
+			function.WithName(toolName),
+			function.WithDescription(description),
+		),
+	}
 }
 
 // KnowledgeSearchRequestWithFilter represents the input with filter for the knowledge search tool.
 type KnowledgeSearchRequestWithFilter struct {
-	Query  string                                 `json:"query,omitempty" jsonschema:"description=The search query to find relevant information in the knowledge base. Can be empty when using only filters."`
-	Filter *searchfilter.UniversalFilterCondition `json:"filter,omitempty" jsonschema:"description=Filter conditions to apply to the search query. Use lowercase operators: 'eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'not in', 'like', 'not like', 'between', 'and', 'or'."`
+	Query          string                                 `json:"query,omitempty" jsonschema:"description=The search query to find relevant information in the knowledge base. Can be empty when using only filters."`
+	Filter         *searchfilter.UniversalFilterCondition `json:"filter,omitempty" jsonschema:"description=Filter conditions to apply to the search query. Use lowercase operators eq ne gt gte lt lte in not in like not like between and or."`
+	IncludeContent *bool                                  `json:"include_content,omitempty" jsonschema:"description=Whether to include full document content in the response. Default depends on the tool; graph tools default to false to keep responses compact."`
 }
 
 // NewAgenticFilterSearchTool creates a knowledge search tool with dynamic agent-controlled filtering.
@@ -194,8 +323,9 @@ func NewAgenticFilterSearchTool(
 	opts ...Option,
 ) tool.Tool {
 	opt := &options{
-		maxResults: defaultMaxResults,
-		minScore:   defaultMinScore,
+		maxResults:     defaultMaxResults,
+		minScore:       defaultMinScore,
+		includeContent: true,
 	}
 	for _, o := range opts {
 		o(opt)
@@ -209,7 +339,7 @@ func NewAgenticFilterSearchTool(
 		invocation, ok := agent.InvocationFromContext(ctx)
 		var runnerFilter map[string]any
 		var runnerConditionedFilter *searchfilter.UniversalFilterCondition
-		if !ok {
+		if !ok || invocation == nil {
 			log.DebugfContext(ctx, "knowledge search tool: no invocation found in context")
 		} else {
 			runnerFilter = invocation.RunOptions.KnowledgeFilter
@@ -219,9 +349,13 @@ func NewAgenticFilterSearchTool(
 		agentMetadataCondition := convertMetadataToFilterCondition(opt.staticFilter)
 		runnerFilterCondition := convertMetadataToFilterCondition(runnerFilter)
 		finalFilter := mergeFilterConditions(agentMetadataCondition, opt.conditionedFilter, runnerFilterCondition, runnerConditionedFilter, req.Filter)
+		history, userID, sessionID := searchContextFromInvocation(invocation)
 
 		searchReq := &knowledge.SearchRequest{
-			Query: req.Query,
+			Query:     req.Query,
+			History:   history,
+			UserID:    userID,
+			SessionID: sessionID,
 			SearchFilter: &knowledge.SearchFilter{
 				FilterCondition: finalFilter,
 			},
@@ -240,7 +374,15 @@ func NewAgenticFilterSearchTool(
 			return nil, fmt.Errorf("search failed: %w", err)
 		}
 
-		return convertSearchResults(result)
+		includeContent := opt.includeContent
+		if req.IncludeContent != nil {
+			includeContent = *req.IncludeContent
+		}
+		resp, err := convertSearchResults(result, opt.excludeMetadataKeys, includeContent)
+		if err != nil {
+			return nil, err
+		}
+		return applyPostProcessor(ctx, resp, opt.postProcessor), nil
 	}
 
 	toolName := opt.toolName
@@ -248,30 +390,124 @@ func NewAgenticFilterSearchTool(
 		toolName = "knowledge_search_with_agentic_filter"
 	}
 	filterInfo := generateAgenticFilterPrompt(agenticFilterInfo)
-	description := ""
-	if opt.toolDescription == "" {
-		description = filterInfo
-	} else {
-		description = fmt.Sprintf("tool description:%s, filter info:%s", opt.toolDescription, filterInfo)
+	description := composeAgenticToolDescription(opt.toolDescription, filterInfo)
+	return &autoMemoryPollutingTool{
+		CallableTool: function.NewFunctionTool(
+			searchFunc,
+			function.WithName(toolName),
+			function.WithDescription(description),
+		),
 	}
-	return function.NewFunctionTool(
-		searchFunc,
-		function.WithName(toolName),
-		function.WithDescription(description),
-	)
+}
+
+func searchContextFromInvocation(invocation *agent.Invocation) ([]knowledge.ConversationMessage, string, string) {
+	if invocation == nil || invocation.Session == nil {
+		return nil, "", ""
+	}
+	sess := invocation.Session
+	sess.EventMu.RLock()
+	defer sess.EventMu.RUnlock()
+
+	history := make([]knowledge.ConversationMessage, 0, defaultSearchHistorySize)
+	for i := len(sess.Events) - 1; i >= 0 && len(history) < defaultSearchHistorySize; i-- {
+		msg, ok := conversationMessageFromEvent(&sess.Events[i])
+		if !ok {
+			continue
+		}
+		history = append(history, msg)
+	}
+	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
+		history[i], history[j] = history[j], history[i]
+	}
+	return history, sess.UserID, sess.ID
+}
+
+func conversationMessageFromEvent(evt *event.Event) (knowledge.ConversationMessage, bool) {
+	if evt == nil {
+		return knowledge.ConversationMessage{}, false
+	}
+	resp := evt.Response
+	if resp == nil || resp.IsPartial || resp.IsToolCallResponse() || resp.IsToolResultResponse() {
+		return knowledge.ConversationMessage{}, false
+	}
+	for _, choice := range resp.Choices {
+		msg := choice.Message
+		if msg.Role != model.RoleUser && msg.Role != model.RoleAssistant {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			var textParts []string
+			for _, part := range msg.ContentParts {
+				if part.Type == model.ContentTypeText && part.Text != nil {
+					t := strings.TrimSpace(*part.Text)
+					if t != "" {
+						textParts = append(textParts, t)
+					}
+				}
+			}
+			content = strings.Join(textParts, "\n")
+			if content == "" {
+				continue
+			}
+		}
+		return knowledge.ConversationMessage{
+			Role:      string(msg.Role),
+			Content:   content,
+			Timestamp: evt.Timestamp.Unix(),
+		}, true
+	}
+	return knowledge.ConversationMessage{}, false
+}
+
+func composeAgenticToolDescription(toolDescription, filterInfo string) string {
+	toolDescription = strings.TrimSpace(toolDescription)
+	filterInfo = strings.TrimSpace(filterInfo)
+
+	base := toolDescription
+	if base == "" {
+		base = agenticFilterPromptIntro
+	}
+
+	filterAppendix := strings.TrimSpace(strings.TrimPrefix(filterInfo, agenticFilterPromptIntro))
+	if filterAppendix == "" {
+		filterAppendix = metadataFilterHint
+	}
+
+	return fmt.Sprintf("%s\n\n== FILTER GUIDANCE ==\n\n%s", base, filterAppendix)
+}
+
+// applyPostProcessor runs the optional ResultPostProcessor on resp. Passing a
+// nil processor returns resp unchanged, so callers can always write
+// `return applyPostProcessor(ctx, resp, opt.postProcessor), nil` without an
+// extra nil check.
+func applyPostProcessor(ctx context.Context, resp *KnowledgeSearchResponse, p ResultPostProcessor) *KnowledgeSearchResponse {
+	if p == nil {
+		return resp
+	}
+	return p(ctx, resp)
 }
 
 // convertSearchResults converts knowledge.SearchResult to KnowledgeSearchResponse.
-func convertSearchResults(result *knowledge.SearchResult) (*KnowledgeSearchResponse, error) {
+func convertSearchResults(
+	result *knowledge.SearchResult,
+	excludeKeys map[string]struct{},
+	includeContent bool,
+) (*KnowledgeSearchResponse, error) {
 	if result == nil || len(result.Documents) == 0 {
 		return nil, errors.New("no relevant information found")
 	}
 
 	documents := make([]*DocumentResult, 0, len(result.Documents))
 	for _, doc := range result.Documents {
+		text := ""
+		if includeContent {
+			text = doc.Document.Content
+		}
 		documents = append(documents, &DocumentResult{
-			Text:     doc.Document.Content,
-			Metadata: filterMetadata(doc.Document.Metadata),
+			ID:       doc.Document.ID,
+			Text:     text,
+			Metadata: filterMetadata(doc.Document.Metadata, excludeKeys),
 			Score:    doc.Score,
 		})
 	}
@@ -337,12 +573,16 @@ func mergeFilterConditions(
 }
 
 // filterMetadata removes internal metadata keys with MetaPrefix from the metadata map.
-func filterMetadata(metadata map[string]any) map[string]any {
+// Keys present in excludeKeys are additionally stripped, regardless of prefix.
+func filterMetadata(metadata map[string]any, excludeKeys map[string]struct{}) map[string]any {
 	if metadata == nil {
 		return nil
 	}
 	filtered := make(map[string]any)
 	for k, v := range metadata {
+		if _, excluded := excludeKeys[k]; excluded {
+			continue
+		}
 		if !strings.HasPrefix(k, source.MetaPrefix) ||
 			k == source.MetaChunkIndex ||
 			k == source.MetaMarkdownHeaderPath ||
@@ -356,7 +596,7 @@ func filterMetadata(metadata map[string]any) map[string]any {
 
 func generateAgenticFilterPrompt(agenticFilterInfo map[string][]any) string {
 	if len(agenticFilterInfo) == 0 {
-		return "You are a helpful assistant that can search for relevant information in the knowledge base."
+		return agenticFilterPromptIntro
 	}
 
 	// Build list of valid filter keys
@@ -368,7 +608,7 @@ func generateAgenticFilterPrompt(agenticFilterInfo map[string][]any) string {
 
 	var b strings.Builder
 
-	fmt.Fprintf(&b, `You are a helpful assistant that can search for relevant information in the knowledge base. Available filters: %s.
+	fmt.Fprintf(&b, `%s Available filters: %s.
 
 Filter Usage:
 - Query: Can be empty when using only metadata filters
@@ -385,7 +625,7 @@ Filter Examples (use double quotes for JSON):
 Note: For logical operators (and/or), use "value" field to specify an array of sub-conditions.
 
 Available Filter Values:
-`, keysStr)
+`, agenticFilterPromptIntro, keysStr)
 
 	// Separate keys with and without predefined values
 	var keysWithValues []string

@@ -10,9 +10,11 @@ This skill can compute basic statistics (lines, words, bytes) and
 capture a short preview of the file.
 
 User-provided files are typically exposed under `work/inputs/` (for
-example, when a host directory is mounted as inputs). Files produced
-by other skills are usually written under `out/` and can be
-summarized directly from there.
+example, when a host directory is mounted as inputs, or when the user
+uploads a file into the conversation and the framework stages it into
+the workspace before scripts run). Files produced by other skills are
+usually written under `out/` and can be summarized directly from
+there.
 
 Examples
 

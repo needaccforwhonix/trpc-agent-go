@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/structuredoutput"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -40,7 +41,11 @@ const (
 	ReasoningContentKey = "reasoning_content"
 	// ReasoningContentKeyAlt is the alternative key used by some providers (e.g. Ollama).
 	ReasoningContentKeyAlt = "reasoning"
-	// EnabledThinkingKey is the key used for enabling thinking mode in API requests e.g. Qwen model.
+	// EnableThinkingKey is the key used for enabling thinking mode in API requests e.g. Qwen model.
+	EnableThinkingKey = "enable_thinking"
+	// EnabledThinkingKey is kept for backward compatibility.
+	//
+	// Deprecated: use EnableThinkingKey.
 	EnabledThinkingKey = "enabled_thinking"
 )
 
@@ -76,6 +81,11 @@ type Message struct {
 	// ReasoningContent is hunyuan or deepseek think content
 	// - https://api-docs.deepseek.com/api/create-chat-completion#responses
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// ReasoningSignature is a token that verifies the reasoning text was generated
+	// by the model. When passing a reasoning block back to the API in a multi-turn
+	// conversation, include the text and its signature unmodified.
+	// Currently used by AWS Bedrock (Claude) models.
+	ReasoningSignature string `json:"reasoning_signature,omitempty"`
 }
 
 // AddFilePath adds a file path to the message.
@@ -105,12 +115,39 @@ func (m *Message) AddFileData(name string, data []byte, mimetype string) {
 	})
 }
 
+// AddFileURL adds a URL-based file to the message.
+func (m *Message) AddFileURL(name, url, mimetype string) {
+	m.ContentParts = append(m.ContentParts, ContentPart{
+		Type: ContentTypeFile,
+		File: &File{
+			Name:     name,
+			URL:      url,
+			MimeType: mimetype,
+		},
+	})
+}
+
 // AddFileID adds a file ID to the message.
 // The file id can be obtained from the response of the upload file API.
 func (m *Message) AddFileID(fileID string) {
 	m.ContentParts = append(m.ContentParts, ContentPart{
 		Type: ContentTypeFile,
 		File: &File{
+			FileID: fileID,
+		},
+	})
+}
+
+// AddFileIDWithName adds a file ID and filename to the message.
+//
+// The filename is not always sent to the model provider when FileID is used,
+// but it can be useful for downstream tooling (for example, staging user file
+// inputs into a skill workspace).
+func (m *Message) AddFileIDWithName(fileID, name string) {
+	m.ContentParts = append(m.ContentParts, ContentPart{
+		Type: ContentTypeFile,
+		File: &File{
+			Name:   name,
 			FileID: fileID,
 		},
 	})
@@ -181,6 +218,20 @@ func (m *Message) AddImageData(data []byte, detail, format string) {
 	})
 }
 
+// AddAudioURL adds URL-based audio to the message.
+// Format may be a media subtype such as "mpeg" or a full MIME type such as
+// "audio/mpeg". An empty format leaves media type resolution to the model
+// provider.
+func (m *Message) AddAudioURL(url, format string) {
+	m.ContentParts = append(m.ContentParts, ContentPart{
+		Type: ContentTypeAudio,
+		Audio: &Audio{
+			URL:    url,
+			Format: format,
+		},
+	})
+}
+
 // AddAudioFilePath adds an audio file path to the message.
 func (m *Message) AddAudioFilePath(path string) error {
 	content, err := os.ReadFile(path)
@@ -214,6 +265,32 @@ func (m *Message) AddAudioData(data []byte, format string) {
 	})
 }
 
+// AddVideoURL adds URL-based video to the message.
+// Format may be a media subtype such as "mp4" or a full MIME type such as
+// "video/mp4". An empty format leaves media type resolution to the model
+// provider.
+func (m *Message) AddVideoURL(url, format string) {
+	m.ContentParts = append(m.ContentParts, ContentPart{
+		Type: ContentTypeVideo,
+		Video: &Video{
+			URL:    url,
+			Format: format,
+		},
+	})
+}
+
+// AddVideoData adds inline video data to the message.
+// The argument of data is the raw video data without base64 encoding.
+func (m *Message) AddVideoData(data []byte, format string) {
+	m.ContentParts = append(m.ContentParts, ContentPart{
+		Type: ContentTypeVideo,
+		Video: &Video{
+			Data:   data,
+			Format: format,
+		},
+	})
+}
+
 // ContentType represents the type of content.
 type ContentType string
 
@@ -222,12 +299,14 @@ const (
 	ContentTypeText  ContentType = "text"
 	ContentTypeImage ContentType = "image"
 	ContentTypeAudio ContentType = "audio"
+	// ContentTypeVideo identifies video content.
+	ContentTypeVideo ContentType = "video"
 	ContentTypeFile  ContentType = "file"
 )
 
 // ContentPart represents a single content part in a multimodal message.
 type ContentPart struct {
-	// Type is the type of content: "text", "image", "audio", "file"
+	// Type is the type of content: "text", "image", "audio", "video", "file".
 	Type ContentType `json:"type"`
 	// Text is the text content.
 	Text *string `json:"text,omitempty"`
@@ -235,20 +314,73 @@ type ContentPart struct {
 	Image *Image `json:"image,omitempty"`
 	// Audio is the audio data.
 	Audio *Audio `json:"audio,omitempty"`
+	// Video is the video data.
+	Video *Video `json:"video,omitempty"`
 	// File is the file data.
 	File *File `json:"file,omitempty"`
+	// ContentRef is an internal reference to externalized content.
+	ContentRef *ContentRef `json:"content_ref,omitempty"`
+}
+
+// ContentRef records where externalized content is stored and how to restore it.
+//
+// A missing schema version represents the v1 schema.
+type ContentRef struct {
+	// ArtifactRef is the pinned artifact reference, for example artifact://name@0.
+	ArtifactRef string `json:"artifact_ref"`
+	// ArtifactName is the artifact filename.
+	ArtifactName string `json:"artifact_name,omitempty"`
+	// ArtifactVersion is the pinned artifact revision.
+	ArtifactVersion int `json:"artifact_version"`
+	// MimeType is the MIME type used when saving and hydrating the content.
+	MimeType string `json:"mime_type,omitempty"`
+	// SizeBytes is the original content size in bytes.
+	SizeBytes int64 `json:"size_bytes,omitempty"`
+	// SHA256 is the lowercase hex SHA256 of the original bytes.
+	SHA256 string `json:"sha256,omitempty"`
+	// OriginalName is the user-facing filename or display name, if any.
+	OriginalName string `json:"original_name,omitempty"`
+	// EventID identifies the owning event for debugging.
+	EventID string `json:"event_id,omitempty"`
+	// RequestID identifies the owning request for debugging.
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // File represents file content for file input models.
 type File struct {
 	// Name is the name of the file, used when passing the file to the model as a string.
 	Name string `json:"filename"`
+	// URL is the URL of the file.
+	URL string `json:"url,omitempty"`
 	// Data is the raw file data, used when passing the file to the model as a string.
 	Data []byte `json:"data"`
 	// FileID is the ID of an uploaded file to use as input.
 	FileID string `json:"file_id"`
 	// MimeType is the format of the file data.
 	MimeType string `json:"format,omitempty"`
+}
+
+// FileURLText returns a textual representation for providers that cannot accept URL-based files.
+func FileURLText(file *File) string {
+	if file == nil {
+		return ""
+	}
+	fileURL := strings.TrimSpace(file.URL)
+	if fileURL == "" {
+		return ""
+	}
+	name := strings.TrimSpace(file.Name)
+	mimeType := strings.TrimSpace(file.MimeType)
+	if name != "" && mimeType != "" {
+		return fmt.Sprintf("File URL: %s (%s): %s", name, mimeType, fileURL)
+	}
+	if name != "" {
+		return fmt.Sprintf("File URL: %s: %s", name, fileURL)
+	}
+	if mimeType != "" {
+		return fmt.Sprintf("File URL (%s): %s", mimeType, fileURL)
+	}
+	return "File URL: " + fileURL
 }
 
 // Image represents an image data for vision models.
@@ -259,16 +391,36 @@ type Image struct {
 	Data []byte `json:"data"`
 	// Detail is the detail level: "low", "high", "auto".
 	Detail string `json:"detail,omitempty"`
-	// Format is the format of the image data.
+	// Format is the image format.
+	// Data-backed images usually use a subtype such as "png".
+	// URL-backed images may use a full MIME type such as "image/png".
 	Format string `json:"format,omitempty"`
 }
 
 // Audio represents audio input for audio models.
 type Audio struct {
+	// URL is the URL of the audio. When URL and Data are both set, URL takes
+	// precedence.
+	URL string `json:"url,omitempty"`
 	// Data is the raw audio data.
 	Data []byte `json:"data"`
-	// Format is the format of the encoded audio data. Currently supports "wav" and "mp3".
+	// Format is the format of the encoded audio data.
+	// Data-backed audio usually uses a subtype such as "wav" or "mp3".
+	// URL-backed audio may use a full MIME type such as "audio/mpeg".
 	Format string `json:"format"`
+}
+
+// Video represents video input for multimodal models.
+type Video struct {
+	// URL is the URL of the video. When URL and Data are both set, URL takes
+	// precedence.
+	URL string `json:"url,omitempty"`
+	// Data is the raw video data.
+	Data []byte `json:"data"`
+	// Format is the video format.
+	// Data-backed video usually uses a subtype such as "mp4".
+	// URL-backed video may use a full MIME type such as "video/mp4".
+	Format string `json:"format,omitempty"`
 }
 
 // NewSystemMessage creates a new system message.
@@ -327,17 +479,45 @@ type GenerationConfig struct {
 
 	// FrequencyPenalty penalizes new tokens based on their frequency in the text so far.
 	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	// Logprobs controls whether providers should return token log probabilities.
+	Logprobs *bool `json:"logprobs,omitempty"`
+	// TopLogprobs controls how many alternative token log probabilities are returned.
+	TopLogprobs *int `json:"top_logprobs,omitempty"`
 
 	// ReasoningEffort limits the reasoning effort for reasoning models.
-	// Supported values: "low", "medium", "high".
-	// Only effective for OpenAI o-series models.
+	// The accepted values depend on the provider:
+	//   - OpenAI o-series: "low", "medium", "high".
+	//   - Anthropic adaptive thinking: "low", "medium", "high", "max", and
+	//     "xhigh" on models that support it.
+	//   - DeepSeek v4 (deepseek-v4-pro / deepseek-v4-flash): "high", "max".
+	//     For backward compatibility, the DeepSeek service maps "low" and
+	//     "medium" to "high", and "xhigh" to "max", so older configurations
+	//     still work without errors.
+	// See:
+	//   - https://platform.openai.com/docs/api-reference/chat/create
+	//   - https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+	//   - https://api-docs.deepseek.com/api/create-chat-completion
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 
-	// ThinkingEnabled enables thinking mode for Claude and Gemini models via OpenAI API.
+	// ThinkingEnabled toggles thinking/reasoning mode for providers that
+	// expose it (e.g. DeepSeek v4 via the "thinking" object, Claude / Gemini
+	// via the OpenAI-compatible API).
+	//
+	// When left nil, trpc-agent-go does NOT emit any thinking-toggle field
+	// in the outgoing request, so the provider's server-side default takes
+	// effect (DeepSeek v4 defaults to "enabled"). Set to *true / *false to
+	// force a specific behavior. Anthropic adaptive-thinking models map *true
+	// to thinking.type=adaptive, while older Anthropic models map *true to
+	// thinking.type=enabled with ThinkingTokens.
 	ThinkingEnabled *bool `json:"thinking_enabled,omitempty"`
 
-	// ThinkingTokens controls the length of thinking for Claude and Gemini models via OpenAI API.
+	// ThinkingTokens controls the fixed thinking token budget for providers that support it.
+	// Anthropic adaptive-thinking models ignore this field and use ReasoningEffort instead.
 	ThinkingTokens *int `json:"thinking_tokens,omitempty"`
+
+	// ThinkingLevel controls the qualitative thinking level for providers that support it.
+	// Gemini 3 uses this field for thinkingConfig.thinkingLevel.
+	ThinkingLevel *string `json:"thinking_level,omitempty"`
 }
 
 // GenerationConfigPatch selectively overrides fields in GenerationConfig.
@@ -358,9 +538,12 @@ type GenerationConfigPatch struct {
 	Stop             []string `json:"stop,omitempty"`
 	PresencePenalty  *float64 `json:"presence_penalty,omitempty"`
 	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	Logprobs         *bool    `json:"logprobs,omitempty"`
+	TopLogprobs      *int     `json:"top_logprobs,omitempty"`
 	ReasoningEffort  *string  `json:"reasoning_effort,omitempty"`
 	ThinkingEnabled  *bool    `json:"thinking_enabled,omitempty"`
 	ThinkingTokens   *int     `json:"thinking_tokens,omitempty"`
+	ThinkingLevel    *string  `json:"thinking_level,omitempty"`
 }
 
 // ApplyGenerationConfigPatch applies patch to base and returns the merged
@@ -390,6 +573,12 @@ func ApplyGenerationConfigPatch(
 	if patch.FrequencyPenalty != nil {
 		base.FrequencyPenalty = patch.FrequencyPenalty
 	}
+	if patch.Logprobs != nil {
+		base.Logprobs = patch.Logprobs
+	}
+	if patch.TopLogprobs != nil {
+		base.TopLogprobs = patch.TopLogprobs
+	}
 	if patch.ReasoningEffort != nil {
 		base.ReasoningEffort = patch.ReasoningEffort
 	}
@@ -398,6 +587,9 @@ func ApplyGenerationConfigPatch(
 	}
 	if patch.ThinkingTokens != nil {
 		base.ThinkingTokens = patch.ThinkingTokens
+	}
+	if patch.ThinkingLevel != nil {
+		base.ThinkingLevel = patch.ThinkingLevel
 	}
 	return base
 }
@@ -416,7 +608,47 @@ type Request struct {
 	// JSON formatting. This field is optional and provider-agnostic.
 	StructuredOutput *StructuredOutput `json:"structured_output,omitempty"`
 
+	// ExtraFields stores provider-specific top-level request body fields.
+	// Model adapters merge these with model-level extra fields when supported;
+	// request-level values take precedence.
+	ExtraFields map[string]any `json:"-"`
+
+	// Headers stores provider-specific HTTP headers for this request.
+	// Model adapters merge these with model-level headers when supported;
+	// request-level values take precedence.
+	Headers map[string]string `json:"-"`
+
 	Tools map[string]tool.Tool `json:"-"` // Tools are not serialized, handled separately
+}
+
+// RequestOption configures a Request.
+type RequestOption func(*Request)
+
+// NewRequest creates a model request from messages and applies options.
+func NewRequest(messages []Message, opts ...RequestOption) *Request {
+	req := &Request{
+		Messages: messages,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(req)
+		}
+	}
+	return req
+}
+
+// WithStructuredOutputJSON sets JSON schema structured output for a request.
+// The schema is constructed automatically from the provided example type.
+//
+// This configures provider-native structured output where supported. Direct
+// model callers still receive normal model.Response values and should unmarshal
+// the final JSON content themselves.
+func WithStructuredOutputJSON(examplePtr any, strict bool, description string) RequestOption {
+	return func(req *Request) {
+		if out := structuredOutputJSON(examplePtr, strict, description); out != nil {
+			req.StructuredOutput = out
+		}
+	}
 }
 
 // ToolCall represents a call to a tool (function) in the model response.
@@ -545,4 +777,20 @@ type StructuredOutput struct {
 	Type StructuredOutputType `json:"type"`
 	// JSONSchema is used when Type is StructuredOutputJSONSchema.
 	JSONSchema *JSONSchemaConfig `json:"json_schema,omitempty"`
+}
+
+func structuredOutputJSON(examplePtr any, strict bool, description string) *StructuredOutput {
+	name, schema, _ := structuredoutput.FromType(examplePtr, strict)
+	if schema == nil {
+		return nil
+	}
+	return &StructuredOutput{
+		Type: StructuredOutputJSONSchema,
+		JSONSchema: &JSONSchemaConfig{
+			Name:        name,
+			Schema:      schema,
+			Strict:      strict,
+			Description: description,
+		},
+	}
 }

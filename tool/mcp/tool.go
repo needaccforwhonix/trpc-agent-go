@@ -19,6 +19,39 @@ import (
 	mcp "trpc.group/trpc-go/trpc-mcp-go"
 )
 
+// mcpToolResult wraps MCP tool result for backward compatibility.
+// It marshals as the Content slice, but provides Meta access via GetMeta().
+type mcpToolResult struct {
+	Content []mcp.Content
+	Meta    map[string]any
+	IsError bool
+}
+
+// MarshalJSON implements json.Marshaler.
+// It marshals only the Content slice for backward compatibility.
+func (r *mcpToolResult) MarshalJSON() ([]byte, error) {
+	if r == nil || len(r.Content) == 0 {
+		return []byte("[]"), nil
+	}
+	return json.Marshal(r.Content)
+}
+
+// GetMeta returns the metadata from the tool result.
+func (r *mcpToolResult) GetMeta() map[string]any {
+	return r.Meta
+}
+
+// GetCallbackResult returns the callback-facing result payload.
+// AfterTool callbacks should continue to receive the raw content slice.
+func (r *mcpToolResult) GetCallbackResult() any {
+	return r.Content
+}
+
+// RetryResultError reports whether the MCP result should be treated as a result-level failure.
+func (r *mcpToolResult) RetryResultError() bool {
+	return r.IsError
+}
+
 // mcpTool implements the Tool interface for MCP tools.
 type mcpTool struct {
 	mcpToolRef     *mcp.Tool
@@ -26,6 +59,8 @@ type mcpTool struct {
 	outputSchema   *tool.Schema
 	sessionManager *mcpSessionManager
 }
+
+var _ tool.MetadataProvider = (*mcpTool)(nil)
 
 // newMCPTool creates a new MCP tool wrapper.
 func newMCPTool(mcpToolData mcp.Tool, sessionManager *mcpSessionManager) *mcpTool {
@@ -45,6 +80,26 @@ func newMCPTool(mcpToolData mcp.Tool, sessionManager *mcpSessionManager) *mcpToo
 	}
 
 	return mcpTool
+}
+
+// ToolMetadata converts explicit MCP tool annotations into framework metadata.
+func (t *mcpTool) ToolMetadata() tool.ToolMetadata {
+	if t == nil || t.mcpToolRef == nil || t.mcpToolRef.Annotations == nil {
+		return tool.ToolMetadata{}
+	}
+
+	annotations := t.mcpToolRef.Annotations
+	var metadata tool.ToolMetadata
+	if annotations.ReadOnlyHint != nil {
+		metadata.ReadOnly = *annotations.ReadOnlyHint
+	}
+	if annotations.DestructiveHint != nil {
+		metadata.Destructive = *annotations.DestructiveHint
+	}
+	if annotations.OpenWorldHint != nil {
+		metadata.OpenWorld = *annotations.OpenWorldHint
+	}
+	return metadata
 }
 
 // Call implements the Tool interface.
@@ -70,13 +125,18 @@ func (t *mcpTool) Call(ctx context.Context, jsonArgs []byte) (any, error) {
 }
 
 // callOnce performs a single call to the MCP tool.
+// Returns a wrapped result that marshals as Content for backward compatibility.
 func (t *mcpTool) callOnce(ctx context.Context, arguments map[string]any) (any, error) {
-	content, err := t.sessionManager.callTool(ctx, t.mcpToolRef.Name, arguments)
+	result, err := t.sessionManager.callTool(ctx, t.mcpToolRef.Name, arguments)
 	if err != nil {
 		return nil, err
 	}
-
-	return content, nil
+	// Wrap for backward compatibility: marshals as Content array, but Meta is accessible
+	return &mcpToolResult{
+		Content: result.Content,
+		Meta:    result.Meta,
+		IsError: result.IsError,
+	}, nil
 }
 
 // Declaration implements the Tool interface.

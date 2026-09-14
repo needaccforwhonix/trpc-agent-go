@@ -47,6 +47,10 @@ const (
 	// KeyTRPCAgentGoClientTimeToFirstToken is the attribute key for time to first token metric.
 	KeyTRPCAgentGoClientTimeToFirstToken = "trpc_agent_go.client.time_to_first_token" // #nosec G101 - this is a metric key name, not a credential.
 
+	// KeyGenAIAppName is the attribute key for GenAI application name.
+	KeyGenAIAppName = "gen_ai.app.name"
+	// KeyGenAIUserID is the attribute key for GenAI user ID.
+	KeyGenAIUserID = "gen_ai.user.id"
 	// KeyGenAIOperationName is the attribute key for GenAI operation name.
 	KeyGenAIOperationName = "gen_ai.operation.name"
 	// KeyGenAISystem is the attribute key for GenAI system identifier.
@@ -58,18 +62,36 @@ const (
 	KeyGenAIRequestIsStream = "gen_ai.request.is_stream"
 	// KeyGenAIRequestChoiceCount is the attribute key for the number of choices in the request.
 	KeyGenAIRequestChoiceCount = "gen_ai.request.choice.count"
-	// KeyGenAIInputMessages is the attribute key for input messages.
+	// KeyGenAIInputMessages is the deprecated compatibility attribute key for
+	// framework-shaped input messages. New integrations should prefer
+	// KeyGenAIInputMessagesOTel.
 	KeyGenAIInputMessages = "gen_ai.input.messages"
-	// KeyGenAIOutputMessages is the attribute key for output messages.
+	// KeyGenAIInputMessagesOTel is the attribute key for OpenTelemetry-aligned
+	// input messages encoded with role+parts.
+	KeyGenAIInputMessagesOTel = "gen_ai.input.messages.otel"
+	// KeyGenAIOutputMessages is the deprecated compatibility attribute key for
+	// framework-shaped output messages. New integrations should prefer
+	// KeyGenAIOutputMessagesOTel.
 	KeyGenAIOutputMessages = "gen_ai.output.messages"
+	// KeyGenAIOutputMessagesOTel is the attribute key for OpenTelemetry-aligned
+	// output messages encoded with role+parts.
+	KeyGenAIOutputMessagesOTel = "gen_ai.output.messages.otel"
 	// KeyGenAIAgentName is the attribute key for agent name.
 	KeyGenAIAgentName = "gen_ai.agent.name"
+	// KeyGenAIAgentID is the attribute key for agent ID.
+	KeyGenAIAgentID = "gen_ai.agent.id"
 	// KeyGenAIConversationID is the attribute key for conversation ID.
 	KeyGenAIConversationID = "gen_ai.conversation.id"
 	// KeyGenAIUsageOutputTokens is the attribute key for output token count.
 	KeyGenAIUsageOutputTokens = "gen_ai.usage.output_tokens" // #nosec G101 - this is a metric key name, not a credential.
 	// KeyGenAIUsageInputTokens is the attribute key for input token count.
 	KeyGenAIUsageInputTokens = "gen_ai.usage.input_tokens" // #nosec G101 - this is a metric key name, not a credential.
+	// KeyGenAIUsageTotalTokens is the attribute key for provider-reported total
+	// token count. It is only set when the model response includes a non-zero
+	// TotalTokens value.
+	// Note: This is an extension field; it is not part of the upstream GenAI
+	// semantic conventions yet.
+	KeyGenAIUsageTotalTokens = "gen_ai.usage.total_tokens" // #nosec G101 - this is a metric key name, not a credential.
 	// KeyGenAIUsageInputTokensCached is the attribute key for cached input token count.
 	// Note: This is an extension field used to report prompt cache tokens; it is not part of the upstream GenAI semantic conventions yet.
 	KeyGenAIUsageInputTokensCached = "gen_ai.usage.input_tokens.cached" // #nosec G101 - this is a metric key name, not a credential.

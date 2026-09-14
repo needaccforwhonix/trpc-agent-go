@@ -12,8 +12,10 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,21 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	mcp "trpc.group/trpc-go/trpc-mcp-go"
 )
+
+func TestIsBenignMCPClientCloseError(t *testing.T) {
+	require.False(t, isBenignMCPClientCloseError(nil))
+	require.True(t, isBenignMCPClientCloseError(os.ErrProcessDone))
+	require.True(
+		t,
+		isBenignMCPClientCloseError(
+			fmt.Errorf("close: %s", processAlreadyFinishedText),
+		),
+	)
+	require.False(
+		t,
+		isBenignMCPClientCloseError(errors.New("close failed")),
+	)
+}
 
 // TestToolSet_Close tests the Close method
 func TestToolSet_Close(t *testing.T) {
@@ -117,9 +134,42 @@ func TestSessionManager_CallTool_UsesStructuredContentWhenContentEmpty(t *testin
 
 	result, err := manager.callTool(context.Background(), "test-tool", map[string]any{"key": "value"})
 	require.NoError(t, err)
-	require.Len(t, result, 1)
+	require.Len(t, result.Content, 1)
 
-	structuredText, ok := result[0].(mcp.TextContent)
+	structuredText, ok := result.Content[0].(mcp.TextContent)
+	require.True(t, ok)
+
+	expectedJSON, err := json.Marshal(structured)
+	require.NoError(t, err)
+	assert.Equal(t, string(expectedJSON), structuredText.Text)
+}
+
+func TestSessionManager_CallTool_UsesStructuredContentWhenContentEmpty_PreservesMeta(t *testing.T) {
+	structured := map[string]any{"count": 1, "foo": "bar"}
+	expectedMeta := map[string]any{"trace_id": "abc123", "source": "structured-only"}
+	manager := newMCPSessionManager(ConnectionConfig{}, nil, nil)
+	manager.client = &stubConnector{
+		callToolFn: func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			require.NotNil(t, ctx)
+			require.Equal(t, "test-tool", req.Params.Name)
+			return &mcp.CallToolResult{
+				Result: mcp.Result{
+					Meta: expectedMeta,
+				},
+				StructuredContent: structured,
+			}, nil
+		},
+	}
+	manager.connected = true
+	manager.initialized = true
+
+	result, err := manager.callTool(context.Background(), "test-tool", map[string]any{"key": "value"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Content, 1)
+	require.Equal(t, expectedMeta, result.Meta)
+
+	structuredText, ok := result.Content[0].(mcp.TextContent)
 	require.True(t, ok)
 
 	expectedJSON, err := json.Marshal(structured)
@@ -144,9 +194,9 @@ func TestSessionManager_CallTool_IgnoresStructuredContentWhenContentPresent(t *t
 
 	result, err := manager.callTool(context.Background(), "test-tool", map[string]any{"key": "value"})
 	require.NoError(t, err)
-	require.Len(t, result, 1)
+	require.Len(t, result.Content, 1)
 
-	original, ok := result[0].(mcp.TextContent)
+	original, ok := result.Content[0].(mcp.TextContent)
 	require.True(t, ok)
 	assert.Equal(t, "original", original.Text)
 }
@@ -165,7 +215,7 @@ func TestSessionManager_CallTool_NoContentNoStructured(t *testing.T) {
 
 	result, err := manager.callTool(context.Background(), "test-tool", nil)
 	require.NoError(t, err)
-	assert.Len(t, result, 0)
+	assert.Len(t, result.Content, 0)
 }
 
 func TestSessionManager_CallTool_StructuredContentMarshalError(t *testing.T) {
@@ -184,7 +234,7 @@ func TestSessionManager_CallTool_StructuredContentMarshalError(t *testing.T) {
 	result, err := manager.callTool(context.Background(), "test-tool", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "marshal structured content")
-	assert.Len(t, result, 0)
+	assert.Nil(t, result)
 }
 
 // TestSessionManager_CallTool_Error tests callTool when CallTool returns an error
@@ -2081,6 +2131,27 @@ func TestToolSet_Close_WithError(t *testing.T) {
 		if !strings.Contains(err.Error(), "failed to close MCP session") {
 			t.Errorf("Expected 'failed to close MCP session' error, got: %v", err)
 		}
+	})
+
+	t.Run("close with already finished process", func(t *testing.T) {
+		config := ConnectionConfig{
+			Transport: "stdio",
+			Command:   "echo",
+			Args:      []string{"hello"},
+		}
+		toolset := NewMCPToolSet(config)
+
+		manager := toolset.sessionManager
+		manager.mu.Lock()
+		manager.client = &stubConnector{
+			closeError: os.ErrProcessDone,
+		}
+		manager.connected = true
+		manager.initialized = true
+		manager.mu.Unlock()
+
+		require.NoError(t, toolset.Close())
+		require.False(t, manager.isConnected())
 	})
 }
 

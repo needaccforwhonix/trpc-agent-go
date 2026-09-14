@@ -40,6 +40,7 @@ type ServiceOpts struct {
 	extraOptions []any  // Extra options passed to storage layer
 
 	sessionTTL         time.Duration // TTL for session state and event list
+	trackEventTTL      *time.Duration
 	appStateTTL        time.Duration // TTL for app state
 	userStateTTL       time.Duration // TTL for user state
 	enableAsyncPersist bool
@@ -55,6 +56,13 @@ type ServiceOpts struct {
 	summaryQueueSize int
 	// summaryJobTimeout is the timeout for processing a single summary job.
 	summaryJobTimeout time.Duration
+	// summaryFilterAllowlist restricts which non-empty filterKeys may trigger
+	// branch summaries.
+	summaryFilterAllowlist []string
+	// cascadeFullSessionSummary controls whether allowed branch summaries also
+	// refresh the full-session summary. Nil preserves the legacy default of
+	// enabling full-session cascade for zero-value options.
+	cascadeFullSessionSummary *bool
 
 	// skipDBInit skips database initialization (table and index creation).
 	// Useful when user doesn't have DDL permissions or when tables are managed externally.
@@ -67,6 +75,11 @@ type ServiceOpts struct {
 	// hooks for session operations.
 	appendEventHooks []session.AppendEventHook
 	getSessionHooks  []session.GetSessionHook
+
+	// tdsqlSharding enables TDSQL distributed instance mode.
+	// When true, uses user_id as shardkey for session/user tables,
+	// broadcast table for app_states, and two-phase TTL cleanup.
+	tdsqlSharding bool
 }
 
 // ServiceOpt is the option for the MySQL session service.
@@ -82,6 +95,20 @@ var (
 		softDelete:        true, // default: enable soft delete
 	}
 )
+
+func (opts ServiceOpts) shouldCascadeFullSessionSummary() bool {
+	if opts.cascadeFullSessionSummary == nil {
+		return true
+	}
+	return *opts.cascadeFullSessionSummary
+}
+
+func (opts ServiceOpts) effectiveTrackEventTTL() time.Duration {
+	if opts.trackEventTTL != nil {
+		return *opts.trackEventTTL
+	}
+	return opts.sessionTTL
+}
 
 // WithSessionEventLimit sets the limit of events in a session.
 func WithSessionEventLimit(limit int) ServiceOpt {
@@ -127,6 +154,15 @@ func WithExtraOptions(extraOptions ...any) ServiceOpt {
 func WithSessionTTL(ttl time.Duration) ServiceOpt {
 	return func(opts *ServiceOpts) {
 		opts.sessionTTL = ttl
+	}
+}
+
+// WithTrackEventTTL sets the TTL for track events.
+// If unset, track events use the session TTL. A non-positive TTL disables track
+// event expiration.
+func WithTrackEventTTL(ttl time.Duration) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		opts.trackEventTTL = &ttl
 	}
 }
 
@@ -202,6 +238,23 @@ func WithSummaryJobTimeout(timeout time.Duration) ServiceOpt {
 	}
 }
 
+// WithSummaryFilterAllowlist restricts which non-empty filterKeys may trigger
+// branch summaries. Keys use the same exact format as event filter keys.
+func WithSummaryFilterAllowlist(filterKeys ...string) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		opts.summaryFilterAllowlist = append([]string{}, filterKeys...)
+	}
+}
+
+// WithCascadeFullSessionSummary controls whether an allowed branch summary also
+// refreshes the full-session summary keyed by SummaryFilterKeyAllContents.
+func WithCascadeFullSessionSummary(enable bool) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		enabled := enable
+		opts.cascadeFullSessionSummary = &enabled
+	}
+}
+
 // WithSoftDelete enables or disables soft delete.
 // When enabled (default), DELETE operations set deleted_at timestamp instead of removing records.
 // When disabled, DELETE operations permanently remove records from database.
@@ -266,5 +319,20 @@ func WithAppendEventHook(hooks ...session.AppendEventHook) ServiceOpt {
 func WithGetSessionHook(hooks ...session.GetSessionHook) ServiceOpt {
 	return func(opts *ServiceOpts) {
 		opts.getSessionHooks = append(opts.getSessionHooks, hooks...)
+	}
+}
+
+// WithTDSQLSharding enables TDSQL distributed instance mode.
+// In this mode:
+//   - session/user tables use user_id as shardkey (PK becomes (id, user_id))
+//   - app_states uses broadcast table (noshardkey_allset)
+//   - TTL cleanup uses two-phase approach (scan then targeted delete)
+//   - DML statements include shardkey in WHERE clause for routing
+//
+// Constraint: user_id must be ASCII-only. TDSQL proxy does not convert
+// character sets; non-ASCII shardkey values may cause routing instability.
+func WithTDSQLSharding(enable bool) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		opts.tdsqlSharding = enable
 	}
 }

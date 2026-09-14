@@ -286,9 +286,12 @@ func TestApplyGenerationConfigPatch(t *testing.T) {
 		Stop:             []string{"STOP"},
 		PresencePenalty:  Float64Ptr(0.1),
 		FrequencyPenalty: Float64Ptr(0.2),
+		Logprobs:         BoolPtr(false),
+		TopLogprobs:      IntPtr(5),
 		ReasoningEffort:  StringPtr("low"),
 		ThinkingEnabled:  BoolPtr(true),
 		ThinkingTokens:   IntPtr(100),
+		ThinkingLevel:    StringPtr("medium"),
 	}
 	patch := GenerationConfigPatch{
 		MaxTokens:        IntPtr(20),
@@ -298,9 +301,12 @@ func TestApplyGenerationConfigPatch(t *testing.T) {
 		Stop:             []string{"X"},
 		PresencePenalty:  Float64Ptr(1.1),
 		FrequencyPenalty: Float64Ptr(1.2),
+		Logprobs:         BoolPtr(true),
+		TopLogprobs:      IntPtr(20),
 		ReasoningEffort:  StringPtr("high"),
 		ThinkingEnabled:  BoolPtr(false),
 		ThinkingTokens:   IntPtr(200),
+		ThinkingLevel:    StringPtr("low"),
 	}
 	got := ApplyGenerationConfigPatch(base, patch)
 	require.NotNil(t, got.MaxTokens)
@@ -315,12 +321,18 @@ func TestApplyGenerationConfigPatch(t *testing.T) {
 	require.Equal(t, 1.1, *got.PresencePenalty)
 	require.NotNil(t, got.FrequencyPenalty)
 	require.Equal(t, 1.2, *got.FrequencyPenalty)
+	require.NotNil(t, got.Logprobs)
+	require.True(t, *got.Logprobs)
+	require.NotNil(t, got.TopLogprobs)
+	require.Equal(t, 20, *got.TopLogprobs)
 	require.NotNil(t, got.ReasoningEffort)
 	require.Equal(t, "high", *got.ReasoningEffort)
 	require.NotNil(t, got.ThinkingEnabled)
 	require.False(t, *got.ThinkingEnabled)
 	require.NotNil(t, got.ThinkingTokens)
 	require.Equal(t, 200, *got.ThinkingTokens)
+	require.NotNil(t, got.ThinkingLevel)
+	require.Equal(t, "low", *got.ThinkingLevel)
 
 	patch.Stop[0] = "Y"
 	require.Equal(t, []string{"X"}, got.Stop)
@@ -544,6 +556,84 @@ func TestMessage_AddFileData(t *testing.T) {
 	}
 }
 
+func TestMessage_AddFileURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		filename string
+		url      string
+		mimetype string
+	}{
+		{
+			name:     "add PDF URL",
+			filename: "report.pdf",
+			url:      "https://example.com/report.pdf",
+			mimetype: "application/pdf",
+		},
+		{
+			name:     "add URL without name",
+			filename: "",
+			url:      "https://example.com/download",
+			mimetype: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := &Message{}
+			msg.AddFileURL(tt.filename, tt.url, tt.mimetype)
+			require.Len(t, msg.ContentParts, 1)
+			assert.Equal(t, ContentTypeFile, msg.ContentParts[0].Type)
+			require.NotNil(t, msg.ContentParts[0].File)
+			assert.Equal(t, tt.filename, msg.ContentParts[0].File.Name)
+			assert.Equal(t, tt.url, msg.ContentParts[0].File.URL)
+			assert.Equal(t, tt.mimetype, msg.ContentParts[0].File.MimeType)
+		})
+	}
+}
+
+func TestFileURLText(t *testing.T) {
+	tests := []struct {
+		name string
+		file *File
+		want string
+	}{
+		{
+			name: "nil",
+			file: nil,
+			want: "",
+		},
+		{
+			name: "empty URL",
+			file: &File{Name: "report.pdf"},
+			want: "",
+		},
+		{
+			name: "name and MIME",
+			file: &File{Name: "report.pdf", URL: " https://example.com/report.pdf ", MimeType: "application/pdf"},
+			want: "File URL: report.pdf (application/pdf): https://example.com/report.pdf",
+		},
+		{
+			name: "name only",
+			file: &File{Name: "report.pdf", URL: "https://example.com/report.pdf"},
+			want: "File URL: report.pdf: https://example.com/report.pdf",
+		},
+		{
+			name: "MIME only",
+			file: &File{URL: "https://example.com/report.pdf", MimeType: "application/pdf"},
+			want: "File URL (application/pdf): https://example.com/report.pdf",
+		},
+		{
+			name: "URL only",
+			file: &File{URL: "https://example.com/report.pdf"},
+			want: "File URL: https://example.com/report.pdf",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, FileURLText(tt.file))
+		})
+	}
+}
+
 func TestMessage_AddFileID(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -568,6 +658,37 @@ func TestMessage_AddFileID(t *testing.T) {
 			assert.Equal(t, ContentTypeFile, msg.ContentParts[0].Type)
 			require.NotNil(t, msg.ContentParts[0].File)
 			assert.Equal(t, tt.fileID, msg.ContentParts[0].File.FileID)
+		})
+	}
+}
+
+func TestMessage_AddFileIDWithName(t *testing.T) {
+	tests := []struct {
+		name   string
+		fileID string
+		file   string
+	}{
+		{
+			name:   "add file id with name",
+			fileID: "file-abc123",
+			file:   "notes.txt",
+		},
+		{
+			name:   "empty name",
+			fileID: "file-abc123",
+			file:   "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := &Message{}
+			msg.AddFileIDWithName(tt.fileID, tt.file)
+
+			require.Len(t, msg.ContentParts, 1)
+			assert.Equal(t, ContentTypeFile, msg.ContentParts[0].Type)
+			require.NotNil(t, msg.ContentParts[0].File)
+			assert.Equal(t, tt.fileID, msg.ContentParts[0].File.FileID)
+			assert.Equal(t, tt.file, msg.ContentParts[0].File.Name)
 		})
 	}
 }
@@ -686,6 +807,40 @@ func TestMessage_AddAudioData(t *testing.T) {
 			assert.Equal(t, tt.format, msg.ContentParts[0].Audio.Format)
 		})
 	}
+}
+
+func TestMessage_AddAudioURL(t *testing.T) {
+	msg := &Message{}
+	msg.AddAudioURL("https://example.com/audio.mp3", "audio/mpeg")
+
+	require.Len(t, msg.ContentParts, 1)
+	assert.Equal(t, ContentTypeAudio, msg.ContentParts[0].Type)
+	require.NotNil(t, msg.ContentParts[0].Audio)
+	assert.Equal(t, "https://example.com/audio.mp3", msg.ContentParts[0].Audio.URL)
+	assert.Equal(t, "audio/mpeg", msg.ContentParts[0].Audio.Format)
+}
+
+func TestMessage_AddVideoURL(t *testing.T) {
+	msg := &Message{}
+	msg.AddVideoURL("https://example.com/video.mp4", "video/mp4")
+
+	require.Len(t, msg.ContentParts, 1)
+	assert.Equal(t, ContentTypeVideo, msg.ContentParts[0].Type)
+	require.NotNil(t, msg.ContentParts[0].Video)
+	assert.Equal(t, "https://example.com/video.mp4", msg.ContentParts[0].Video.URL)
+	assert.Equal(t, "video/mp4", msg.ContentParts[0].Video.Format)
+}
+
+func TestMessage_AddVideoData(t *testing.T) {
+	data := []byte("video data")
+	msg := &Message{}
+	msg.AddVideoData(data, "mp4")
+
+	require.Len(t, msg.ContentParts, 1)
+	assert.Equal(t, ContentTypeVideo, msg.ContentParts[0].Type)
+	require.NotNil(t, msg.ContentParts[0].Video)
+	assert.Equal(t, data, msg.ContentParts[0].Video.Data)
+	assert.Equal(t, "mp4", msg.ContentParts[0].Video.Format)
 }
 
 func TestMessage_AddFilePath(t *testing.T) {

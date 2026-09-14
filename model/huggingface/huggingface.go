@@ -22,9 +22,11 @@ import (
 	"os"
 	"strings"
 
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
+	"trpc.group/trpc-go/trpc-agent-go/model/internal/modeltailoring"
 )
 
 // Model implements the model.Model interface for HuggingFace API.
@@ -42,6 +44,7 @@ type Model struct {
 	extraFields                map[string]any
 	enableTokenTailoring       bool
 	maxInputTokens             int
+	contextWindow              int
 	tokenCounter               model.TokenCounter
 	tailoringStrategy          model.TailoringStrategy
 	tokenTailoringConfig       *model.TokenTailoringConfig
@@ -102,6 +105,7 @@ func New(modelName string, opts ...Option) (*Model, error) {
 		extraFields:                options.ExtraFields,
 		enableTokenTailoring:       options.EnableTokenTailoring || options.MaxInputTokens > 0,
 		maxInputTokens:             options.MaxInputTokens,
+		contextWindow:              options.ContextWindow,
 		tokenCounter:               options.TokenCounter,
 		tailoringStrategy:          tailoringStrategy,
 		tokenTailoringConfig:       options.TokenTailoringConfig,
@@ -125,6 +129,11 @@ func (m *Model) GenerateContent(ctx context.Context, request *model.Request) (<-
 		return nil, fmt.Errorf("failed to convert request: %w", err)
 	}
 
+	// Execute callback synchronously before starting the goroutine
+	// to avoid a race where the runner and HTTP handler finish
+	// (closing the SSE writer) while the callback is still running.
+	m.runChatRequestCallback(ctx, hfRequest)
+
 	// Create response channel.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
 
@@ -138,10 +147,58 @@ func (m *Model) GenerateContent(ctx context.Context, request *model.Request) (<-
 	return responseChan, nil
 }
 
+func (m *Model) runChatRequestCallback(
+	ctx context.Context,
+	hfRequest *ChatCompletionRequest,
+) {
+	if m.chatRequestCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat request callback")
+	m.chatRequestCallback(ctx, hfRequest)
+}
+
+func (m *Model) runChatResponseCallback(
+	ctx context.Context,
+	hfRequest *ChatCompletionRequest,
+	hfResponse *ChatCompletionResponse,
+) {
+	if m.chatResponseCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat response callback")
+	m.chatResponseCallback(ctx, hfRequest, hfResponse)
+}
+
+func (m *Model) runChatChunkCallback(
+	ctx context.Context,
+	hfRequest *ChatCompletionRequest,
+	chunk *ChatCompletionChunk,
+) {
+	if m.chatChunkCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat chunk callback")
+	m.chatChunkCallback(ctx, hfRequest, chunk)
+}
+
+func (m *Model) runChatStreamCompleteCallback(
+	ctx context.Context,
+	hfRequest *ChatCompletionRequest,
+	streamErr error,
+) {
+	if m.chatStreamCompleteCallback == nil {
+		return
+	}
+	defer imodel.RecoverCallbackPanic(ctx, "chat stream complete callback")
+	m.chatStreamCompleteCallback(ctx, hfRequest, streamErr)
+}
+
 // Info returns basic information about the model.
 func (m *Model) Info() model.Info {
 	return model.Info{
-		Name: m.name,
+		Name:          m.name,
+		ContextWindow: m.contextWindow,
 	}
 }
 
@@ -153,11 +210,6 @@ func (m *Model) handleNonStreamingRequest(
 	responseChan chan<- *model.Response,
 ) {
 	defer close(responseChan)
-
-	// Call request callback if provided.
-	if m.chatRequestCallback != nil {
-		m.chatRequestCallback(ctx, hfRequest)
-	}
 
 	// Make HTTP request.
 	hfResponse, err := m.makeRequest(ctx, hfRequest)
@@ -171,9 +223,7 @@ func (m *Model) handleNonStreamingRequest(
 	}
 
 	// Call response callback if provided.
-	if m.chatResponseCallback != nil {
-		m.chatResponseCallback(ctx, hfRequest, hfResponse)
-	}
+	m.runChatResponseCallback(ctx, hfRequest, hfResponse)
 
 	// Convert HuggingFace response to model.Response.
 	response := m.convertResponse(hfResponse)
@@ -190,86 +240,80 @@ func (m *Model) handleStreamingRequest(
 	defer close(responseChan)
 
 	var streamErr error
-	defer func() {
-		if m.chatStreamCompleteCallback != nil {
-			m.chatStreamCompleteCallback(ctx, hfRequest, streamErr)
-		}
-	}()
-
-	// Call request callback if provided.
-	if m.chatRequestCallback != nil {
-		m.chatRequestCallback(ctx, hfRequest)
-	}
+	var terminalResponse *model.Response
 
 	// Make streaming HTTP request.
 	hfRequest.Stream = true
 	resp, err := m.makeStreamingRequest(ctx, hfRequest)
 	if err != nil {
 		streamErr = err
-		responseChan <- &model.Response{
+		terminalResponse = &model.Response{
 			Error: &model.ResponseError{
 				Message: fmt.Sprintf("failed to make streaming request: %v", err),
 			},
 		}
-		return
-	}
-	defer resp.Body.Close()
+	} else {
+		defer resp.Body.Close()
 
-	// Read and process streaming response.
-	// Use bufio.Reader instead of Scanner to avoid 64KB line limit.
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
+		// Read and process streaming response.
+		// Use bufio.Reader instead of Scanner to avoid 64KB line limit.
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				streamErr = err
+				terminalResponse = &model.Response{
+					Error: &model.ResponseError{
+						Message: fmt.Sprintf("error reading stream: %v", err),
+					},
+				}
 				break
 			}
-			streamErr = err
-			responseChan <- &model.Response{
-				Error: &model.ResponseError{
-					Message: fmt.Sprintf("error reading stream: %v", err),
-				},
+
+			line = strings.TrimSpace(line)
+
+			// Skip empty lines and comments.
+			if line == "" || !strings.HasPrefix(line, "data: ") {
+				continue
 			}
-			break
+
+			// Remove "data: " prefix.
+			data := strings.TrimPrefix(line, "data: ")
+
+			// Check for stream end.
+			if data == "[DONE]" {
+				break
+			}
+
+			// Parse chunk.
+			var chunk ChatCompletionChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				log.Warnf("failed to parse chunk: %v, data: %s", err, data)
+				continue
+			}
+
+			// Call chunk callback if provided.
+			m.runChatChunkCallback(ctx, hfRequest, &chunk)
+
+			// Convert chunk to model.Response.
+			response := m.convertChunk(&chunk)
+			responseChan <- response
 		}
+	}
 
-		line = strings.TrimSpace(line)
-
-		// Skip empty lines and comments.
-		if line == "" || !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		// Remove "data: " prefix.
-		data := strings.TrimPrefix(line, "data: ")
-
-		// Check for stream end.
-		if data == "[DONE]" {
-			break
-		}
-
-		// Parse chunk.
-		var chunk ChatCompletionChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			log.Warnf("failed to parse chunk: %v, data: %s", err, data)
-			continue
-		}
-
-		// Call chunk callback if provided.
-		if m.chatChunkCallback != nil {
-			m.chatChunkCallback(ctx, hfRequest, &chunk)
-		}
-
-		// Convert chunk to model.Response.
-		response := m.convertChunk(&chunk)
-		responseChan <- response
+	m.runChatStreamCompleteCallback(ctx, hfRequest, streamErr)
+	if terminalResponse != nil {
+		responseChan <- terminalResponse
 	}
 }
 
 // makeRequest makes a non-streaming HTTP request to the HuggingFace API.
 func (m *Model) makeRequest(ctx context.Context, hfRequest *ChatCompletionRequest) (*ChatCompletionResponse, error) {
 	// Marshal request to JSON.
-	requestBody, err := m.marshalRequest(hfRequest)
+	requestBody, err := m.marshalRequestForContext(ctx, hfRequest)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -319,7 +363,7 @@ func (m *Model) makeRequest(ctx context.Context, hfRequest *ChatCompletionReques
 // makeStreamingRequest makes a streaming HTTP request to the HuggingFace API.
 func (m *Model) makeStreamingRequest(ctx context.Context, hfRequest *ChatCompletionRequest) (*http.Response, error) {
 	// Marshal request to JSON.
-	requestBody, err := m.marshalRequest(hfRequest)
+	requestBody, err := m.marshalRequestForContext(ctx, hfRequest)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -368,8 +412,32 @@ func (m *Model) setHeaders(req *http.Request) {
 
 // marshalRequest marshals the request to JSON, including extra fields.
 func (m *Model) marshalRequest(hfRequest *ChatCompletionRequest) ([]byte, error) {
+	return m.marshalRequestWithToolControl(hfRequest, false)
+}
+
+func (m *Model) marshalRequestForContext(
+	ctx context.Context,
+	hfRequest *ChatCompletionRequest,
+) ([]byte, error) {
+	return m.marshalRequestWithToolControl(
+		hfRequest,
+		imodelrequest.ToolsDisabled(ctx),
+	)
+}
+
+func (m *Model) marshalRequestWithToolControl(
+	hfRequest *ChatCompletionRequest,
+	disableToolFields bool,
+) ([]byte, error) {
+	request := hfRequest
+	if disableToolFields && hfRequest != nil {
+		filtered := *hfRequest
+		filtered.Tools = nil
+		filtered.ToolChoice = nil
+		request = &filtered
+	}
 	// Marshal the base request.
-	baseJSON, err := json.Marshal(hfRequest)
+	baseJSON, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
 	}
@@ -386,12 +454,18 @@ func (m *Model) marshalRequest(hfRequest *ChatCompletionRequest) ([]byte, error)
 	}
 
 	// Merge model-level extra fields.
-	for k, v := range m.extraFields {
+	for k, v := range imodelrequest.FilterToolControlFields(
+		m.extraFields,
+		disableToolFields,
+	) {
 		requestMap[k] = v
 	}
 
 	// Merge request-level extra fields (takes precedence).
-	for k, v := range hfRequest.ExtraFields {
+	for k, v := range imodelrequest.FilterToolControlFields(
+		hfRequest.ExtraFields,
+		disableToolFields,
+	) {
 		requestMap[k] = v
 	}
 
@@ -407,71 +481,55 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	// Determine max input tokens using priority: user config > auto calculation > default.
-	maxInputTokens := m.maxInputTokens
-	if maxInputTokens <= 0 {
-		// Auto-calculate based on model context window with custom or default parameters.
-		contextWindow := imodel.ResolveContextWindow(m.name)
-		if m.tokenTailoringConfig != nil &&
-			(m.tokenTailoringConfig.ProtocolOverheadTokens > 0 ||
-				m.tokenTailoringConfig.ReserveOutputTokens > 0) {
-			// Use custom parameters if any are set.
-			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
-				contextWindow,
-				m.tokenTailoringConfig.ProtocolOverheadTokens,
-				m.tokenTailoringConfig.ReserveOutputTokens,
-				m.tokenTailoringConfig.InputTokensFloor,
-				m.tokenTailoringConfig.SafetyMarginRatio,
-				m.tokenTailoringConfig.MaxInputTokensRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
-		}
-		log.Debugf("auto-calculated max input tokens: model=%s, contextWindow=%d, maxInputTokens=%d",
-			m.name, contextWindow, maxInputTokens)
+	maxInputTokens := m.InputTokenBudget(ctx, request)
+	if m.maxInputTokens <= 0 {
+		log.DebugfContext(ctx, "auto-calculated max input tokens: model=%s, maxInputTokens=%d",
+			m.name, maxInputTokens)
 	}
+	finishObservation := modeltailoring.ObserveChanges(
+		ctx, "huggingface.Model", request, maxInputTokens,
+	)
+	defer finishObservation()
 
 	// Apply token tailoring.
 	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
 	if err != nil {
+		if len(tailored) > 0 {
+			log.WarnContext(ctx, "token tailoring returned best-effort messages in huggingface.Model", err)
+			modeltailoring.ApplyResult(
+				ctx, "huggingface.Model", request, tailored,
+			)
+			return
+		}
 		log.Warn("token tailoring failed in huggingface.Model", err)
 		return
 	}
 
-	request.Messages = tailored
+	modeltailoring.ApplyResult(
+		ctx, "huggingface.Model", request, tailored,
+	)
+}
 
-	// Calculate remaining tokens for output based on context window.
-	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
-	if err != nil {
-		log.Warn("failed to count tokens after tailoring", err)
-		return
+// InputTokenBudget returns the same input budget used by token tailoring.
+func (m *Model) InputTokenBudget(_ context.Context, _ *model.Request) int {
+	if m.maxInputTokens > 0 {
+		return m.maxInputTokens
 	}
-
-	// Set max output tokens only if user hasn't specified it.
-	// This respects user's explicit configuration while providing a safe default.
-	if request.GenerationConfig.MaxTokens == nil {
-		contextWindow := imodel.ResolveContextWindow(m.name)
-		var maxOutputTokens int
-		if m.tokenTailoringConfig != nil &&
-			(m.tokenTailoringConfig.ProtocolOverheadTokens > 0 ||
-				m.tokenTailoringConfig.OutputTokensFloor > 0) {
-			// Use custom parameters if any are set.
-			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
-				contextWindow,
-				usedTokens,
-				m.tokenTailoringConfig.ProtocolOverheadTokens,
-				m.tokenTailoringConfig.OutputTokensFloor,
-				m.tokenTailoringConfig.SafetyMarginRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxOutputTokens = imodel.CalculateMaxOutputTokens(contextWindow, usedTokens)
-		}
-		if maxOutputTokens > 0 {
-			request.GenerationConfig.MaxTokens = &maxOutputTokens
-			log.Debugf("token tailoring: contextWindow=%d, usedTokens=%d, maxOutputTokens=%d",
-				contextWindow, usedTokens, maxOutputTokens)
-		}
+	contextWindow := m.contextWindow
+	if contextWindow <= 0 {
+		contextWindow = imodel.ResolveContextWindow(m.name)
 	}
+	if m.tokenTailoringConfig != nil &&
+		(m.tokenTailoringConfig.ProtocolOverheadTokens > 0 ||
+			m.tokenTailoringConfig.ReserveOutputTokens > 0) {
+		return imodel.CalculateMaxInputTokensWithParams(
+			contextWindow,
+			m.tokenTailoringConfig.ProtocolOverheadTokens,
+			m.tokenTailoringConfig.ReserveOutputTokens,
+			m.tokenTailoringConfig.InputTokensFloor,
+			m.tokenTailoringConfig.SafetyMarginRatio,
+			m.tokenTailoringConfig.MaxInputTokensRatio,
+		)
+	}
+	return imodel.CalculateMaxInputTokens(contextWindow)
 }

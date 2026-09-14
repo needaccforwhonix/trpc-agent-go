@@ -15,20 +15,50 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/google/uuid"
 	agentevent "trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/multimodal"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/source"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/steerext"
+	aguitool "trpc.group/trpc-go/trpc-agent-go/server/agui/internal/tool"
+	"trpc.group/trpc-go/trpc-agent-go/skill"
 )
 
 // Translator translates trpc-agent-go events to AG-UI events.
 type Translator interface {
 	// Translate translates a trpc-agent-go event to AG-UI events.
 	Translate(ctx context.Context, event *agentevent.Event) ([]aguievents.Event, error)
+}
+
+// TranslatorFactory is a function that creates a translator for an AG-UI run.
+type Factory func(ctx context.Context, input *adapter.RunAgentInput, opts ...Option) (Translator, error)
+
+// NewFactory creates a default translator factory for AG-UI.
+// The returned factory constructs the default translator with the provided input and options.
+func NewFactory(baseOpts ...Option) Factory {
+	return func(ctx context.Context, input *adapter.RunAgentInput, opts ...Option) (Translator, error) {
+		if input == nil {
+			return nil, errors.New("run agent input is nil")
+		}
+		allOpts := append(slices.Clone(baseOpts), opts...)
+		return New(ctx, input.ThreadID, input.RunID, allOpts...)
+	}
+}
+
+// PostRunFinalizingTranslator extends Translator with post-run finalization events.
+type PostRunFinalizingTranslator interface {
+	Translator
+	// PostRunFinalizationEvents returns AG-UI events needed to finalize open protocol streams after a run ends.
+	PostRunFinalizationEvents(ctx context.Context) ([]aguievents.Event, error)
 }
 
 // New creates a new event translator.
@@ -39,11 +69,22 @@ func New(ctx context.Context, threadID, runID string, opts ...Option) (Translato
 		runID:                                  runID,
 		lastMessageID:                          "",
 		receivingMessage:                       false,
+		textStreams:                            newMessageStreamState(),
+		graphTextAppendTargetID:                "",
+		reasoningStreams:                       newMessageStreamState(),
+		concurrentMessageStreamsEnabled:        options.concurrentMessageStreamsEnabled,
 		seenResponseIDs:                        make(map[string]struct{}),
 		seenToolCallIDs:                        make(map[string]struct{}),
+		toolCallDeltas:                         make(map[toolCallDeltaKey]*toolCallDeltaState),
+		toolCallDeltasByID:                     make(map[string]*toolCallDeltaState),
 		graphNodeLifecycleActivityEnabled:      options.graphNodeLifecycleActivityEnabled,
 		graphNodeInterruptActivityEnabled:      options.graphNodeInterruptActivityEnabled,
 		graphNodeInterruptActivityTopLevelOnly: options.graphNodeInterruptActivityTopLevelOnly,
+		reasoningContentEnabled:                options.reasoningContentEnabled,
+		eventSourceMetadataEnabled:             options.eventSourceMetadataEnabled,
+		toolCallDeltaStreamingEnabled:          options.toolCallDeltaStreamingEnabled,
+		streamingToolResultActivityEnabled:     options.streamingToolResultActivityEnabled,
+		streamingToolResultContent:             make(map[string]string),
 	}, nil
 }
 
@@ -53,12 +94,30 @@ type translator struct {
 	runID                                  string
 	lastMessageID                          string
 	receivingMessage                       bool
+	textStreams                            messageStreamState
+	graphTextAppendTargetID                string
+	lastReasoningMessageID                 string
+	receivingReasoning                     bool
+	reasoningStreams                       messageStreamState
+	concurrentMessageStreamsEnabled        bool
 	seenResponseIDs                        map[string]struct{}
 	seenToolCallIDs                        map[string]struct{}
+	toolCallDeltas                         map[toolCallDeltaKey]*toolCallDeltaState
+	toolCallDeltasByID                     map[string]*toolCallDeltaState
 	graphNodeLifecycleActivityEnabled      bool
 	graphNodeInterruptActivityEnabled      bool
 	graphNodeInterruptActivityTopLevelOnly bool
+	reasoningContentEnabled                bool
+	eventSourceMetadataEnabled             bool
+	toolCallDeltaStreamingEnabled          bool
+	streamingToolResultActivityEnabled     bool
+	streamingToolResultContent             map[string]string
 }
+
+const (
+	skillRunArtifactsStateKey = skill.StateKeyArtifacts
+	steerConsumedActivityType = "steer.consumed"
+)
 
 // Translate translates one trpc-agent-go event into zero or more AG-UI events.
 func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]aguievents.Event, error) {
@@ -85,27 +144,49 @@ func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]
 	events = append(events, t.graphToolEvents(event)...)
 	// Handle node custom events (progress, text, custom).
 	events = append(events, t.graphNodeCustomEvents(event)...)
+	events = append(events, t.toolArtifactsEvents(event)...)
+	queuedUserEvents, handled, err := t.queuedUserMessageEvents(event)
+	if err != nil {
+		return nil, err
+	}
+	if handled {
+		events = append(events, queuedUserEvents...)
+		return t.finalizeEvents(event, events), nil
+	}
 
 	rsp := event.Response
 	if rsp == nil {
 		if len(events) > 0 || hasGraphDelta {
-			return events, nil
+			return t.finalizeEvents(event, events), nil
 		}
 		return nil, errors.New("event response is nil")
 	}
 	if rsp.Error != nil {
 		log.Errorf("agui: threadID: %s, runID: %s, error in response: %v", t.threadID, t.runID, rsp.Error)
+		finalizationEvents, err := t.PostRunFinalizationEvents(ctx)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, finalizationEvents...)
 		events = append(events, aguievents.NewRunErrorEvent(rsp.Error.Message, aguievents.WithRunID(t.runID)))
-		return events, nil
+		return t.finalizeEvents(event, events), nil
 	}
 	if rsp.Object == model.ObjectTypeChatCompletionChunk || rsp.Object == model.ObjectTypeChatCompletion {
-		textMessageEvents, err := t.textMessageEvent(rsp)
+		if t.reasoningContentEnabled {
+			reasoningEvents, err := t.translateReasoningMessageEvents(rsp)
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, reasoningEvents...)
+		}
+		textMessageEvents, err := t.translateTextMessageEvents(rsp)
 		if err != nil {
 			return nil, err
 		}
 		events = append(events, textMessageEvents...)
 	}
 	if rsp.IsToolCallResponse() {
+		events = append(events, t.closeTextStreamsBeforeToolEvent()...)
 		toolCallEvents, err := t.toolCallEvent(rsp)
 		if err != nil {
 			return nil, err
@@ -113,19 +194,187 @@ func (t *translator) Translate(ctx context.Context, event *agentevent.Event) ([]
 		events = append(events, toolCallEvents...)
 	}
 	if rsp.IsToolResultResponse() {
-		toolResultEvents, err := t.toolResultEvent(rsp, event.ID)
+		if t.streamingToolResultActivityEnabled && rsp.IsPartial {
+			toolResultActivityEvents, err := t.toolResultActivityEvents(rsp)
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, toolResultActivityEvents...)
+		} else {
+			events = append(events, t.closeTextStreamsBeforeToolEvent()...)
+			toolResultEvents, err := t.toolResultEvent(rsp, event.ID)
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, toolResultEvents...)
+			if t.streamingToolResultActivityEnabled {
+				t.clearToolResultActivityState(rsp)
+			}
+		}
+	}
+	if event.IsRunnerCompletion() {
+		finalizationEvents, err := t.PostRunFinalizationEvents(ctx)
 		if err != nil {
 			return nil, err
 		}
-		events = append(events, toolResultEvents...)
-	}
-	if event.IsRunnerCompletion() {
-		if t.receivingMessage {
-			events = append(events, aguievents.NewTextMessageEndEvent(t.lastMessageID))
-		}
+		events = append(events, finalizationEvents...)
 		events = append(events, aguievents.NewRunFinishedEvent(t.threadID, t.runID))
 	}
-	return events, nil
+	return t.finalizeEvents(event, events), nil
+}
+
+// PostRunFinalizationEvents closes any active reasoning or text streams after a run ends.
+func (t *translator) PostRunFinalizationEvents(context.Context) ([]aguievents.Event, error) {
+	if t == nil {
+		return nil, nil
+	}
+	return t.postRunFinalizationEvents(), nil
+}
+
+func (t *translator) finalizeEvents(
+	src *agentevent.Event,
+	events []aguievents.Event,
+) []aguievents.Event {
+	if t == nil ||
+		!t.eventSourceMetadataEnabled ||
+		len(events) == 0 {
+		return events
+	}
+	// A zero-value override intentionally suppresses rawEvent export.
+	metadata, ok := source.FromEvent(src)
+	if !ok {
+		return events
+	}
+	for _, evt := range events {
+		if evt == nil {
+			continue
+		}
+		base := evt.GetBaseEvent()
+		if base == nil || base.RawEvent != nil {
+			continue
+		}
+		base.RawEvent = metadata
+	}
+	return events
+}
+
+func (t *translator) queuedUserMessageEvents(
+	evt *agentevent.Event,
+) ([]aguievents.Event, bool, error) {
+	meta, ok, err := agentevent.GetExtension[steerext.QueuedUserMessageMetadata](
+		evt,
+		steerext.QueuedUserMessageExtensionKey,
+	)
+	if err != nil {
+		return nil, true, fmt.Errorf("decode queued user message metadata: %w", err)
+	}
+	if !ok || meta.Status != steerext.QueuedUserMessageStatusConsumed {
+		return nil, false, nil
+	}
+	if evt == nil || evt.Response == nil || len(evt.Response.Choices) == 0 {
+		return nil, true, errors.New("queued user message event missing message")
+	}
+	message := evt.Response.Choices[0].Message
+	if message.Role != model.RoleUser {
+		return nil, true, fmt.Errorf(
+			"queued user message event role must be user: %s",
+			message.Role,
+		)
+	}
+
+	messageID := evt.Response.ID
+	if messageID == "" {
+		messageID = evt.ID
+	}
+	if messageID == "" {
+		messageID = uuid.NewString()
+	}
+
+	events := make([]aguievents.Event, 0, 4)
+	events = append(events, t.closeTextStreamsBeforeQueuedUserMessage()...)
+	if len(message.ContentParts) > 0 {
+		userMessage, err := queuedUserMessageFromContentParts(messageID, message)
+		if err != nil {
+			return nil, true, err
+		}
+		events = append(
+			events,
+			aguievents.NewCustomEvent(
+				multimodal.CustomEventNameUserMessage,
+				aguievents.WithValue(userMessage),
+			),
+		)
+	} else if message.Content != "" {
+		events = append(
+			events,
+			aguievents.NewTextMessageStartEvent(
+				messageID,
+				aguievents.WithRole(string(aguitypes.RoleUser)),
+			),
+			aguievents.NewTextMessageContentEvent(messageID, message.Content),
+			aguievents.NewTextMessageEndEvent(messageID),
+		)
+		t.recordClosedMessageID(messageID)
+	}
+	events = append(events, aguievents.NewActivitySnapshotEvent(
+		steerConsumedActivityMessageID(messageID),
+		steerConsumedActivityType,
+		map[string]any{
+			"requestId": evt.RequestID,
+			"messageId": messageID,
+			"status":    meta.Status,
+		},
+	))
+	return events, true, nil
+}
+
+func steerConsumedActivityMessageID(messageID string) string {
+	return "activity-steer-consumed-" + messageID
+}
+
+type artifactRef struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
+	Ref     string `json:"ref"`
+}
+
+type skillRunArtifactsDelta struct {
+	ToolCallID string        `json:"tool_call_id"`
+	Artifacts  []artifactRef `json:"artifacts"`
+}
+
+func (t *translator) toolArtifactsEvents(evt *agentevent.Event) []aguievents.Event {
+	if t == nil || evt == nil || len(evt.StateDelta) == 0 {
+		return nil
+	}
+
+	raw, ok := evt.StateDelta[skillRunArtifactsStateKey]
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	var delta skillRunArtifactsDelta
+	if err := json.Unmarshal(raw, &delta); err != nil || len(delta.Artifacts) == 0 {
+		return nil
+	}
+	toolCallID := strings.TrimSpace(delta.ToolCallID)
+	if toolCallID == "" {
+		return nil
+	}
+	payload := map[string]any{
+		"threadId":   t.threadID,
+		"runId":      t.runID,
+		"toolCallId": toolCallID,
+		"artifacts":  delta.Artifacts,
+	}
+	if evt.ID != "" {
+		payload["messageId"] = evt.ID
+	}
+	return []aguievents.Event{
+		aguievents.NewCustomEvent(
+			"tool.artifacts",
+			aguievents.WithValue(payload),
+		),
+	}
 }
 
 const (
@@ -167,9 +416,18 @@ func (t *translator) graphNodeActivityEvents(evt *agentevent.Event) []aguievents
 	if meta.NodeID == "" {
 		return nil
 	}
-	// Agent nodes emit an additional start event without attempt metadata; ignore it to avoid duplicates.
-	if meta.NodeType == graph.NodeTypeAgent && meta.Attempt == 0 {
-		return nil
+	if meta.NodeType == graph.NodeTypeAgent {
+		switch graph.NodeEventEmitterFromStateDelta(evt.StateDelta) {
+		case graph.NodeEventEmitterExecutor:
+		case graph.NodeEventEmitterAgentHelper:
+			return nil
+		default:
+			// Backward-compatible fallback for older cores that do not emit explicit
+			// lifecycle source metadata.
+			if meta.Attempt == 0 {
+				return nil
+			}
+		}
 	}
 
 	value := graphNodePatchValue{NodeID: meta.NodeID, Phase: string(meta.Phase)}
@@ -235,6 +493,112 @@ func (t *translator) graphNodeInterruptActivityEvents(evt *agentevent.Event) []a
 	}
 }
 
+// reasoningEvents translates reasoning_content emitted by models (e.g. DeepSeek, Claude Thinking)
+// into AG-UI REASONING_* events.
+func (t *translator) reasoningEvents(rsp *model.Response) ([]aguievents.Event, error) {
+	if rsp == nil || len(rsp.Choices) == 0 {
+		return nil, nil
+	}
+	if rsp.ID == "" {
+		return nil, nil
+	}
+	reasoningID := reasoningMessageID(rsp.ID)
+	var events []aguievents.Event
+	// Different message ID means a new reasoning message.
+	if t.lastReasoningMessageID != reasoningID {
+		switch rsp.Object {
+		case model.ObjectTypeChatCompletionChunk:
+			if rsp.Choices[0].Delta.ReasoningContent == "" {
+				return nil, nil
+			}
+			if t.receivingReasoning {
+				events = append(events,
+					aguievents.NewReasoningMessageEndEvent(t.lastReasoningMessageID),
+					aguievents.NewReasoningEndEvent(t.lastReasoningMessageID),
+				)
+				t.receivingReasoning = false
+			}
+			t.lastReasoningMessageID = reasoningID
+			t.receivingReasoning = true
+			events = append(events,
+				aguievents.NewReasoningStartEvent(reasoningID),
+				aguievents.NewReasoningMessageStartEvent(reasoningID, string(aguitypes.RoleReasoning)),
+			)
+		case model.ObjectTypeChatCompletion:
+			if rsp.Choices[0].Message.ReasoningContent == "" {
+				return nil, nil
+			}
+			if t.receivingReasoning {
+				events = append(events,
+					aguievents.NewReasoningMessageEndEvent(t.lastReasoningMessageID),
+					aguievents.NewReasoningEndEvent(t.lastReasoningMessageID),
+				)
+				t.receivingReasoning = false
+			}
+			t.lastReasoningMessageID = reasoningID
+			events = append(events,
+				aguievents.NewReasoningStartEvent(reasoningID),
+				aguievents.NewReasoningMessageStartEvent(reasoningID, string(aguitypes.RoleReasoning)),
+				aguievents.NewReasoningMessageContentEvent(reasoningID, rsp.Choices[0].Message.ReasoningContent),
+				aguievents.NewReasoningMessageEndEvent(reasoningID),
+				aguievents.NewReasoningEndEvent(reasoningID),
+			)
+			return events, nil
+		default:
+			return nil, errors.New("invalid response object")
+		}
+	}
+	choice := rsp.Choices[0]
+	reasoningDelta := ""
+	contentDelta := ""
+	if rsp.Object == model.ObjectTypeChatCompletionChunk {
+		reasoningDelta = choice.Delta.ReasoningContent
+		contentDelta = choice.Delta.Content
+	} else {
+		reasoningDelta = choice.Message.ReasoningContent
+		contentDelta = choice.Message.Content
+	}
+	// Streaming response.
+	switch rsp.Object {
+	case model.ObjectTypeChatCompletionChunk:
+		if reasoningDelta != "" {
+			events = append(events, aguievents.NewReasoningMessageContentEvent(reasoningID, reasoningDelta))
+		}
+		if t.receivingReasoning {
+			shouldEnd := false
+			if contentDelta != "" {
+				shouldEnd = true
+			}
+			if rsp.IsToolCallResponse() {
+				shouldEnd = true
+			}
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				shouldEnd = true
+			}
+			if shouldEnd {
+				t.receivingReasoning = false
+				events = append(events,
+					aguievents.NewReasoningMessageEndEvent(reasoningID),
+					aguievents.NewReasoningEndEvent(reasoningID),
+				)
+			}
+		}
+	// For streaming response, don't need to emit final completion event.
+	// It means the response is ended.
+	case model.ObjectTypeChatCompletion:
+		if t.receivingReasoning {
+			t.receivingReasoning = false
+			events = append(events,
+				aguievents.NewReasoningMessageEndEvent(reasoningID),
+				aguievents.NewReasoningEndEvent(reasoningID),
+			)
+		}
+	default:
+		return nil, errors.New("invalid response object")
+	}
+	return events, nil
+}
+
 // textMessageEvent translates a text message trpc-agent-go event to AG-UI events.
 func (t *translator) textMessageEvent(rsp *model.Response) ([]aguievents.Event, error) {
 	if rsp == nil || len(rsp.Choices) == 0 {
@@ -284,7 +648,7 @@ func (t *translator) textMessageEvent(rsp *model.Response) ([]aguievents.Event, 
 		if rsp.Choices[0].Delta.Content != "" {
 			events = append(events, aguievents.NewTextMessageContentEvent(rsp.ID, rsp.Choices[0].Delta.Content))
 		}
-		if rsp.Choices[0].FinishReason != nil && *rsp.Choices[0].FinishReason != "" {
+		if t.receivingMessage && rsp.Choices[0].FinishReason != nil && *rsp.Choices[0].FinishReason != "" {
 			t.receivingMessage = false
 			events = append(events, aguievents.NewTextMessageEndEvent(rsp.ID))
 		}
@@ -301,6 +665,10 @@ func (t *translator) textMessageEvent(rsp *model.Response) ([]aguievents.Event, 
 	return events, nil
 }
 
+func reasoningMessageID(responseID string) string {
+	return "reasoning-" + responseID
+}
+
 // toolCallEvent translates a tool call trpc-agent-go event to AG-UI events.
 func (t *translator) toolCallEvent(rsp *model.Response) ([]aguievents.Event, error) {
 	if rsp == nil || len(rsp.Choices) == 0 {
@@ -308,22 +676,12 @@ func (t *translator) toolCallEvent(rsp *model.Response) ([]aguievents.Event, err
 	}
 	events := make([]aguievents.Event, 0, len(rsp.Choices))
 	for _, choice := range rsp.Choices {
-		for _, toolCall := range choice.Message.ToolCalls {
-			t.recordToolCallID(toolCall.ID)
-			// Tool Call Start Event.
-			startOpt := []aguievents.ToolCallStartOption{aguievents.WithParentMessageID(rsp.ID)}
-			toolCallStartEvent := aguievents.NewToolCallStartEvent(toolCall.ID, toolCall.Function.Name, startOpt...)
-			events = append(events, toolCallStartEvent)
-			// Tool Call Arguments Event.
-			toolCallArguments := formatToolCallArguments(toolCall.Function.Arguments)
-			if toolCallArguments != "" {
-				events = append(events, aguievents.NewToolCallArgsEvent(toolCall.ID, toolCallArguments))
-			}
-			// Tool call end should precede result to align with AG-UI protocol.
-			events = append(events, aguievents.NewToolCallEndEvent(toolCall.ID))
+		events = append(events, t.messageToolCallEvents(rsp.ID, choice)...)
+		if t.toolCallDeltaStreamingEnabled {
+			events = append(events, t.deltaToolCallEvents(rsp.ID, choice)...)
 		}
 	}
-	t.lastMessageID = rsp.ID
+	t.recordClosedMessageID(rsp.ID)
 	return events, nil
 }
 
@@ -335,16 +693,76 @@ func (t *translator) toolResultEvent(rsp *model.Response, messageID string) ([]a
 	events := make([]aguievents.Event, 0, len(rsp.Choices))
 	for _, choice := range rsp.Choices {
 		if choice.Message.Content != "" {
+			events = append(events, t.closeDeltaToolCallForResult(choice.Message.ToolID)...)
 			events = append(events, aguievents.NewToolCallResultEvent(messageID,
 				choice.Message.ToolID, choice.Message.Content))
 		}
 		if choice.Delta.Content != "" {
+			events = append(events, t.closeDeltaToolCallForResult(choice.Delta.ToolID)...)
 			events = append(events, aguievents.NewToolCallResultEvent(messageID,
 				choice.Delta.ToolID, choice.Delta.Content))
 		}
 	}
-	t.lastMessageID = messageID
+	t.recordClosedMessageID(messageID)
 	return events, nil
+}
+
+func (t *translator) toolResultActivityEvents(rsp *model.Response) ([]aguievents.Event, error) {
+	if rsp == nil || len(rsp.Choices) == 0 {
+		return nil, nil
+	}
+	events := make([]aguievents.Event, 0, len(rsp.Choices))
+	for _, choice := range rsp.Choices {
+		if event, ok := t.toolResultActivityEvent(choice.Message.ToolID, choice.Message.Content); ok {
+			events = append(events, t.closeDeltaToolCallForResult(choice.Message.ToolID)...)
+			events = append(events, event)
+		}
+		if event, ok := t.toolResultActivityEvent(choice.Delta.ToolID, choice.Delta.Content); ok {
+			events = append(events, t.closeDeltaToolCallForResult(choice.Delta.ToolID)...)
+			events = append(events, event)
+		}
+	}
+	return events, nil
+}
+
+func (t *translator) toolResultActivityEvent(toolCallID, chunk string) (aguievents.Event, bool) {
+	if toolCallID == "" || chunk == "" {
+		return nil, false
+	}
+	content := t.streamingToolResultContent[toolCallID] + chunk
+	t.streamingToolResultContent[toolCallID] = content
+	messageID := aguitool.StreamingToolResultActivityMessageID(toolCallID)
+	if len(content) == len(chunk) {
+		return aguievents.NewActivitySnapshotEvent(
+			messageID,
+			aguitool.StreamingToolResultActivityType,
+			map[string]any{
+				"toolCallId": toolCallID,
+				"content":    content,
+			},
+		), true
+	}
+	return aguievents.NewActivityDeltaEvent(
+		messageID,
+		aguitool.StreamingToolResultActivityType,
+		[]aguievents.JSONPatchOperation{
+			{Op: "add", Path: "/content", Value: content},
+		},
+	), true
+}
+
+func (t *translator) clearToolResultActivityState(rsp *model.Response) {
+	if t == nil || rsp == nil {
+		return
+	}
+	for _, choice := range rsp.Choices {
+		if choice.Message.ToolID != "" {
+			delete(t.streamingToolResultContent, choice.Message.ToolID)
+		}
+		if choice.Delta.ToolID != "" {
+			delete(t.streamingToolResultContent, choice.Delta.ToolID)
+		}
+	}
 }
 
 // formatToolCallArguments formats a tool call arguments event to a string.
@@ -378,18 +796,13 @@ func (t *translator) graphModelEvents(evt *agentevent.Event) []aguievents.Event 
 	if t.hasSeenResponseID(responseID) {
 		return nil
 	}
-	var events []aguievents.Event
-	if t.receivingMessage && t.lastMessageID != responseID {
-		events = append(events, aguievents.NewTextMessageEndEvent(t.lastMessageID))
-		t.receivingMessage = false
-	}
+	events := t.graphModelBoundaryEvents(responseID)
 	events = append(events,
 		aguievents.NewTextMessageStartEvent(responseID, aguievents.WithRole(model.RoleAssistant.String())),
 		aguievents.NewTextMessageContentEvent(responseID, meta.Output),
 		aguievents.NewTextMessageEndEvent(responseID),
 	)
-	t.lastMessageID = responseID
-	t.recordResponseID(responseID)
+	t.recordGraphModelResponseID(responseID)
 	return events
 }
 
@@ -506,9 +919,10 @@ func (t *translator) handleProgressEvent(meta graph.NodeCustomEventMetadata) []a
 func (t *translator) handleTextEvent(meta graph.NodeCustomEventMetadata) []aguievents.Event {
 	// If we're currently in a message context and the text is from the same
 	// message context, emit as TextMessageContent for seamless streaming.
-	if t.receivingMessage && meta.Message != "" {
+	messageID, ok := t.graphTextAppendMessageID()
+	if ok && meta.Message != "" {
 		return []aguievents.Event{
-			aguievents.NewTextMessageContentEvent(t.lastMessageID, meta.Message),
+			aguievents.NewTextMessageContentEvent(messageID, meta.Message),
 		}
 	}
 

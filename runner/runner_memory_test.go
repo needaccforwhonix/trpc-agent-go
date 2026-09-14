@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -29,11 +30,58 @@ type mockMemoryServiceForAutoMemory struct {
 	sess          *session.Session
 }
 
-func (m *mockMemoryServiceForAutoMemory) AddMemory(ctx context.Context, userKey memory.UserKey, memoryStr string, topics []string) error {
+type mockIngestor struct {
+	enqueueCalled bool
+	enqueueErr    error
+	sess          *session.Session
+	lastOptions   session.IngestOptions
+}
+
+type mockMemoryReaderIngestor struct {
+	mockIngestor
+	readCalled bool
+}
+
+func (m *mockIngestor) IngestSession(
+	ctx context.Context,
+	sess *session.Session,
+	opts ...session.IngestOption,
+) error {
+	m.enqueueCalled = true
+	m.sess = sess
+	m.lastOptions = session.IngestOptions{}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(&m.lastOptions)
+	}
+	return m.enqueueErr
+}
+
+func (m *mockMemoryReaderIngestor) ReadMemories(
+	ctx context.Context,
+	userKey memory.UserKey,
+	limit int,
+) ([]*memory.Entry, error) {
+	m.readCalled = true
+	return nil, nil
+}
+
+func (m *mockMemoryReaderIngestor) SearchMemories(
+	ctx context.Context,
+	userKey memory.UserKey,
+	query string,
+	_ ...memory.SearchOption,
+) ([]*memory.Entry, error) {
+	return nil, nil
+}
+
+func (m *mockMemoryServiceForAutoMemory) AddMemory(ctx context.Context, userKey memory.UserKey, memoryStr string, topics []string, _ ...memory.AddOption) error {
 	return nil
 }
 
-func (m *mockMemoryServiceForAutoMemory) UpdateMemory(ctx context.Context, memoryKey memory.Key, memoryStr string, topics []string) error {
+func (m *mockMemoryServiceForAutoMemory) UpdateMemory(ctx context.Context, memoryKey memory.Key, memoryStr string, topics []string, _ ...memory.UpdateOption) error {
 	return nil
 }
 
@@ -49,7 +97,7 @@ func (m *mockMemoryServiceForAutoMemory) ReadMemories(ctx context.Context, userK
 	return nil, nil
 }
 
-func (m *mockMemoryServiceForAutoMemory) SearchMemories(ctx context.Context, userKey memory.UserKey, query string) ([]*memory.Entry, error) {
+func (m *mockMemoryServiceForAutoMemory) SearchMemories(ctx context.Context, userKey memory.UserKey, query string, _ ...memory.SearchOption) ([]*memory.Entry, error) {
 	return nil, nil
 }
 
@@ -123,4 +171,126 @@ func TestRunner_WithMemoryService_AutoMemoryIntegration(t *testing.T) {
 	require.NotNil(t, mockMemSvc.sess)
 	require.Equal(t, "test-app", mockMemSvc.sess.AppName)
 	require.Equal(t, "user", mockMemSvc.sess.UserID)
+}
+
+func TestResolveMemoryReader(t *testing.T) {
+	t.Run("memory service wins", func(t *testing.T) {
+		mockMemSvc := &mockMemoryServiceForAutoMemory{}
+		mockIngestor := &mockMemoryReaderIngestor{}
+
+		reader := resolveMemoryReader(mockMemSvc, mockIngestor)
+
+		require.Same(t, mockMemSvc, reader)
+	})
+
+	t.Run("reader ingestor is used without memory service", func(t *testing.T) {
+		mockIngestor := &mockMemoryReaderIngestor{}
+
+		reader := resolveMemoryReader(nil, mockIngestor)
+
+		require.Same(t, mockIngestor, reader)
+	})
+
+	t.Run("plain ingestor returns nil", func(t *testing.T) {
+		reader := resolveMemoryReader(nil, &mockIngestor{})
+
+		require.Nil(t, reader)
+	})
+}
+
+func TestRunner_NewRunInvocationSetsMemoryReader(t *testing.T) {
+	t.Run("from memory service", func(t *testing.T) {
+		mockMemSvc := &mockMemoryServiceForAutoMemory{}
+		mockIngestor := &mockMemoryReaderIngestor{}
+		r := &runner{
+			sessionService: sessioninmemory.NewSessionService(),
+			memoryService:  mockMemSvc,
+			ingestor:       mockIngestor,
+		}
+
+		inv := r.newRunInvocation(
+			session.NewSession("app", "user", "session"),
+			model.NewUserMessage("hello"),
+			&mockAgent{name: "test-agent"},
+			agent.RunOptions{},
+			"app",
+			"",
+			"",
+		)
+
+		require.Same(t, mockMemSvc, inv.MemoryReader)
+		require.Same(t, mockMemSvc, inv.MemoryService)
+	})
+
+	t.Run("from reader ingestor", func(t *testing.T) {
+		mockIngestor := &mockMemoryReaderIngestor{}
+		r := &runner{
+			sessionService: sessioninmemory.NewSessionService(),
+			ingestor:       mockIngestor,
+		}
+
+		inv := r.newRunInvocation(
+			session.NewSession("app", "user", "session"),
+			model.NewUserMessage("hello"),
+			&mockAgent{name: "test-agent"},
+			agent.RunOptions{},
+			"app",
+			"",
+			"",
+		)
+
+		require.Same(t, mockIngestor, inv.MemoryReader)
+		require.Nil(t, inv.MemoryService)
+	})
+}
+
+func TestRunner_WithSessionIngestor_Integration(t *testing.T) {
+	mockIngestor := &mockIngestor{}
+	sessSvc := sessioninmemory.NewSessionService()
+	mockAgent := &mockAgent{name: "test-agent"}
+
+	r := NewRunner("test-app", mockAgent,
+		WithSessionService(sessSvc),
+		WithSessionIngestor(mockIngestor),
+	)
+
+	ctx := context.Background()
+	eventCh, err := r.Run(ctx, "user", "session", model.NewUserMessage("hello"))
+	require.NoError(t, err)
+
+	for range eventCh {
+	}
+
+	require.True(t, mockIngestor.enqueueCalled)
+	require.NotNil(t, mockIngestor.sess)
+	require.Equal(t, "test-app", mockIngestor.sess.AppName)
+	require.Equal(t, "user", mockIngestor.sess.UserID)
+	require.Equal(t, "session", mockIngestor.lastOptions.RunID)
+	require.Equal(t, "test-agent", mockIngestor.lastOptions.AgentID)
+}
+
+// resolveIngestOpts is a small test helper that applies IngestOption values to
+// a zero-value IngestOptions, mirroring what an Ingestor implementation does.
+func resolveIngestOpts(opts ...session.IngestOption) session.IngestOptions {
+	var got session.IngestOptions
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(&got)
+	}
+	return got
+}
+
+func TestRunner_DefaultIngestOptions_PrefersInvocationAgent(t *testing.T) {
+	r := &runner{defaultAgentName: "fallback-agent"}
+	sess := session.NewSession("app", "user", "sess-id")
+
+	withInv := resolveIngestOpts(r.defaultIngestOptions(sess, &agent.Invocation{AgentName: "live-agent"})...)
+	require.Equal(t, "sess-id", withInv.RunID)
+	require.Equal(t, "live-agent", withInv.AgentID)
+
+	withoutInv := resolveIngestOpts(r.defaultIngestOptions(sess, nil)...)
+	require.Equal(t, "sess-id", withoutInv.RunID)
+	require.Equal(t, "fallback-agent", withoutInv.AgentID)
 }

@@ -14,10 +14,18 @@ coverage.html
 cover.html
 PR*.md
 pr*.md
+!docs/mkdocs/zh/promptiter.md
+!docs/mkdocs/en/promptiter.md
+!docs/mkdocs/zh/blog/promptiter.md
+!docs/mkdocs/en/blog/promptiter.md
 claude3.7.sh
 dpskv3.sh
+dpskv4.sh
+glm.sh
 .cursorignore
 !LICENSE
+!.github/CODEOWNERS
+!openclaw/examples/sandbox_service_execution/Dockerfile
 .kiro
 .claude*
 CLAUDE.md
@@ -30,6 +38,7 @@ pnpm-lock.yaml
 .gocache
 !.github/scripts/run-go-tests.sh
 .DS_Store
+.env
 .gomodcache
 next-env.d.ts
 .codebuddy
@@ -40,3 +49,4 @@ __pycache__
 .venv
 examples/knowledge/evaluation/dataset/*
 !examples/claudecode/.claude
+!examples/evaluation/claudecode/.claude

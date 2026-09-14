@@ -20,7 +20,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/hunyuan/internal/hunyuan"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
@@ -34,6 +36,20 @@ func (s stubTool) Call(_ context.Context, _ []byte) (any, error) { return nil, n
 
 // Declaration returns the tool declaration.
 func (s stubTool) Declaration() *tool.Declaration { return s.decl }
+
+func TestConvertToolsSortsByKeyAndSkipsInvalidTools(t *testing.T) {
+	toolsMap := map[string]tool.Tool{
+		"b-key": stubTool{decl: &tool.Declaration{Name: "alpha"}},
+		"a-key": stubTool{decl: &tool.Declaration{Name: "zeta"}},
+		"c-key": stubTool{},
+		"skip":  nil,
+	}
+
+	result := convertTools(toolsMap)
+	require.Len(t, result, 2)
+	require.Equal(t, "zeta", result[0].Function.Name)
+	require.Equal(t, "alpha", result[1].Function.Name)
+}
 
 // testStubCounter is a stub TokenCounter for testing token tailoring.
 type testStubCounter struct{}
@@ -59,6 +75,14 @@ func (testStubStrategy) TailorMessages(ctx context.Context, messages []model.Mes
 	return append([]model.Message{messages[0]}, messages[2:]...), nil
 }
 
+type overflowTailoringStrategy struct {
+	tailored []model.Message
+}
+
+func (s overflowTailoringStrategy) TailorMessages(ctx context.Context, messages []model.Message, maxTokens int) ([]model.Message, error) {
+	return s.tailored, fmt.Errorf("minimal protected context exceeds token budget")
+}
+
 // testErrorStrategy is a stub TailoringStrategy that returns an error.
 type testErrorStrategy struct{}
 
@@ -75,6 +99,76 @@ func (testErrorCounter) CountTokens(ctx context.Context, message model.Message) 
 
 func (testErrorCounter) CountTokensRange(ctx context.Context, messages []model.Message, start, end int) (int, error) {
 	return 0, fmt.Errorf("count tokens range error")
+}
+
+func TestModel_CallbackPanicsAreRecovered(t *testing.T) {
+	t.Run("request callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatRequestCallback: func(ctx context.Context, req *hunyuan.ChatCompletionNewParams) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatRequestCallback(context.Background(), &hunyuan.ChatCompletionNewParams{})
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("response callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatResponseCallback: func(ctx context.Context, req *hunyuan.ChatCompletionNewParams, resp *hunyuan.ChatCompletionResponse) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatResponseCallback(
+				context.Background(),
+				&hunyuan.ChatCompletionNewParams{},
+				&hunyuan.ChatCompletionResponse{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("chunk callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatChunkCallback: func(ctx context.Context, req *hunyuan.ChatCompletionNewParams, chunk *hunyuan.ChatCompletionResponse) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatChunkCallback(
+				context.Background(),
+				&hunyuan.ChatCompletionNewParams{},
+				&hunyuan.ChatCompletionResponse{},
+			)
+		})
+		assert.True(t, callbackCalled)
+	})
+
+	t.Run("stream complete callback", func(t *testing.T) {
+		callbackCalled := false
+		m := &Model{
+			chatStreamCompleteCallback: func(ctx context.Context, req *hunyuan.ChatCompletionNewParams, err error) {
+				callbackCalled = true
+				panic("boom")
+			},
+		}
+
+		require.NotPanics(t, func() {
+			m.runChatStreamCompleteCallback(context.Background(), &hunyuan.ChatCompletionNewParams{}, nil)
+		})
+		assert.True(t, callbackCalled)
+	})
 }
 
 func TestNew(t *testing.T) {
@@ -124,6 +218,60 @@ func TestGenerateContentNilRequest(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for nil request, got nil")
 	}
+}
+
+func TestGenerateContentToolsDisabledAfterCallback(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"Response": hunyuan.ChatCompletionResponse{
+				Id: "test-id",
+				Choices: []*hunyuan.ChatCompletionResponseChoice{{
+					Index:        0,
+					FinishReason: "stop",
+					Message: &hunyuan.ChatCompletionMessageParam{
+						Role:    "assistant",
+						Content: "ok",
+					},
+				}},
+			},
+		}))
+	}))
+	defer server.Close()
+
+	m := New(
+		"hunyuan-lite",
+		WithSecretId("test-secret-id"),
+		WithSecretKey("test-secret-key"),
+		WithBaseUrl(server.URL),
+		WithHost("test-host"),
+		WithChatRequestCallback(func(
+			_ context.Context,
+			request *hunyuan.ChatCompletionNewParams,
+		) {
+			request.Tools = []*hunyuan.ChatCompletionMessageTool{{}}
+			request.ToolChoice = "required"
+			request.CustomTool = &hunyuan.ChatCompletionMessageTool{}
+		}),
+	)
+	ctx := imodelrequest.WithToolsDisabled(context.Background())
+
+	responseChan, err := m.GenerateContent(ctx, &model.Request{
+		Messages: []model.Message{model.NewUserMessage("test")},
+	})
+	require.NoError(t, err)
+	for range responseChan {
+	}
+
+	require.NotNil(t, captured)
+	require.NotContains(t, captured, "Tools")
+	require.NotContains(t, captured, "ToolChoice")
+	require.NotContains(t, captured, "CustomTool")
 }
 
 func TestGenerateContentWithMockServer(t *testing.T) {
@@ -327,6 +475,283 @@ func TestGenerateContentStreamWithMockServer(t *testing.T) {
 	}
 }
 
+func TestChatStreamCompleteCallbackBeforeFinalResponse(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+
+		chunks := []hunyuan.ChatCompletionResponse{
+			{
+				Id:      "stream-id-1",
+				Created: time.Now().Unix(),
+				Choices: []*hunyuan.ChatCompletionResponseChoice{
+					{
+						Index: 0,
+						Delta: &hunyuan.ChatCompletionResponseDelta{
+							Role:    "assistant",
+							Content: "Hello",
+						},
+					},
+				},
+			},
+			{
+				Id:      "stream-id-2",
+				Created: time.Now().Unix(),
+				Choices: []*hunyuan.ChatCompletionResponseChoice{
+					{
+						Index: 0,
+						Delta: &hunyuan.ChatCompletionResponseDelta{
+							Content: " world",
+						},
+						FinishReason: "stop",
+					},
+				},
+			},
+		}
+
+		for _, chunk := range chunks {
+			data, err := json.Marshal(chunk)
+			require.NoError(t, err)
+			_, err = fmt.Fprintf(w, "data: %s\n\n", string(data))
+			require.NoError(t, err)
+			flusher.Flush()
+		}
+
+		_, err := fmt.Fprint(w, "data: [DONE]\n\n")
+		require.NoError(t, err)
+		flusher.Flush()
+	}))
+	defer mockServer.Close()
+
+	streamCompleteCalled := make(chan struct{})
+	m := New("hunyuan-lite",
+		WithSecretId("test-secret-id"),
+		WithSecretKey("test-secret-key"),
+		WithBaseUrl(mockServer.URL),
+		WithHost("test-host"),
+		WithChatStreamCompleteCallback(func(ctx context.Context,
+			chatRequest *hunyuan.ChatCompletionNewParams, streamErr error) {
+			close(streamCompleteCalled)
+		}),
+	)
+
+	ctx := context.Background()
+	request := &model.Request{
+		Messages: []model.Message{
+			model.NewUserMessage("Hello"),
+		},
+		GenerationConfig: model.GenerationConfig{
+			Stream: true,
+		},
+	}
+
+	responseChan, err := m.GenerateContent(ctx, request)
+	require.NoError(t, err)
+
+	var sawFinal bool
+	for resp := range responseChan {
+		if !resp.Done {
+			continue
+		}
+		sawFinal = true
+		select {
+		case <-streamCompleteCalled:
+			// Success.
+		default:
+			t.Fatal("stream complete callback must run before final response is emitted")
+		}
+		break
+	}
+	assert.True(t, sawFinal)
+	select {
+	case <-streamCompleteCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+}
+
+func TestHandleStreamingResponseWithoutFinalChunk(t *testing.T) {
+	handlerErrCh := make(chan error, 1)
+	reportHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case handlerErrCh <- err:
+		default:
+		}
+	}
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			reportHandlerErr(fmt.Errorf("response writer is not a flusher"))
+			return
+		}
+
+		chunk := hunyuan.ChatCompletionResponse{
+			Id:      "stream-id-1",
+			Created: time.Now().Unix(),
+			Choices: []*hunyuan.ChatCompletionResponseChoice{
+				{
+					Index: 0,
+					Delta: &hunyuan.ChatCompletionResponseDelta{
+						Role:    "assistant",
+						Content: "Hello",
+					},
+				},
+			},
+		}
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			reportHandlerErr(err)
+			return
+		}
+		if _, err = fmt.Fprintf(w, "data: %s\n\n", string(data)); err != nil {
+			reportHandlerErr(err)
+			return
+		}
+		flusher.Flush()
+		if _, err = fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+			reportHandlerErr(err)
+			return
+		}
+		flusher.Flush()
+	}))
+	defer mockServer.Close()
+
+	streamCompleteCalled := make(chan error, 1)
+	m := New("hunyuan-lite",
+		WithSecretId("test-secret-id"),
+		WithSecretKey("test-secret-key"),
+		WithBaseUrl(mockServer.URL),
+		WithHost("test-host"),
+		WithChatStreamCompleteCallback(func(ctx context.Context,
+			chatRequest *hunyuan.ChatCompletionNewParams, streamErr error) {
+			streamCompleteCalled <- streamErr
+		}),
+	)
+
+	responseChan := make(chan *model.Response, 2)
+	m.handleStreamingResponse(context.Background(),
+		&hunyuan.ChatCompletionNewParams{}, responseChan)
+	close(responseChan)
+
+	var responses []*model.Response
+	for resp := range responseChan {
+		responses = append(responses, resp)
+	}
+
+	require.Len(t, responses, 1)
+	assert.True(t, responses[0].IsPartial)
+	assert.False(t, responses[0].Done)
+	select {
+	case streamErr := <-streamCompleteCalled:
+		assert.NoError(t, streamErr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	select {
+	case err := <-handlerErrCh:
+		require.NoError(t, err)
+	default:
+	}
+}
+
+func TestHandleStreamingResponseCallbackOnContextCancel(t *testing.T) {
+	handlerErrCh := make(chan error, 1)
+	reportHandlerErr := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case handlerErrCh <- err:
+		default:
+		}
+	}
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			reportHandlerErr(fmt.Errorf("response writer is not a flusher"))
+			return
+		}
+
+		chunk := hunyuan.ChatCompletionResponse{
+			Id:      "stream-id-1",
+			Created: time.Now().Unix(),
+			Choices: []*hunyuan.ChatCompletionResponseChoice{
+				{
+					Index: 0,
+					Delta: &hunyuan.ChatCompletionResponseDelta{
+						Role:    "assistant",
+						Content: "Hello",
+					},
+				},
+			},
+		}
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			reportHandlerErr(err)
+			return
+		}
+		if _, err = fmt.Fprintf(w, "data: %s\n\n", string(data)); err != nil {
+			reportHandlerErr(err)
+			return
+		}
+		flusher.Flush()
+	}))
+	defer mockServer.Close()
+
+	streamCompleteCalled := make(chan error, 1)
+	m := New("hunyuan-lite",
+		WithSecretId("test-secret-id"),
+		WithSecretKey("test-secret-key"),
+		WithBaseUrl(mockServer.URL),
+		WithHost("test-host"),
+		WithChatStreamCompleteCallback(func(ctx context.Context,
+			chatRequest *hunyuan.ChatCompletionNewParams, streamErr error) {
+			streamCompleteCalled <- streamErr
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	responseChan := make(chan *model.Response)
+	m.handleStreamingResponse(ctx, &hunyuan.ChatCompletionNewParams{}, responseChan)
+
+	select {
+	case streamErr := <-streamCompleteCalled:
+		require.ErrorIs(t, streamErr, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream complete callback")
+	}
+	select {
+	case resp := <-responseChan:
+		t.Fatalf("unexpected response: %#v", resp)
+	default:
+	}
+	select {
+	case err := <-handlerErrCh:
+		require.NoError(t, err)
+	default:
+	}
+}
+
 func TestConvertMessage(t *testing.T) {
 	msg := model.Message{
 		Role:    model.RoleUser,
@@ -387,7 +812,14 @@ func TestConvertMessage(t *testing.T) {
 		{
 			Type: model.ContentTypeAudio,
 			Audio: &model.Audio{
-				Data: []byte("audio data"),
+				URL: "https://example.com/audio.mp3",
+			},
+		},
+		{
+			Type: model.ContentTypeVideo,
+			Video: &model.Video{
+				URL:  "https://example.com/video.mp4",
+				Data: []byte("ignored video data"),
 			},
 		},
 	}
@@ -396,9 +828,13 @@ func TestConvertMessage(t *testing.T) {
 		t.Fatalf("convertMessage failed: %v", err)
 	}
 
-	if len(hMsg.Contents) != 3 {
-		t.Fatalf("Expected 3 content parts, got %d", len(hMsg.Contents))
+	if len(hMsg.Contents) != 4 {
+		t.Fatalf("Expected 4 content parts, got %d", len(hMsg.Contents))
 	}
+	assert.Equal(t, "audio_url", hMsg.Contents[2].Type)
+	assert.Equal(t, "https://example.com/audio.mp3", hMsg.Contents[2].VideoUrl.Url)
+	assert.Equal(t, "video_url", hMsg.Contents[3].Type)
+	assert.Equal(t, "https://example.com/video.mp4", hMsg.Contents[3].VideoUrl.Url)
 }
 
 func TestTokenTailoringOptions(t *testing.T) {
@@ -830,6 +1266,28 @@ func TestWithTokenTailoring(t *testing.T) {
 	}
 }
 
+func TestWithTokenTailoring_UsesProtectedContextOnOverflow(t *testing.T) {
+	tailored := []model.Message{
+		model.NewSystemMessage("sys"),
+		model.NewUserMessage("q"),
+	}
+	m := &Model{
+		name:                 "test-model",
+		enableTokenTailoring: true,
+		maxInputTokens:       1,
+		tailoringStrategy:    overflowTailoringStrategy{tailored: tailored},
+	}
+	req := &model.Request{Messages: []model.Message{
+		model.NewSystemMessage("sys"),
+		model.NewUserMessage("old"),
+		model.NewUserMessage("q"),
+	}}
+
+	m.applyTokenTailoring(context.Background(), req)
+
+	require.Equal(t, tailored, req.Messages)
+}
+
 func TestWithEnableTokenTailoringDisabled(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mockResponse := struct {
@@ -1070,6 +1528,14 @@ func TestImageToURLOrBase64(t *testing.T) {
 			},
 			want: "data:image/png;base64,dGVzdA==",
 		},
+		{
+			name: "with full MIME format",
+			image: &model.Image{
+				Format: "image/png",
+				Data:   []byte("test"),
+			},
+			want: "data:image/png;base64,dGVzdA==",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1082,18 +1548,26 @@ func TestImageToURLOrBase64(t *testing.T) {
 	}
 }
 
-func TestAudioToBase64(t *testing.T) {
-	audio := &model.Audio{
-		Format: "audio/mp3",
+func TestAudioToURLOrBase64(t *testing.T) {
+	assert.Equal(t, "https://example.com/audio.mp3", audioToURLOrBase64(&model.Audio{
+		URL:  "https://example.com/audio.mp3",
+		Data: []byte("ignored audio data"),
+	}))
+	assert.Equal(t, "data:audio/mp3;base64,dGVzdCBhdWRpbyBkYXRh", audioToURLOrBase64(&model.Audio{
+		Format: "mp3",
 		Data:   []byte("test audio data"),
-	}
+	}))
+}
 
-	result := audioToBase64(audio)
-	expected := "data:audio/mp3;base64,dGVzdCBhdWRpbyBkYXRh"
-
-	if result != expected {
-		t.Errorf("Expected %s, got %s", expected, result)
-	}
+func TestVideoToURLOrBase64(t *testing.T) {
+	assert.Equal(t, "https://example.com/video.mp4", videoToURLOrBase64(&model.Video{
+		URL:  "https://example.com/video.mp4",
+		Data: []byte("ignored video data"),
+	}))
+	assert.Equal(t, "data:video/mp4;base64,dGVzdCB2aWRlbyBkYXRh", videoToURLOrBase64(&model.Video{
+		Format: "mp4",
+		Data:   []byte("test video data"),
+	}))
 }
 
 // Test_buildToolDescription tests tool description building.
@@ -1268,5 +1742,120 @@ func TestTokenTailoringCounterError(t *testing.T) {
 
 	if len(responses) != 1 {
 		t.Fatalf("Expected 1 response, got %d", len(responses))
+	}
+}
+
+// TestChatRequestCallbackSynchronous verifies that
+// chatRequestCallback is invoked synchronously inside
+// GenerateContent, before the response goroutine starts.
+func TestChatRequestCallbackSynchronous(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "non_streaming", stream: false},
+		{name: "streaming", stream: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					if tt.stream {
+						w.Header().Set("Content-Type",
+							"text/event-stream")
+						w.WriteHeader(http.StatusOK)
+						flusher, ok := w.(http.Flusher)
+						if !ok {
+							http.Error(w,
+								"no flusher",
+								http.StatusInternalServerError)
+							return
+						}
+						chunk := hunyuan.ChatCompletionResponse{
+							Id:      "s1",
+							Created: 1,
+							Choices: []*hunyuan.ChatCompletionResponseChoice{{
+								Index: 0,
+								Delta: &hunyuan.ChatCompletionResponseDelta{
+									Role:    "assistant",
+									Content: "hi",
+								},
+								FinishReason: "stop",
+							}},
+						}
+						data, _ := json.Marshal(chunk)
+						fmt.Fprintf(w,
+							"data: %s\n\n", data)
+						flusher.Flush()
+						fmt.Fprint(w, "data: [DONE]\n\n")
+						flusher.Flush()
+						return
+					}
+					w.Header().Set("Content-Type",
+						"application/json")
+					resp := struct {
+						Response hunyuan.ChatCompletionResponse `json:"Response"`
+					}{
+						Response: hunyuan.ChatCompletionResponse{
+							Id:      "n1",
+							Created: 1,
+							Choices: []*hunyuan.ChatCompletionResponseChoice{{
+								Index:        0,
+								FinishReason: "stop",
+								Message: &hunyuan.ChatCompletionMessageParam{
+									Role:    "assistant",
+									Content: "hi",
+								},
+							}},
+							Usage: hunyuan.ChatCompletionResponseUsage{
+								TotalTokens: 1,
+							},
+						},
+					}
+					json.NewEncoder(w).Encode(resp)
+				}))
+			defer srv.Close()
+
+			var callCount int64
+			m := New("hunyuan-lite",
+				WithSecretId("id"),
+				WithSecretKey("key"),
+				WithBaseUrl(srv.URL),
+				WithHost("test"),
+				WithChatRequestCallback(
+					func(_ context.Context,
+						_ *hunyuan.ChatCompletionNewParams,
+					) {
+						callCount++
+					}),
+			)
+
+			req := &model.Request{
+				Messages: []model.Message{
+					model.NewUserMessage("hi"),
+				},
+				GenerationConfig: model.GenerationConfig{
+					Stream: tt.stream,
+				},
+			}
+
+			ch, err := m.GenerateContent(
+				context.Background(), req)
+			require.NoError(t, err)
+
+			// Callback must have fired synchronously
+			// before GenerateContent returned.
+			assert.Equal(t, int64(1), callCount,
+				"callback must execute exactly once "+
+					"before GenerateContent returns")
+
+			// Drain the channel to avoid goroutine leak.
+			for range ch {
+			}
+
+			// Confirm no extra invocations after drain.
+			assert.Equal(t, int64(1), callCount,
+				"callback must not be called more than once")
+		})
 	}
 }

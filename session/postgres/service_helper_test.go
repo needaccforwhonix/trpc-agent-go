@@ -20,43 +20,80 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
-func TestRefreshSessionTTL_Success(t *testing.T) {
-	s, mock, db := setupMockService(t, &TestServiceOpts{sessionTTL: time.Hour})
-	defer db.Close()
+func TestApplySessionStateTimestamps(t *testing.T) {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	jsonCreatedAt := time.Date(2026, 8, 25, 17, 0, 0, 0, location)
+	jsonUpdatedAt := jsonCreatedAt.Add(time.Minute)
+	databaseCreatedAt := time.Date(2026, 8, 25, 17, 0, 0, 0, time.UTC)
+	databaseUpdatedAt := databaseCreatedAt.Add(time.Minute)
 
-	key := session.Key{
-		AppName:   "test-app",
-		UserID:    "test-user",
-		SessionID: "test-session",
+	tests := []struct {
+		name          string
+		state         SessionState
+		wantCreatedAt time.Time
+		wantUpdatedAt time.Time
+	}{
+		{
+			name: "prefer JSON timestamps",
+			state: SessionState{
+				CreatedAt: jsonCreatedAt,
+				UpdatedAt: jsonUpdatedAt,
+			},
+			wantCreatedAt: jsonCreatedAt,
+			wantUpdatedAt: jsonUpdatedAt,
+		},
+		{
+			name:          "fall back for legacy payload",
+			state:         SessionState{},
+			wantCreatedAt: databaseCreatedAt,
+			wantUpdatedAt: databaseUpdatedAt,
+		},
+		{
+			name: "fall back only for missing creation time",
+			state: SessionState{
+				UpdatedAt: jsonUpdatedAt,
+			},
+			wantCreatedAt: databaseCreatedAt,
+			wantUpdatedAt: jsonUpdatedAt,
+		},
+		{
+			name: "fall back only for missing update time",
+			state: SessionState{
+				CreatedAt: jsonCreatedAt,
+			},
+			wantCreatedAt: jsonCreatedAt,
+			wantUpdatedAt: databaseUpdatedAt,
+		},
 	}
 
-	// Mock the UPDATE query for refreshing TTL.
-	mock.ExpectExec("UPDATE session_states").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "test-app", "test-user", "test-session").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	err := s.refreshSessionTTL(context.Background(), key)
-	require.NoError(t, err)
-	require.NoError(t, mock.ExpectationsWereMet())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applySessionStateTimestamps(
+				&tt.state,
+				databaseCreatedAt,
+				databaseUpdatedAt,
+			)
+			assert.True(t, tt.state.CreatedAt.Equal(tt.wantCreatedAt))
+			assert.True(t, tt.state.UpdatedAt.Equal(tt.wantUpdatedAt))
+		})
+	}
 }
 
-func TestRefreshSessionTTL_Error(t *testing.T) {
-	s, mock, db := setupMockService(t, &TestServiceOpts{sessionTTL: time.Hour})
+func TestGetTrackEventsByTrackLists_EmptyAndMismatch(t *testing.T) {
+	db, _, err := sqlmock.New()
+	require.NoError(t, err)
 	defer db.Close()
-
-	key := session.Key{
-		AppName:   "test-app",
-		UserID:    "test-user",
-		SessionID: "test-session",
-	}
-
-	// Mock UPDATE error.
-	mock.ExpectExec("UPDATE session_states").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "test-app", "test-user", "test-session").
-		WillReturnError(assert.AnError)
-
-	err := s.refreshSessionTTL(context.Background(), key)
+	s := createTestService(t, db)
+	got, err := s.getTrackEventsByTrackLists(context.Background(), nil, nil, 0, time.Time{})
+	require.NoError(t, err)
+	assert.Nil(t, got)
+	_, err = s.getTrackEventsByTrackLists(
+		context.Background(),
+		[]session.Key{{AppName: "app", UserID: "user", SessionID: "sess"}},
+		nil,
+		0,
+		time.Time{},
+	)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "refresh session TTL failed")
-	require.NoError(t, mock.ExpectationsWereMet())
+	assert.Contains(t, err.Error(), "track lists count mismatch")
 }

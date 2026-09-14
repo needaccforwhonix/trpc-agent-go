@@ -12,6 +12,7 @@ package codeexecutor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -46,12 +47,96 @@ const (
 	AttrMountUsed = "mount_used"
 )
 
-// Workspace represents an isolated execution workspace.
-// Path is host path for local runtime or a logical mount path for
-// containers.
+// Workspace represents an isolated logical execution workspace.
 type Workspace struct {
-	ID   string
+	// ID identifies the logical workspace, typically for an execution,
+	// session, or invocation. It may remain unchanged when the backend
+	// replaces the physical execution environment, so it must not be used to
+	// detect whether a cached handle is stale. Instance-aware backends expose
+	// that separate identity through [WorkspaceInstanceProvider].
+	ID string
+	// Path is a host path for a local runtime or a logical mount path for
+	// containers. Like ID, a deterministic Path may be reused across physical
+	// execution-environment instances.
 	Path string
+}
+
+// ErrWorkspaceStale reports that a workspace handle belongs to a physical
+// execution-environment instance that is no longer current. Callers should
+// invalidate the exact [WorkspaceHandle] whenever an error matches this value.
+//
+// A standalone ErrWorkspaceStale remains safe to retry for compatibility.
+// Errors that also match [ErrWorkspaceRetryUnsafe] or
+// [ErrPartialOutputCommit] are invalidation-only signals and must not be
+// replayed. Callers performing automatic replay must use
+// [IsWorkspaceRetrySafe] rather than testing ErrWorkspaceStale alone.
+//
+// Backends must not return a standalone ErrWorkspaceStale for transport
+// timeouts, lost responses, ordinary file-system errors, or non-zero program
+// exit codes when side effects may be unknown. Such failures must remain
+// ordinary errors or join ErrWorkspaceRetryUnsafe.
+var ErrWorkspaceStale = errors.New("codeexecutor: workspace is stale")
+
+// ErrWorkspaceRetryUnsafe marks a stale operation that may have produced side
+// effects and therefore must not be replayed automatically. The enclosing error
+// should also match [ErrWorkspaceStale] so callers can invalidate its handle.
+var ErrWorkspaceRetryUnsafe = errors.New(
+	"codeexecutor: workspace operation is unsafe to retry",
+)
+
+// IsWorkspaceRetrySafe reports whether err authorizes automatic workspace
+// replay. A stale partial output commit is always unsafe because outputs or
+// artifacts may already have been persisted.
+func IsWorkspaceRetrySafe(err error) bool {
+	return errors.Is(err, ErrWorkspaceStale) &&
+		!errors.Is(err, ErrWorkspaceRetryUnsafe) &&
+		!errors.Is(err, ErrPartialOutputCommit)
+}
+
+// WorkspaceInstanceID identifies the physical execution-environment instance
+// to which a cached [Workspace] handle belongs.
+//
+// The value is opaque to the framework and must be non-empty. It must remain
+// stable while cached workspaces can be reused, and must change whenever the
+// backend recreates the environment such that cached handles need to be
+// recreated. Unlike [Workspace.ID], it identifies that physical instance
+// rather than the logical workspace. It is not a workspace-content, file, or
+// metadata version.
+type WorkspaceInstanceID string
+
+// WorkspaceHandle binds a logical [Workspace] to the backend instance that
+// created it and to one exact [WorkspaceRegistry] cache entry.
+//
+// InstanceID is empty for legacy managers that do not implement
+// [WorkspaceInstanceProvider]. The registry-owned identity is intentionally
+// private: callers can copy a handle and pass it back to
+// [WorkspaceRegistry.Invalidate], but cannot forge or reuse its cache token.
+type WorkspaceHandle struct {
+	Workspace  Workspace
+	InstanceID WorkspaceInstanceID
+
+	registry   *WorkspaceRegistry
+	registryID string
+	entryToken uint64
+}
+
+// WorkspaceInstanceProvider is an optional [WorkspaceManager] capability for
+// backends whose physical execution environment can be replaced while logical
+// workspace IDs remain stable.
+//
+// InstanceID must return the current opaque, non-empty instance ID. The ID must
+// change on every physical environment replacement; an ID must never be reused
+// within a process, even if a platform-level identifier is reused.
+//
+// The lookup may make the backend ready (for example, by lazily reconnecting),
+// but must not modify workspace contents. Implementations must follow the
+// stability and change rules documented on [WorkspaceInstanceID].
+//
+// A wrapper around a WorkspaceManager must forward this capability when the
+// wrapped manager implements it. A wrapper whose manager does not implement it
+// must not synthesize an empty ID or otherwise advertise the capability.
+type WorkspaceInstanceProvider interface {
+	InstanceID(ctx context.Context) (WorkspaceInstanceID, error)
 }
 
 // WorkspacePolicy configures workspace behavior.
@@ -83,13 +168,17 @@ type ResourceLimits struct {
 
 // RunProgramSpec describes a program invocation in a workspace.
 type RunProgramSpec struct {
-	Cmd     string
-	Args    []string
-	Env     map[string]string
-	Cwd     string // relative to workspace root
-	Stdin   string
-	Timeout time.Duration
-	Limits  ResourceLimits
+	Cmd  string
+	Args []string
+	Env  map[string]string
+	// CleanEnv starts the program from an empty environment instead of
+	// inheriting os.Environ. Workspace base variables and Env are still
+	// added by runtimes that support workspace execution.
+	CleanEnv bool
+	Cwd      string // relative to workspace root
+	Stdin    string
+	Timeout  time.Duration
+	Limits   ResourceLimits
 }
 
 // RunResult captures a single program run result.
@@ -130,7 +219,9 @@ type WorkspaceFS interface {
 	StageInputs(ctx context.Context, ws Workspace,
 		specs []InputSpec) error
 	// CollectOutputs applies the declarative output spec to collect
-	// files and optionally persist artifacts.
+	// files and optionally persist artifacts. Implementations should
+	// return ErrPartialOutputCommit when output collection completed but
+	// the metadata record could not be committed.
 	CollectOutputs(ctx context.Context, ws Workspace,
 		spec OutputSpec) (OutputManifest, error)
 }
@@ -148,6 +239,20 @@ type Capabilities struct {
 	ReadOnlyMount  bool
 	Streaming      bool
 	MaxDiskBytes   int64
+	// SupportsCleanEnv reports whether ProgramRunner.RunProgram honors
+	// RunProgramSpec.CleanEnv - i.e. it can start the spawned program with
+	// spec.Env only, instead of the inherited process environment. Tool layers
+	// that depend on CleanEnv for security (e.g. tool/workspaceexec policy
+	// mode) must gate on this capability and fail closed when it is false,
+	// because the alternative is silently degrading the policy contract on
+	// backends that ignore CleanEnv.
+	//
+	// Defaults to false so any backend that has not been audited
+	// for CleanEnv support is treated as "does not support" until
+	// it opts in. The local, container and e2b backends opt in via
+	// NewEngineWithCapabilities (issue #1845); other backends keep
+	// the zero value and fail closed.
+	SupportsCleanEnv bool
 }
 
 // Engine is a backend that provides workspace and execution services.
@@ -177,13 +282,34 @@ func (e *stdEngine) FS() WorkspaceFS           { return e.f }
 func (e *stdEngine) Runner() ProgramRunner     { return e.r }
 func (e *stdEngine) Describe() Capabilities    { return e.c }
 
-// NewEngine constructs a simple Engine from its components.
+// NewEngine constructs a simple Engine from its components, with
+// zero-valued Capabilities. Existing callers keep their historical
+// behaviour; new backends that want to advertise capabilities
+// (notably SupportsCleanEnv) should use NewEngineWithCapabilities
+// instead.
 func NewEngine(
 	m WorkspaceManager,
 	f WorkspaceFS,
 	r ProgramRunner,
 ) Engine {
 	return &stdEngine{m: m, f: f, r: r}
+}
+
+// NewEngineWithCapabilities is the explicit-capabilities form of
+// NewEngine. Backends that have audited their runtime behaviour
+// against the Capabilities surface (today: codeexecutor/local,
+// codeexecutor/container and codeexecutor/e2b declare
+// SupportsCleanEnv = true) use this constructor; backends that have
+// not yet been audited continue to use NewEngine and inherit the
+// zero value, which fails closed in any tool that gates on a
+// capability.
+func NewEngineWithCapabilities(
+	m WorkspaceManager,
+	f WorkspaceFS,
+	r ProgramRunner,
+	c Capabilities,
+) Engine {
+	return &stdEngine{m: m, f: f, r: r, c: c}
 }
 
 // Default file modes and common subdirectories.

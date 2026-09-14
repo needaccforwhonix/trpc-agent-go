@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,8 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
+	"trpc.group/trpc-go/trpc-agent-go/internal/errorcontent"
+	"trpc.group/trpc-go/trpc-agent-go/internal/flow/calllimit"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
@@ -265,6 +268,56 @@ func TestBuildRequestProcessors_AddSessionSummaryWiring(t *testing.T) {
 	require.False(t, crp.AddSessionSummary)
 }
 
+// Test that buildRequestProcessors wires SessionSummaryInjectionMode into
+// ContentRequestProcessor correctly.
+func TestBuildRequestProcessors_SessionSummaryInjectionModeWiring(t *testing.T) {
+	// user mode
+	optsUser := &Options{}
+	WithAddSessionSummary(true)(optsUser)
+	WithSessionSummaryInjectionMode(SessionSummaryInjectionUser)(optsUser)
+	procs := buildRequestProcessors("test-agent", optsUser)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.AddSessionSummary)
+	require.Equal(t, processor.SessionSummaryInjectionUser, crp.SessionSummaryInjectionMode)
+
+	// default (system) mode
+	optsSystem := &Options{}
+	WithAddSessionSummary(true)(optsSystem)
+	procs = buildRequestProcessors("test-agent", optsSystem)
+	crp = nil
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.AddSessionSummary)
+	require.Equal(t, processor.SessionSummaryInjectionSystem, crp.SessionSummaryInjectionMode)
+}
+
+func TestBuildRequestProcessors_AddCurrentTimeToolGuidanceWiring(t *testing.T) {
+	opts := &Options{}
+	WithAddCurrentTime(true)(opts)
+
+	procs := buildRequestProcessors("test-agent", opts)
+	var timeProc *processor.TimeRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.TimeRequestProcessor); ok {
+			timeProc = v
+		}
+	}
+	require.NotNil(t, timeProc)
+	require.True(t, timeProc.AddCurrentTime)
+	require.Equal(t, "environment_context_current_time", timeProc.CurrentTimeToolName)
+	require.True(t, timeProc.CurrentTimeToolAvailable)
+}
+
 // Test that buildRequestProcessors wires MaxHistoryRuns into
 // ContentRequestProcessor correctly.
 func TestBuildRequestProcessors_MaxHistoryRunsWiring(t *testing.T) {
@@ -295,6 +348,48 @@ func TestBuildRequestProcessors_MaxHistoryRunsWiring(t *testing.T) {
 	require.Equal(t, 0, crp.MaxHistoryRuns)
 }
 
+func TestBuildRequestProcessors_ToolTranscriptModeWiring(t *testing.T) {
+	opts := &Options{}
+	WithToolTranscriptMode(ToolTranscriptModeOmitPreviousCompleted)(opts)
+
+	procs := buildRequestProcessors("test-agent", opts)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.Equal(t, processor.ToolTranscriptModeOmitPreviousCompleted, crp.ToolTranscriptMode)
+}
+
+func TestBuildRequestProcessors_ContextCompactionWiring(t *testing.T) {
+	opts := &Options{}
+	WithEnableContextCompaction(true)(opts)
+	WithContextCompactionKeepRecentRequests(2)(opts)
+	WithContextCompactionToolResultMaxTokens(2048)(opts)
+	counter := model.NewSimpleTokenCounter(model.WithApproxRunesPerToken(1))
+	WithContextCompactionTokenCounter(counter)(opts)
+	WithToolResultCompactionConfig(&ToolResultCompactionConfig{
+		SkipRecentFunc: func([]event.Event) int { return 3 },
+	})(opts)
+
+	procs := buildRequestProcessors("test-agent", opts)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.ContextCompactionConfig.Enabled)
+	require.Equal(t, 2, crp.ContextCompactionConfig.KeepRecentRequests)
+	require.Equal(t, 2048, crp.ContextCompactionConfig.ToolResultMaxTokens)
+	require.Same(t, counter, crp.ContextCompactionConfig.TokenCounter)
+	require.NotNil(t, crp.ContextCompactionConfig.SkipRecentFunc)
+	require.Equal(t, 3, crp.ContextCompactionConfig.SkipRecentFunc(nil))
+}
+
 // Test that buildRequestProcessors wires PreserveSameBranch into
 // ContentRequestProcessor correctly.
 func TestBuildRequestProcessors_PreserveSameBranchWiring(t *testing.T) {
@@ -323,6 +418,362 @@ func TestBuildRequestProcessors_PreserveSameBranchWiring(t *testing.T) {
 	}
 	require.NotNil(t, crp)
 	require.False(t, crp.PreserveSameBranch)
+}
+
+func TestBuildRequestProcessors_PreserveForeignMessagesWiring(t *testing.T) {
+	optsTrue := &Options{}
+	WithPreserveForeignMessages(true)(optsTrue)
+	procs := buildRequestProcessors("tester", optsTrue)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.True(t, crp.PreserveForeignMessages)
+
+	optsFalse := &Options{}
+	WithPreserveForeignMessages(false)(optsFalse)
+	procs = buildRequestProcessors("tester", optsFalse)
+	crp = nil
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.False(t, crp.PreserveForeignMessages)
+}
+
+func TestBuildRequestProcessors_PreloadSessionRecallWiring(t *testing.T) {
+	opts := &Options{}
+	WithPreloadMemory(3)(opts)
+	WithPreloadMemoryInjectionMode(PreloadMemoryInjectionUser)(opts)
+	WithPreloadSessionRecall(4)(opts)
+	WithPreloadSessionRecallInjectionMode(PreloadSessionRecallInjectionUser)(opts)
+	WithPreloadSessionRecallMinScore(0.6)(opts)
+	WithPreloadSessionRecallSearchMode(session.SearchModeDense)(opts)
+
+	procs := buildRequestProcessors("tester", opts)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+	require.NotNil(t, crp)
+	require.Equal(t, 3, crp.PreloadMemory)
+	require.Equal(
+		t,
+		processor.PreloadMemoryInjectionUser,
+		crp.PreloadMemoryInjectionMode,
+	)
+	require.Equal(t, 4, crp.PreloadSessionRecall)
+	require.Equal(
+		t,
+		processor.PreloadSessionRecallInjectionUser,
+		crp.PreloadSessionRecallInjectionMode,
+	)
+	require.Equal(t, 0.6, crp.PreloadSessionRecallMinScore)
+	require.Equal(
+		t,
+		session.SearchModeDense,
+		crp.PreloadSessionRecallSearchMode,
+	)
+}
+
+func TestBuildRequestProcessors_EventMessageProjectorWiring(
+	t *testing.T,
+) {
+	projector := func(
+		_ *agent.Invocation,
+		_ event.Event,
+		msg model.Message,
+	) model.Message {
+		msg.Content = "projected"
+		return msg
+	}
+
+	opts := &Options{}
+	WithEventMessageProjector(projector)(opts)
+	procs := buildRequestProcessors("tester", opts)
+	var crp *processor.ContentRequestProcessor
+	for _, p := range procs {
+		if v, ok := p.(*processor.ContentRequestProcessor); ok {
+			crp = v
+		}
+	}
+
+	require.NotNil(t, crp)
+	require.NotNil(t, crp.EventMessageProjector)
+
+	got := crp.EventMessageProjector(
+		nil,
+		event.Event{},
+		model.NewUserMessage("hello"),
+	)
+	require.Equal(t, "projected", got.Content)
+}
+
+func TestBuildRequestProcessors_IncludeSyntheticErrorMessagesWiring(
+	t *testing.T,
+) {
+	newMessageEvent := func(author string, msg model.Message) event.Event {
+		return event.Event{
+			Author: author,
+			Response: &model.Response{
+				Done:    true,
+				Choices: []model.Choice{{Message: msg}},
+			},
+		}
+	}
+	newInvocation := func() *agent.Invocation {
+		errorEvent := event.NewErrorEvent(
+			"inv",
+			"tester",
+			"flow_error",
+			"boom",
+		)
+		errorEvent.Response.Choices = []model.Choice{{
+			Message: model.NewAssistantMessage(errorcontent.FallbackMessage),
+		}}
+		errorcontent.MarkSynthetic(errorEvent)
+		return &agent.Invocation{
+			AgentName: "tester",
+			Session: &session.Session{Events: []event.Event{
+				newMessageEvent("user", model.NewUserMessage("first")),
+				*errorEvent,
+				newMessageEvent("user", model.NewUserMessage("second")),
+			}},
+		}
+	}
+	tests := []struct {
+		name        string
+		configure   func(*Options)
+		wantContent []string
+	}{
+		{
+			name:        "default omits",
+			configure:   func(*Options) {},
+			wantContent: []string{"first\n\nsecond"},
+		},
+		{
+			name: "compatibility mode includes",
+			configure: func(opts *Options) {
+				WithIncludeSyntheticErrorMessages(true)(opts)
+			},
+			wantContent: []string{
+				"first",
+				errorcontent.FallbackMessage,
+				"second",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &Options{}
+			tt.configure(opts)
+			procs := buildRequestProcessors("tester", opts)
+			var contentProcessor *processor.ContentRequestProcessor
+			for _, requestProcessor := range procs {
+				if candidate, ok := requestProcessor.(*processor.ContentRequestProcessor); ok {
+					contentProcessor = candidate
+				}
+			}
+			require.NotNil(t, contentProcessor)
+			req := &model.Request{}
+
+			contentProcessor.ProcessRequest(
+				context.Background(),
+				newInvocation(),
+				req,
+				nil,
+			)
+
+			require.Len(t, req.Messages, len(tt.wantContent))
+			for i, content := range tt.wantContent {
+				require.Equal(t, content, req.Messages[i].Content)
+			}
+		})
+	}
+}
+
+func TestBuildRequestProcessors_PostToolPromptInjection(t *testing.T) {
+	const (
+		systemContent = "system"
+		toolContent   = "tool"
+		customPrompt  = "[Custom Prompt] Do not mention tools."
+	)
+
+	findPostToolProcessor := func(
+		t *testing.T,
+		opts *Options,
+	) *processor.PostToolRequestProcessor {
+		t.Helper()
+
+		procs := buildRequestProcessors("tester", opts)
+		for _, p := range procs {
+			if v, ok := p.(*processor.PostToolRequestProcessor); ok {
+				return v
+			}
+		}
+		return nil
+	}
+
+	run := func(t *testing.T, opts *Options) string {
+		t.Helper()
+
+		ptp := findPostToolProcessor(t, opts)
+		require.NotNil(t, ptp)
+
+		req := &model.Request{
+			Messages: []model.Message{
+				{Role: model.RoleSystem, Content: systemContent},
+				{Role: model.RoleTool, Content: toolContent},
+			},
+		}
+		ptp.ProcessRequest(
+			context.Background(),
+			&agent.Invocation{},
+			req,
+			make(chan *event.Event, 1),
+		)
+		return req.Messages[0].Content
+	}
+
+	t.Run("default prompt injected", func(t *testing.T) {
+		opts := &Options{}
+		got := run(t, opts)
+		require.Contains(t, got, processor.DefaultPostToolPrompt)
+	})
+
+	t.Run("custom prompt injected", func(t *testing.T) {
+		opts := &Options{}
+		WithPostToolPrompt(customPrompt)(opts)
+		got := run(t, opts)
+		require.Contains(t, got, customPrompt)
+		require.NotContains(t, got, processor.DefaultPostToolPrompt)
+	})
+
+	t.Run("injection disabled", func(t *testing.T) {
+		opts := &Options{}
+		WithEnablePostToolPrompt(false)(opts)
+		require.Nil(t, findPostToolProcessor(t, opts))
+	})
+
+	t.Run("disable overrides custom prompt", func(t *testing.T) {
+		opts := &Options{}
+		WithPostToolPrompt(customPrompt)(opts)
+		WithEnablePostToolPrompt(false)(opts)
+		require.Nil(t, findPostToolProcessor(t, opts))
+	})
+}
+
+func TestHasPotentialToolSurface(t *testing.T) {
+	baseTool := &mockTool{name: testToolNameA}
+	baseToolSet := &mockToolSet{name: testDummyToolSetName}
+	subAgent := &mockAgent{name: testSimpleSubAgentName}
+
+	tests := []struct {
+		name    string
+		agent   *LLMAgent
+		options *Options
+		want    bool
+	}{
+		{
+			name:    "nil options",
+			options: nil,
+			want:    false,
+		},
+		{
+			name: "agent tools",
+			agent: &LLMAgent{
+				tools: []tool.Tool{baseTool},
+			},
+			options: nil,
+			want:    true,
+		},
+		{
+			name:    "no surface",
+			options: &Options{},
+			want:    false,
+		},
+		{
+			name: "direct tools",
+			options: &Options{
+				Tools: []tool.Tool{baseTool},
+			},
+			want: true,
+		},
+		{
+			name: "tool sets",
+			options: &Options{
+				ToolSets: []tool.ToolSet{baseToolSet},
+			},
+			want: true,
+		},
+		{
+			name: "activatable tool sets",
+			options: &Options{
+				activatableToolSets: []tool.ToolSet{baseToolSet},
+			},
+			want: true,
+		},
+		{
+			name: "tool activation rules",
+			options: &Options{
+				toolActivationRules: []toolActivationRule{{}},
+			},
+			want: true,
+		},
+		{
+			name: "sub agents",
+			options: &Options{
+				SubAgents: []agent.Agent{subAgent},
+			},
+			want: true,
+		},
+		{
+			name: "extension tools",
+			options: &Options{
+				extensionContributedTools: []tool.Tool{baseTool},
+			},
+			want: true,
+		},
+		{
+			name: "await user reply tool",
+			options: &Options{
+				EnableAwaitUserReplyTool: true,
+			},
+			want: true,
+		},
+		{
+			name: "knowledge",
+			options: &Options{
+				Knowledge: &minimalKnowledge{},
+			},
+			want: true,
+		},
+		{
+			name: "skills repository",
+			options: &Options{
+				skillsRepository: &mockSkillRepository{},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(
+				t,
+				tt.want,
+				hasPotentialToolSurface(tt.agent, tt.options),
+			)
+		})
+	}
 }
 
 // Test that WithPreserveSameBranch option sets the corresponding
@@ -773,6 +1224,72 @@ func TestLLMAgent_New_WithOutputSchema_InvalidCombos(t *testing.T) {
 			},
 		)
 	})
+
+	t.Run("with await_user_reply", func(t *testing.T) {
+		require.PanicsWithValue(t,
+			invalidOutputSchemaAwaitUserReply,
+			func() {
+				_ = New("test",
+					WithOutputSchema(schema),
+					WithAwaitUserReplyTool(true),
+				)
+			},
+		)
+	})
+
+	// An extension that contributes tools through
+	// extension.Registry.Tools must be rejected too: those tools
+	// land on the same outbound surface as WithTools / WithToolSets
+	// and so violate the same "structured output ⇒ no callable
+	// tools" contract.
+	t.Run("with tool-contributing extension", func(t *testing.T) {
+		extTool := dummyTool{decl: &tool.Declaration{Name: "from_extension"}}
+		ext := &fakeExt{name: "ext", tools: []tool.Tool{extTool}}
+		require.PanicsWithValue(t,
+			"Invalid LLMAgent configuration: if output_schema is set, extension-contributed tools (WithExtensions → Registry.Tools) must be empty",
+			func() {
+				_ = New("test",
+					WithOutputSchema(schema),
+					WithExtensions(ext),
+				)
+			},
+		)
+	})
+
+	t.Run("with activatable toolsets", func(t *testing.T) {
+		toolset := dummyToolSet{name: "activatable"}
+		require.NotPanics(t, func() {
+			_ = New("test",
+				WithOutputSchema(schema),
+				WithActivatableToolSets([]tool.ToolSet{toolset}),
+			)
+		})
+	})
+
+	t.Run("with tool activation rules", func(t *testing.T) {
+		require.PanicsWithValue(t,
+			"Invalid LLMAgent configuration: if output_schema is set, tool activation rules must be empty",
+			func() {
+				_ = New("test",
+					WithOutputSchema(schema),
+					WithToolActivationOnSkillLoad("research", []string{"activatable"}),
+				)
+			},
+		)
+	})
+
+	// A hook-only extension (Register that never calls r.Tools)
+	// leaves extensionContributedTools empty and must remain
+	// compatible with WithOutputSchema — the guard reaches the
+	// tools branch only via len(...) > 0.
+	t.Run("with hook-only extension is allowed", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			_ = New("test",
+				WithOutputSchema(schema),
+				WithExtensions(&hookOnlyExt{name: "h"}),
+			)
+		})
+	})
 }
 
 func TestLLMAgent_New_WithStructuredOutputJSONSchema_AllowsTools(t *testing.T) {
@@ -790,6 +1307,43 @@ func TestLLMAgent_New_WithStructuredOutputJSONSchema_AllowsTools(t *testing.T) {
 			WithToolSets([]tool.ToolSet{toolset}),
 		)
 	})
+}
+
+func TestLLMAgent_OutputSchemaOnly_InjectsJSONInstructions(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"status": map[string]any{"type": "string"},
+		},
+	}
+	agt := New(
+		"test-agent",
+		WithOutputSchema(schema),
+	)
+
+	reqProcs := buildRequestProcessorsWithAgent(agt, &agt.option)
+	var instrProc *processor.InstructionRequestProcessor
+	for _, rp := range reqProcs {
+		if p, ok := rp.(*processor.InstructionRequestProcessor); ok {
+			instrProc = p
+			break
+		}
+	}
+	require.NotNil(t, instrProc)
+
+	inv := &agent.Invocation{InvocationID: testModelPromptInvocationID}
+	agt.setupInvocation(inv)
+
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("hi")},
+	}
+	eventCh := make(chan *event.Event, 10)
+	instrProc.ProcessRequest(context.Background(), inv, req, eventCh)
+
+	require.NotEmpty(t, req.Messages)
+	require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+	require.Contains(t, req.Messages[0].Content, "IMPORTANT: Return ONLY a JSON object")
+	require.Contains(t, req.Messages[0].Content, `"status"`)
 }
 
 // TestLLMAgent_InvocationContextAccess verifies that LLMAgent can access invocation
@@ -950,11 +1504,12 @@ func TestLLMAgent_EnableCodeExecutionResponseProcessor(t *testing.T) {
 		}
 	}
 
-	newInvocation := func() *agent.Invocation {
+	newInvocation := func(opts ...agent.RunOption) *agent.Invocation {
 		return &agent.Invocation{
 			Message:      model.NewUserMessage("hi"),
 			InvocationID: "test-invocation",
 			Session:      &session.Session{ID: "test-session"},
+			RunOptions:   agent.NewRunOptions(opts...),
 		}
 	}
 
@@ -998,6 +1553,63 @@ func TestLLMAgent_EnableCodeExecutionResponseProcessor(t *testing.T) {
 
 		require.Equal(t, 0, exec.CallCount())
 		require.Equal(t, codeBlock, gotContent)
+	})
+
+	t.Run("run_override_takes_precedence", func(t *testing.T) {
+		staticExec := &countingCodeExecutor{}
+		overrideExec := &countingCodeExecutor{}
+		agt := New(
+			"test",
+			WithModel(newMockModel()),
+			WithCodeExecutor(staticExec),
+		)
+
+		events, err := agt.Run(
+			context.Background(),
+			newInvocation(agent.WithCodeExecutor(overrideExec)),
+		)
+		require.NoError(t, err)
+		for range events {
+		}
+
+		require.Equal(t, 0, staticExec.CallCount())
+		require.Equal(t, 1, overrideExec.CallCount())
+	})
+
+	t.Run("non_executable_markdown_block", func(t *testing.T) {
+		exec := &countingCodeExecutor{}
+		agt := New(
+			"test",
+			WithModel(&mockModelWithResponse{
+				response: &model.Response{
+					Choices: []model.Choice{{
+						Message: model.Message{
+							Role: model.RoleAssistant,
+							Content: "```markdown\n" +
+								"# hello\n```",
+						},
+					}},
+					Done: true,
+				},
+			}),
+			WithCodeExecutor(exec),
+		)
+
+		events, err := agt.Run(context.Background(), newInvocation())
+		require.NoError(t, err)
+
+		gotContent := ""
+		for ev := range events {
+			if ev == nil || ev.Response == nil {
+				continue
+			}
+			if ev.IsFinalResponse() && len(ev.Choices) > 0 {
+				gotContent = ev.Choices[0].Message.Content
+			}
+		}
+
+		require.Equal(t, 0, exec.CallCount())
+		require.Equal(t, "```markdown\n# hello\n```", gotContent)
 	})
 }
 
@@ -1046,6 +1658,33 @@ func TestLLMAgent_OptionsWithStructuredOutputJSON(t *testing.T) {
 	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
 }
 
+func TestLLMAgent_OptionsWithStructuredOutputJSON_StrictFlagControlsGeneratedSchema(t *testing.T) {
+	type MyStruct struct {
+		Field    string   `json:"field"`
+		Optional []string `json:"optional"`
+	}
+
+	strictOpts := &Options{}
+	WithStructuredOutputJSON(new(MyStruct), true, "strict")(strictOpts)
+	require.NotNil(t, strictOpts.StructuredOutput)
+	strictSchema := strictOpts.StructuredOutput.JSONSchema.Schema
+	strictRequired := strictSchema["required"].([]string)
+	require.Len(t, strictRequired, 2)
+	strictProps := strictSchema["properties"].(map[string]any)
+	_, hasAnyOf := strictProps["optional"].(map[string]any)["anyOf"]
+	require.True(t, hasAnyOf)
+
+	nonStrictOpts := &Options{}
+	WithStructuredOutputJSON(new(MyStruct), false, "non-strict")(nonStrictOpts)
+	require.NotNil(t, nonStrictOpts.StructuredOutput)
+	nonStrictSchema := nonStrictOpts.StructuredOutput.JSONSchema.Schema
+	nonStrictRequired := nonStrictSchema["required"].([]string)
+	require.Equal(t, []string{"field"}, nonStrictRequired)
+	nonStrictProps := nonStrictSchema["properties"].(map[string]any)
+	_, hasAnyOf = nonStrictProps["optional"].(map[string]any)["anyOf"]
+	require.False(t, hasAnyOf)
+}
+
 func TestLLMAgent_OptionsWithStructuredOutputJSONSchema(t *testing.T) {
 	schema := map[string]any{"type": "object"}
 	opts := &Options{}
@@ -1056,6 +1695,73 @@ func TestLLMAgent_OptionsWithStructuredOutputJSONSchema(t *testing.T) {
 	require.Equal(t, "output", opts.StructuredOutput.JSONSchema.Name)
 	require.True(t, opts.StructuredOutput.JSONSchema.Strict)
 	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
+}
+
+func TestLLMAgent_SetupInvocation_UsesRunStructuredOutputOverride(t *testing.T) {
+	type agentOutput struct {
+		AgentField string `json:"agent_field"`
+	}
+	type runOutput struct {
+		RunField string `json:"run_field"`
+	}
+
+	agt := New(
+		"test-agent",
+		WithStructuredOutputJSON(new(agentOutput), true, "agent description"),
+	)
+	inv := &agent.Invocation{}
+	agent.WithStructuredOutputJSON(new(runOutput), true, "run description")(&inv.RunOptions)
+
+	agt.setupInvocation(inv)
+
+	require.NotNil(t, inv.StructuredOutput)
+	require.NotNil(t, inv.StructuredOutput.JSONSchema)
+	require.Equal(t, "runOutput", inv.StructuredOutput.JSONSchema.Name)
+	require.Equal(t, "run description", inv.StructuredOutput.JSONSchema.Description)
+	require.Equal(t, reflect.TypeOf((*runOutput)(nil)), inv.StructuredOutputType)
+	require.NotNil(t, inv.RunOptions.StructuredOutput)
+	require.NotNil(t, inv.RunOptions.StructuredOutput.JSONSchema)
+	require.Equal(t, "runOutput", inv.RunOptions.StructuredOutput.JSONSchema.Name)
+	require.Equal(t, reflect.TypeOf((*runOutput)(nil)), inv.RunOptions.StructuredOutputType)
+}
+
+func TestLLMAgent_Run_UsesRunStructuredOutputWithoutStaticOutputProcessor(t *testing.T) {
+	type runOutput struct {
+		RunField string `json:"run_field"`
+	}
+
+	agt := New(
+		"test-agent",
+		WithModel(&mockModelWithResponse{
+			response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.NewAssistantMessage(`{"run_field":"ok"}`),
+				}},
+				Done: true,
+			},
+		}),
+	)
+	inv := &agent.Invocation{
+		Message:      model.NewUserMessage("hi"),
+		InvocationID: "test-invocation",
+		Session:      &session.Session{ID: "test-session"},
+	}
+	agent.WithStructuredOutputJSON(new(runOutput), true, "run description")(&inv.RunOptions)
+
+	eventCh, err := agt.Run(context.Background(), inv)
+	require.NoError(t, err)
+
+	var structured any
+	for evt := range eventCh {
+		if evt != nil && evt.StructuredOutput != nil {
+			structured = evt.StructuredOutput
+		}
+	}
+
+	require.NotNil(t, structured)
+	result, ok := structured.(*runOutput)
+	require.True(t, ok)
+	require.Equal(t, "ok", result.RunField)
 }
 
 // TestLLMAgent_OptionsWithAddCurrentTime tests WithAddCurrentTime option.
@@ -1131,6 +1837,20 @@ func TestLLMAgent_SetGlobalInstruction(t *testing.T) {
 	require.Equal(t, "initial global", agt.getSystemPrompt())
 
 	agt.SetGlobalInstruction("updated global")
+	require.Equal(t, "updated global", agt.getSystemPrompt())
+}
+
+func TestLLMAgent_SetPrompts(t *testing.T) {
+	agt := New(
+		"test",
+		WithInstruction("initial instruction"),
+		WithGlobalInstruction("initial global"),
+	)
+	require.Equal(t, "initial instruction", agt.getInstruction())
+	require.Equal(t, "initial global", agt.getSystemPrompt())
+
+	agt.SetPrompts("updated instruction", "updated global")
+	require.Equal(t, "updated instruction", agt.getInstruction())
 	require.Equal(t, "updated global", agt.getSystemPrompt())
 }
 
@@ -1324,7 +2044,7 @@ func TestLLMAgent_SetModelInstructions(t *testing.T) {
 
 // TestHaveCustomResponseError tests the Error method of haveCustomResponseError.
 func TestHaveCustomResponseError(t *testing.T) {
-	err := &haveCustomResponseError{EventChan: make(<-chan *event.Event)}
+	err := &haveCustomResponseError{eventChan: make(<-chan *event.Event)}
 	require.Equal(t, "custom response provided, returning early", err.Error())
 }
 
@@ -1826,6 +2546,30 @@ func TestLLMAgent_RunWithModelName_NotFound(t *testing.T) {
 	require.Equal(t, defaultModel, inv.Model)
 }
 
+func TestLLMAgent_BaseModelForInvocation_MissingModelNameSuppressesAgentSelector(t *testing.T) {
+	defaultModel := &mockModelWithResponse{}
+	selectorModel := &mockModelWithResponse{}
+	llmAgent := New(
+		"test-agent",
+		WithModel(defaultModel),
+		WithModelSelector(func(ctx context.Context, inv *agent.Invocation) (model.Model, error) {
+			return selectorModel, nil
+		}),
+	)
+	inv := &agent.Invocation{
+		InvocationID: "test-1",
+		AgentName:    "test-agent",
+		Message:      model.NewUserMessage("Test message"),
+		RunOptions: agent.RunOptions{
+			ModelName: "non-existent-model",
+		},
+	}
+	resolution := llmAgent.resolveFlowBaseModel(inv)
+	require.Same(t, defaultModel, resolution.Model)
+	require.NotSame(t, selectorModel, resolution.Model)
+	require.False(t, resolution.AllowAgentSelector)
+}
+
 // TestLLMAgent_RunWithModel_Priority tests that WithModel takes priority over WithModelName.
 func TestLLMAgent_RunWithModel_Priority(t *testing.T) {
 	modelFromWithModel := &mockModelWithResponse{
@@ -1914,6 +2658,40 @@ func TestLLMAgent_SetupInvocation_PropagatesMaxLimits(t *testing.T) {
 	llmNoLimits.setupInvocation(invNoLimits)
 	require.Equal(t, 0, invNoLimits.MaxLLMCalls)
 	require.Equal(t, 0, invNoLimits.MaxToolIterations)
+}
+
+func TestLLMAgent_SetupInvocation_ConfiguresCallLimitFinalization(t *testing.T) {
+	const toolInstruction = "finish with the available tool results"
+	llmAgent := New(
+		"limits-agent",
+		WithModel(newDummyModel()),
+		WithMaxLLMCalls(2),
+		WithMaxToolIterations(1),
+		WithLLMCallLimitFinalization(""),
+		WithToolIterationLimitFinalization(toolInstruction),
+	)
+
+	llmInvocation := agent.NewInvocation()
+	llmAgent.setupInvocation(llmInvocation)
+	require.False(t, calllimit.RecordLLMCall(llmInvocation, 2))
+	require.True(t, calllimit.RecordLLMCall(llmInvocation, 2))
+	instruction, ok := calllimit.ActivateForLLM(llmInvocation, true)
+	require.True(t, ok)
+	require.Equal(t, calllimit.DefaultInstruction, instruction)
+
+	toolInvocation := agent.NewInvocation()
+	llmAgent.setupInvocation(toolInvocation)
+	require.True(t, calllimit.RecordToolIteration(toolInvocation, 1))
+	calllimit.ScheduleToolFinalization(toolInvocation)
+	instruction, ok = calllimit.ActivateForLLM(toolInvocation, false)
+	require.True(t, ok)
+	require.Equal(t, toolInstruction, instruction)
+
+	defaultAgent := New("default-agent", WithModel(newDummyModel()))
+	defaultInvocation := agent.NewInvocation()
+	defaultAgent.setupInvocation(defaultInvocation)
+	require.False(t, calllimit.RecordLLMCall(defaultInvocation, 1))
+	require.False(t, calllimit.RecordToolIteration(defaultInvocation, 1))
 }
 
 func TestLLMAgent_MessageFilterMode(t *testing.T) {

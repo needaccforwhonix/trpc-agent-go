@@ -96,26 +96,50 @@ func newWorkspaceRuntime(c *CodeExecutor) (*workspaceRuntime, error) {
 }
 
 // findBindSource returns the host path whose bind dest equals dest.
-// Bind spec is source:dest[:mode]. We parse from right to handle ':'
-// that may appear in the source path (Windows not considered here).
+// Bind spec is source:dest[:mode]. We parse from the right so ':'
+// may appear in the source path (Windows not considered here).
 func findBindSource(binds []string, dest string) string {
 	for _, b := range binds {
 		parts := strings.Split(b, ":")
 		if len(parts) < 2 {
 			continue
 		}
-		// Last part may be mode; second last is dest.
-		d := parts[len(parts)-2]
-		if d != dest {
-			continue
-		}
-		// Join all but the last two parts as source.
-		src := strings.Join(parts[:len(parts)-2], ":")
-		if st, err := os.Stat(src); err == nil && st.IsDir() {
-			return src
+		for _, i := range bindDestCandidateIndexes(parts) {
+			if parts[i] == dest {
+				src := strings.Join(parts[:i], ":")
+				if st, err := os.Stat(src); err == nil && st.IsDir() {
+					return src
+				}
+			}
 		}
 	}
 	return ""
+}
+
+func bindDestCandidateIndexes(parts []string) []int {
+	if len(parts) == 2 {
+		return []int{1}
+	}
+	if isBindMode(parts[len(parts)-1]) {
+		return []int{len(parts) - 2}
+	}
+	return []int{len(parts) - 1}
+}
+
+func isBindMode(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, opt := range strings.Split(s, ",") {
+		switch opt {
+		case "ro", "rw", "z", "Z", "cached", "delegated", "consistent",
+			"private", "rprivate", "shared", "rshared", "slave", "rslave",
+			"nocopy":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // CreateWorkspace ensures a per‑execution directory inside container.
@@ -408,7 +432,6 @@ func (r *workspaceRuntime) RunProgram(
 		"run_"+time.Now().Format("20060102T150405.000"),
 	)
 	// Build env parts with defaults first, then overlay user env.
-	var envParts []string
 	baseEnv := map[string]string{
 		codeexecutor.WorkspaceEnvDirKey: ws.Path,
 		codeexecutor.EnvSkillsDir:       skillsDir,
@@ -416,16 +439,13 @@ func (r *workspaceRuntime) RunProgram(
 		codeexecutor.EnvOutputDir:       outDir,
 		codeexecutor.EnvRunDir:          runDir,
 	}
-	for k, v := range baseEnv {
-		if _, ok := spec.Env[k]; ok {
-			continue
-		}
-		envParts = append(envParts, k+"="+shellQuote(v))
-	}
-	for k, v := range spec.Env {
-		envParts = append(envParts, k+"="+shellQuote(v))
-	}
-	envStr := strings.Join(envParts, " ")
+	// envPrefix is the leading `env ...` token. When spec.CleanEnv
+	// is set (workspace_exec / skill_run policy mode) it becomes
+	// `env -i ...` so the spawned command starts from an empty
+	// environment plus the workspace base vars and a minimal PATH,
+	// honoring RunProgramSpec.CleanEnv on the container backend
+	// (issue #1845).
+	envPrefix := envToken(baseEnv, spec.Env, spec.CleanEnv)
 	var cmdline strings.Builder
 	// Ensure run/output dirs exist before cd/exec.
 	cmdline.WriteString("mkdir -p ")
@@ -435,18 +455,27 @@ func (r *workspaceRuntime) RunProgram(
 	cmdline.WriteString(" && cd ")
 	cmdline.WriteString(shellQuote(cwd))
 	cmdline.WriteString(" && ")
-	if envStr != "" {
-		cmdline.WriteString("env ")
-		cmdline.WriteString(envStr)
-		cmdline.WriteString(" ")
-	}
+	cmdline.WriteString(envPrefix)
 	cmdline.WriteString(shellQuote(spec.Cmd))
 	for _, a := range spec.Args {
 		cmdline.WriteString(" ")
 		cmdline.WriteString(shellQuote(a))
 	}
-	argv := []string{"/bin/bash", "-lc", cmdline.String()}
-	out, errOut, code, timed, err := r.execCmd(ctx, argv, t)
+	argv := programShellArgv(spec.CleanEnv, cmdline.String())
+	// In CleanEnv mode constrain the outer `env` wrapper's own
+	// process environment (blank the dynamic-loader hooks, pin
+	// PATH) so it cannot be hijacked before its `env -i` runs.
+	var execEnv []string
+	if spec.CleanEnv {
+		execEnv = cleanWrapperEnv()
+	}
+	out, errOut, code, timed, err := r.execCmdWithStdin(
+		ctx,
+		argv,
+		t,
+		spec.Stdin,
+		execEnv,
+	)
 	res := codeexecutor.RunResult{
 		Stdout:   out,
 		Stderr:   errOut,
@@ -512,6 +541,9 @@ func (r *workspaceRuntime) Collect(
 		if rel == line {
 			rel = filepath.ToSlash(line)
 		}
+		if codeexecutor.IsRootMetadataTempPath(rel) {
+			continue
+		}
 		if seen[rel] {
 			continue
 		}
@@ -533,6 +565,20 @@ func (r *workspaceRuntime) Collect(
 
 // StageInputs maps external inputs using container semantics.
 func (r *workspaceRuntime) StageInputs(
+	ctx context.Context,
+	ws codeexecutor.Workspace,
+	specs []codeexecutor.InputSpec,
+) error {
+	return codeexecutor.WithWorkspaceMetadataLock(
+		ctx,
+		ws.Path,
+		func(ctx context.Context) error {
+			return r.stageInputsLocked(ctx, ws, specs)
+		},
+	)
+}
+
+func (r *workspaceRuntime) stageInputsLocked(
 	ctx context.Context,
 	ws codeexecutor.Workspace,
 	specs []codeexecutor.InputSpec,
@@ -775,11 +821,45 @@ func (r *workspaceRuntime) saveWorkspaceMetadata(
 	if err != nil {
 		return err
 	}
-	return r.PutFiles(ctx, ws, []codeexecutor.PutFile{{
-		Path:    codeexecutor.MetaFileName,
+	tmpFile := codeexecutor.MetadataTempFileName()
+	tmpPath := path.Join(ws.Path, tmpFile)
+	destPath := path.Join(ws.Path, codeexecutor.MetaFileName)
+	committed := false
+	defer r.cleanupMetadataTemp(ctx, tmpPath, &committed)
+	if err := r.PutFiles(ctx, ws, []codeexecutor.PutFile{{
+		Path:    tmpFile,
 		Content: buf,
 		Mode:    metadataFileMode,
-	}})
+	}}); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	sb.WriteString("set -e; tmp=")
+	sb.WriteString(shellQuote(tmpPath))
+	sb.WriteString("; dest=")
+	sb.WriteString(shellQuote(destPath))
+	sb.WriteString("; trap 'rm -f \"$tmp\"' EXIT; ")
+	sb.WriteString("if [ -d \"$dest\" ]; then ")
+	sb.WriteString("echo \"metadata path is a directory\" >&2; exit 1; ")
+	sb.WriteString("fi; mv -f \"$tmp\" \"$dest\"")
+	sb.WriteString("; trap - EXIT")
+	_, stderr, code, _, err := r.execCmd(
+		ctx,
+		[]string{"/bin/bash", "-lc", sb.String()},
+		time.Duration(defaultStageTimeoutSec)*time.Second,
+	)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf(
+			"workspace metadata commit failed: exit code %d: %s",
+			code,
+			strings.TrimSpace(stderr),
+		)
+	}
+	committed = true
+	return nil
 }
 
 func (r *workspaceRuntime) loadWorkspaceMetadata(
@@ -804,6 +884,9 @@ func (r *workspaceRuntime) loadWorkspaceMetadata(
 		return md, nil
 	}
 	if err := json.Unmarshal([]byte(files[0].Content), &md); err != nil {
+		if codeexecutor.IsMetadataCorruptError(err) {
+			return codeexecutor.NewWorkspaceMetadata(), nil
+		}
 		return codeexecutor.WorkspaceMetadata{}, err
 	}
 	if md.Version == 0 {
@@ -817,6 +900,29 @@ func (r *workspaceRuntime) loadWorkspaceMetadata(
 		md.Skills = map[string]codeexecutor.SkillMeta{}
 	}
 	return md, nil
+}
+
+func (r *workspaceRuntime) cleanupMetadataTemp(
+	ctx context.Context,
+	tmpPath string,
+	committed *bool,
+) {
+	if committed != nil && *committed {
+		return
+	}
+	if tmpPath == "" {
+		return
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
+	_, _, _, _, _ = r.execCmd(
+		cleanupCtx,
+		[]string{
+			"/bin/bash",
+			"-lc",
+			"rm -f " + shellQuote(tmpPath),
+		},
+		time.Duration(defaultStageTimeoutSec)*time.Second,
+	)
 }
 
 // CollectOutputs applies container-side glob and optional save.
@@ -869,6 +975,10 @@ func (r *workspaceRuntime) CollectOutputs(
 			mf.LimitsHit = true
 			break
 		}
+		rel := strings.TrimPrefix(line, ws.Path+"/")
+		if codeexecutor.IsRootMetadataTempPath(rel) {
+			continue
+		}
 		data, sizeBytes, _, mime, err := r.copyFileOut(ctx, line)
 		if err != nil {
 			return codeexecutor.OutputManifest{}, err
@@ -877,13 +987,24 @@ func (r *workspaceRuntime) CollectOutputs(
 			data = data[:maxFileBytes]
 			mf.LimitsHit = true
 		}
+		if int64(len(data)) > left {
+			data = data[:left]
+			mf.LimitsHit = true
+		}
+		truncated := sizeBytes > int64(len(data))
+		if truncated && spec.Save {
+			rel := strings.TrimPrefix(line, ws.Path+"/")
+			return codeexecutor.OutputManifest{}, fmt.Errorf(
+				"cannot save truncated output file: %s",
+				rel,
+			)
+		}
 		left -= int64(len(data))
-		rel := strings.TrimPrefix(line, ws.Path+"/")
 		ref := codeexecutor.FileRef{
 			Name:      rel,
 			MIMEType:  mime,
 			SizeBytes: sizeBytes,
-			Truncated: sizeBytes > int64(len(data)),
+			Truncated: truncated,
 		}
 		if spec.Inline {
 			ref.Content = string(data)
@@ -949,11 +1070,23 @@ func (r *workspaceRuntime) copyBytesTo(
 }
 
 func inputBase(from string) string {
-	i := strings.LastIndex(from, "/")
-	if i >= 0 && i+1 < len(from) {
-		return from[i+1:]
+	s := strings.TrimSpace(from)
+	if strings.HasPrefix(s, inputSchemeArtifact) {
+		rest := strings.TrimPrefix(s, inputSchemeArtifact)
+		name, _, err := codeexecutor.ParseArtifactRef(rest)
+		if err == nil {
+			base := path.Base(strings.TrimSpace(name))
+			if base != "." && base != "/" && base != ".." && base != "" {
+				return base
+			}
+		}
 	}
-	return from
+
+	i := strings.LastIndex(s, "/")
+	if i >= 0 && i+1 < len(s) {
+		return s[i+1:]
+	}
+	return s
 }
 
 // ExecuteInline writes code blocks and runs them.
@@ -1023,12 +1156,30 @@ func (r *workspaceRuntime) execCmd(
 	argv []string,
 	timeout time.Duration,
 ) (string, string, int, bool, error) {
+	return r.execCmdWithStdin(ctx, argv, timeout, "", nil)
+}
+
+// execCmdWithStdin runs argv in the container. execEnv, when
+// non-nil, is passed to ContainerExecCreate so docker overrides the
+// named keys on the exec process via ReplaceOrAppendEnvValues; a nil
+// execEnv preserves the historical behaviour of inheriting the
+// container environment verbatim. Only the CleanEnv RunProgram path
+// supplies execEnv (see cleanWrapperEnv).
+func (r *workspaceRuntime) execCmdWithStdin(
+	ctx context.Context,
+	argv []string,
+	timeout time.Duration,
+	stdin string,
+	execEnv []string,
+) (string, string, int, bool, error) {
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ec := tcontainer.ExecOptions{
 		Cmd:          argv,
+		Env:          execEnv,
 		AttachStdout: true,
 		AttachStderr: true,
+		AttachStdin:  stdin != "",
 	}
 	ex, err := r.ce.client.ContainerExecCreate(
 		tctx, r.ce.container.ID, ec,
@@ -1043,8 +1194,26 @@ func (r *workspaceRuntime) execCmd(
 		return "", "", 0, false, err
 	}
 	defer hj.Close()
+
+	writeDone := make(chan error, 1)
+	if stdin != "" {
+		go func() {
+			_, err := io.WriteString(hj.Conn, stdin)
+			if closeErr := hj.CloseWrite(); err == nil &&
+				closeErr != nil {
+				err = closeErr
+			}
+			writeDone <- err
+		}()
+	}
+
 	var stdout, stderr bytes.Buffer
 	_, err = stdcopy.StdCopy(&stdout, &stderr, hj.Reader)
+	if stdin != "" {
+		if writeErr := <-writeDone; err == nil && writeErr != nil {
+			err = writeErr
+		}
+	}
 	if err != nil {
 		return "", "", 0, false, err
 	}
@@ -1076,6 +1245,62 @@ func shellQuote(s string) string {
 	}
 	q := strings.ReplaceAll(s, "'", "'\\''")
 	return "'" + q + "'"
+}
+
+// programShellArgv selects the process argv used to run a program.
+//
+// In CleanEnv (policy) mode the outer bash is itself launched
+// through `env -i PATH=<minimal>`, so it starts from an empty
+// environment. This is required - not merely belt-and-suspenders -
+// because `docker exec` hands the outer shell the container process
+// environment, and a non-interactive bash sources $BASH_ENV (and is
+// subject to $LD_PRELOAD on its own process) *before* it runs the
+// command line. --noprofile / --norc only suppress profile and rc
+// files, not BASH_ENV, so without the `env -i` wrapper a
+// container-supplied BASH_ENV / ENV / LD_PRELOAD would execute or
+// hijack at shell start-up, ahead of the inner `env -i ...` that
+// isolates the command. PATH is set so the shell can still resolve
+// mkdir / cd.
+//
+// The wrapper is invoked by its trusted absolute path
+// (/usr/bin/env) rather than the bare name "env", so docker's argv
+// resolution does not depend on the inherited container PATH. The
+// `env` process itself is further constrained by the exec
+// environment built in cleanWrapperEnv (see RunProgram), which
+// blanks the dynamic-loader hooks that would otherwise execute code
+// inside the wrapper before its `env -i` runs.
+//
+// Without CleanEnv the historical login shell (-lc) and inherited
+// environment are preserved for non-policy callers.
+func programShellArgv(clean bool, cmdline string) []string {
+	if clean {
+		return []string{
+			"/usr/bin/env", "-i", "PATH=" + minimalCleanPATH,
+			"/bin/bash", "--noprofile", "--norc", "-c", cmdline,
+		}
+	}
+	return []string{"/bin/bash", "-lc", cmdline}
+}
+
+// cleanWrapperEnv is the environment handed to ContainerExecCreate
+// for a CleanEnv spawn. `docker exec` builds the exec process
+// environment as ReplaceOrAppendEnvValues(containerEnv, execEnv), so
+// every key listed here is overridden in place (or appended) on the
+// outer `/usr/bin/env` wrapper process. PATH is pinned to the
+// minimal search path and the glibc dynamic-loader hooks are blanked
+// so a container-level LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT cannot
+// inject code into the wrapper at start-up, before its `env -i`
+// clears the environment for the shell. ReplaceOrAppendEnvValues
+// cannot delete container variables this list does not name, but the
+// loader hooks are the only ones that run code at process start-up;
+// everything else is cleared by the following `env -i`.
+func cleanWrapperEnv() []string {
+	return []string{
+		"PATH=" + minimalCleanPATH,
+		"LD_PRELOAD=",
+		"LD_LIBRARY_PATH=",
+		"LD_AUDIT=",
+	}
 }
 
 func tarFromFiles(files []codeexecutor.PutFile) (io.ReadCloser, error) {

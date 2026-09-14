@@ -10,10 +10,30 @@
 package llmagent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"trpc.group/trpc-go/trpc-agent-go/agent"
+	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/session"
+	"trpc.group/trpc-go/trpc-agent-go/skill"
+	"trpc.group/trpc-go/trpc-agent-go/tool"
+	toolskill "trpc.group/trpc-go/trpc-agent-go/tool/skill"
+	toolworkspaceexec "trpc.group/trpc-go/trpc-agent-go/tool/workspaceexec"
 )
+
+type stubSkillStager struct{}
+
+func (stubSkillStager) StageSkill(
+	_ context.Context,
+	_ toolskill.SkillStageRequest,
+) (toolskill.SkillStageResult, error) {
+	return toolskill.SkillStageResult{}, nil
+}
 
 func TestWithChannelBufferSize(t *testing.T) {
 	tests := []struct {
@@ -52,6 +72,90 @@ func TestWithChannelBufferSize(t *testing.T) {
 			require.Equal(t, tt.wantBufSize, options.ChannelBufferSize)
 		})
 	}
+}
+
+func TestWithSyncSummaryIntraRun(t *testing.T) {
+	opts := &Options{}
+	WithSyncSummaryIntraRun(true)(opts)
+	require.True(t, opts.SyncSummaryIntraRun)
+
+	WithSyncSummaryIntraRun(false)(opts)
+	require.False(t, opts.SyncSummaryIntraRun)
+}
+
+func TestWithSessionSummaryInjectionMode(t *testing.T) {
+	opts := &Options{}
+	// Default should be zero value (empty string, treated as system).
+	require.Equal(t, processor.SessionSummaryInjectionMode(""), opts.SessionSummaryInjectionMode)
+
+	WithSessionSummaryInjectionMode(SessionSummaryInjectionUser)(opts)
+	require.Equal(t, processor.SessionSummaryInjectionUser, opts.SessionSummaryInjectionMode)
+
+	WithSessionSummaryInjectionMode(SessionSummaryInjectionSystem)(opts)
+	require.Equal(t, processor.SessionSummaryInjectionSystem, opts.SessionSummaryInjectionMode)
+}
+
+func TestWithContextCompactionOptions(t *testing.T) {
+	opts := &Options{}
+
+	WithEnableContextCompaction(true)(opts)
+	require.True(t, opts.EnableContextCompaction)
+
+	WithContextCompactionThresholdRatio(0.8)(opts)
+	require.Equal(t, 0.8, opts.ContextCompactionThresholdRatio)
+	WithContextCompactionThresholdRatio(0)(opts)
+	require.Equal(t, 0.8, opts.ContextCompactionThresholdRatio)
+
+	WithContextCompactionToolResultMaxTokens(2048)(opts)
+	require.Equal(t, 2048, opts.ContextCompactionToolResultMaxTokens)
+	WithContextCompactionToolResultMaxTokens(-1)(opts)
+	require.Equal(t, 2048, opts.ContextCompactionToolResultMaxTokens)
+
+	WithContextCompactionKeepRecentRequests(3)(opts)
+	require.Equal(t, 3, opts.ContextCompactionKeepRecentRequests)
+	WithContextCompactionKeepRecentRequests(-1)(opts)
+	require.Equal(t, 3, opts.ContextCompactionKeepRecentRequests)
+
+	WithContextCompactionOversizedToolResultMaxTokens(4096)(opts)
+	require.Equal(t, 4096, opts.ContextCompactionOversizedToolResultMaxTokens)
+	WithContextCompactionOversizedToolResultMaxTokens(-1)(opts)
+	require.Equal(t, 4096, opts.ContextCompactionOversizedToolResultMaxTokens)
+
+	counter := model.NewSimpleTokenCounter(model.WithApproxRunesPerToken(1))
+	WithContextCompactionTokenCounter(counter)(opts)
+	require.Same(t, counter, opts.ContextCompactionTokenCounter)
+	WithContextCompactionTokenCounter(nil)(opts)
+	require.Same(t, counter, opts.ContextCompactionTokenCounter)
+}
+
+func TestWithToolResultCompactionConfig(t *testing.T) {
+	opts := &Options{}
+	cfg := &ToolResultCompactionConfig{
+		ForceCleanToolNames: []string{"shell", "grep"},
+		KeepToolNames:       []string{"session_load"},
+		SkipRecentFunc:      func([]event.Event) int { return 2 },
+	}
+
+	WithToolResultCompactionConfig(cfg)(opts)
+	require.NotNil(t, opts.ToolResultCompactionConfig)
+	require.Equal(t, []string{"shell", "grep"},
+		opts.ToolResultCompactionConfig.ForceCleanToolNames)
+	require.Equal(t, []string{"session_load"},
+		opts.ToolResultCompactionConfig.KeepToolNames)
+	require.Equal(t, 2,
+		opts.ToolResultCompactionConfig.SkipRecentFunc(nil))
+
+	cfg.ForceCleanToolNames[0] = "changed"
+	cfg.KeepToolNames[0] = "changed"
+	require.Equal(t, []string{"shell", "grep"},
+		opts.ToolResultCompactionConfig.ForceCleanToolNames)
+	require.Equal(t, []string{"session_load"},
+		opts.ToolResultCompactionConfig.KeepToolNames)
+	require.Equal(t, 2,
+		opts.ToolResultCompactionConfig.SkipRecentFunc(nil))
+
+	WithToolResultCompactionConfig(nil)(opts)
+	require.NotNil(t, opts.ToolResultCompactionConfig)
 }
 
 func TestWithMessageFilterMode(t *testing.T) {
@@ -160,6 +264,44 @@ func TestWithSkillLoadMode(t *testing.T) {
 	require.Equal(t, SkillLoadModeSession, b.option.SkillLoadMode)
 }
 
+func TestWithMaxLoadedSkills(t *testing.T) {
+	const (
+		agentName = "test-agent"
+		maxSkills = 3
+	)
+
+	a := New(agentName)
+	require.Equal(t, 0, a.option.MaxLoadedSkills)
+
+	b := New(agentName, WithMaxLoadedSkills(maxSkills))
+	require.Equal(t, maxSkills, b.option.MaxLoadedSkills)
+
+	c := New(agentName, WithMaxLoadedSkills(0))
+	require.Equal(t, 0, c.option.MaxLoadedSkills)
+}
+
+func TestWithMaxOverviewSkills(t *testing.T) {
+	const (
+		agentName = "test-agent"
+		maxSkills = 8
+	)
+
+	a := New(agentName)
+	require.Equal(t, 0, a.option.MaxOverviewSkills,
+		"default must be 0 (no cap) so existing callers see no behavior change")
+
+	b := New(agentName, WithMaxOverviewSkills(maxSkills))
+	require.Equal(t, maxSkills, b.option.MaxOverviewSkills)
+
+	c := New(agentName, WithMaxOverviewSkills(0))
+	require.Equal(t, 0, c.option.MaxOverviewSkills,
+		"explicit 0 must remain a no-op")
+
+	d := New(agentName, WithMaxOverviewSkills(-1))
+	require.Equal(t, -1, d.option.MaxOverviewSkills,
+		"negative values are stored as-is; processor treats them as no-cap")
+}
+
 func TestWithSkillsLoadedContentInToolResults(t *testing.T) {
 	a := New("test-agent")
 	require.False(t, a.option.SkillsLoadedContentInToolResults)
@@ -168,11 +310,214 @@ func TestWithSkillsLoadedContentInToolResults(t *testing.T) {
 	require.True(t, b.option.SkillsLoadedContentInToolResults)
 }
 
+func TestWithSkillsDirectoryHints(t *testing.T) {
+	a := New("test-agent")
+	require.False(t, a.option.skillsDirectoryHints)
+
+	b := New("test-agent", WithSkillsDirectoryHints(true))
+	require.True(t, b.option.skillsDirectoryHints)
+}
+
+func TestWithSkillsFilePathHints(t *testing.T) {
+	a := New("test-agent")
+	require.False(t, a.option.skillsFilePathHints)
+
+	b := New("test-agent", WithSkillsFilePathHints(true))
+	require.True(t, b.option.skillsFilePathHints)
+}
+
+func TestWithSkillLoadToolDescription(t *testing.T) {
+	a := New("test-agent")
+	require.Nil(t, a.option.skillLoadToolDescription)
+
+	const description = "Load the matching skill before answering."
+
+	b := New(
+		"test-agent",
+		WithSkillLoadToolDescription(description),
+	)
+	require.NotNil(t, b.option.skillLoadToolDescription)
+	require.Equal(t, description, *b.option.skillLoadToolDescription)
+}
+
+func TestWithWorkspaceExecSurfaceEnabled(t *testing.T) {
+	a := New("test-agent")
+	require.Nil(t, a.option.workspaceExecSurfaceEnabled)
+	require.True(t, workspaceExecSurfaceEnabled(&a.option))
+
+	b := New(
+		"test-agent",
+		WithWorkspaceExecSurfaceEnabled(false),
+	)
+	require.NotNil(t, b.option.workspaceExecSurfaceEnabled)
+	require.False(t, *b.option.workspaceExecSurfaceEnabled)
+}
+
+func TestWithWorkspaceExecOutputLimits(t *testing.T) {
+	limits := toolworkspaceexec.OutputLimits{MaxOutputBytes: 1234}
+	opts := &Options{}
+	WithWorkspaceExecOutputLimits(limits)(opts)
+	require.Equal(t, limits, opts.workspaceExecOutputLimits)
+}
+
+func TestWithSkillsCapabilityGuidance(t *testing.T) {
+	a := New("test-agent")
+	require.Nil(t, a.option.skillsCapabilityGuidance)
+
+	b := New(
+		"test-agent",
+		WithSkillsCapabilityGuidance("Use directory bundles."),
+	)
+	require.NotNil(t, b.option.skillsCapabilityGuidance)
+	require.Equal(
+		t,
+		"Use directory bundles.",
+		*b.option.skillsCapabilityGuidance,
+	)
+}
+
+func TestWithSkillsProtocolGuidance(t *testing.T) {
+	a := New("test-agent")
+	require.Nil(t, a.option.skillsProtocolGuidance)
+
+	b := New(
+		"test-agent",
+		WithSkillsProtocolGuidance("Always load SKILL.md first."),
+	)
+	require.NotNil(t, b.option.skillsProtocolGuidance)
+	require.Equal(
+		t,
+		"Always load SKILL.md first.",
+		*b.option.skillsProtocolGuidance,
+	)
+}
+
+func TestWithSkillFilter(t *testing.T) {
+	a := New("test-agent")
+	require.Nil(t, a.option.skillFilter)
+
+	filter := func(context.Context, skill.Summary) bool { return true }
+	b := New("test-agent", WithSkillFilter(filter))
+	require.NotNil(t, b.option.skillFilter)
+}
+
+func TestWithSkipSkillsFallbackOnSessionSummary(t *testing.T) {
+	a := New("test-agent")
+	require.True(t, a.option.SkipSkillsFallbackOnSessionSummary)
+
+	b := New(
+		"test-agent",
+		WithSkipSkillsFallbackOnSessionSummary(false),
+	)
+	require.False(t, b.option.SkipSkillsFallbackOnSessionSummary)
+}
+
+func TestNew_DefaultGenerationConfigKeepsLegacyNonStreaming(t *testing.T) {
+	a := New("test-agent")
+	require.False(t, a.genConfig.Stream)
+}
+
+func TestWithModelSelector(t *testing.T) {
+	selector := func(ctx context.Context, inv *agent.Invocation) (model.Model, error) {
+		return inv.Model, nil
+	}
+	a := New("test-agent", WithModelSelector(selector))
+	require.NotNil(t, a.modelSelector)
+	expected := newDummyModel()
+	got, err := a.modelSelector(context.Background(), &agent.Invocation{
+		Model: expected,
+	})
+	require.NoError(t, err)
+	require.Same(t, expected, got)
+}
+
+func TestLLMAgent_Run_DefaultGenerationConfigUsesPublicStreamingBehavior(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	runAndCapture := func(
+		t *testing.T,
+		runOptions ...agent.RunOption,
+	) *model.Request {
+		t.Helper()
+
+		mdl := &captureModel{}
+		agt := New("test-agent", WithModel(mdl))
+
+		invOpts := []agent.InvocationOptions{
+			agent.WithInvocationMessage(model.NewUserMessage("hi")),
+			agent.WithInvocationSession(&session.Session{}),
+		}
+		if len(runOptions) > 0 {
+			invOpts = append(
+				invOpts,
+				agent.WithInvocationRunOptions(
+					agent.NewRunOptions(runOptions...),
+				),
+			)
+		}
+		inv := agent.NewInvocation(invOpts...)
+
+		ch, err := agt.Run(context.Background(), inv)
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		for evt := range ch {
+			if evt != nil && evt.RequiresCompletion {
+				key := agent.GetAppendEventNoticeKey(evt.ID)
+				_ = inv.AddNoticeChannel(ctx, key)
+				_ = inv.NotifyCompletion(ctx, key)
+			}
+		}
+
+		require.NotNil(t, mdl.got)
+		return mdl.got
+	}
+
+	t.Run("default is non-streaming", func(t *testing.T) {
+		req := runAndCapture(t)
+		require.False(t, req.GenerationConfig.Stream)
+	})
+
+	t.Run("per-run override enables streaming", func(t *testing.T) {
+		req := runAndCapture(t, agent.WithStream(true))
+		require.True(t, req.GenerationConfig.Stream)
+	})
+}
+
+func TestWithGenerationConfig_ExplicitFalseDisablesStreaming(
+	t *testing.T,
+) {
+	a := New(
+		"test-agent",
+		WithGenerationConfig(model.GenerationConfig{Stream: false}),
+	)
+	require.False(t, a.genConfig.Stream)
+}
+
+func TestBuildRequestProcessors_DefaultGenerationConfigUsesZeroValue(
+	t *testing.T,
+) {
+	procs := buildRequestProcessors("test-agent", &Options{})
+	var basicProc *processor.BasicRequestProcessor
+	for _, proc := range procs {
+		if candidate, ok := proc.(*processor.BasicRequestProcessor); ok {
+			basicProc = candidate
+			break
+		}
+	}
+	require.NotNil(t, basicProc)
+	require.False(t, basicProc.GenerationConfig.Stream)
+}
+
 func TestWithMaxLimits_OnOptions(t *testing.T) {
 	opts := &Options{}
 
 	WithMaxLLMCalls(3)(opts)
 	WithMaxToolIterations(4)(opts)
+	WithLLMCallLimitFinalization("")(opts)
+	WithToolIterationLimitFinalization("finish with available results")(opts)
 
 	if opts.MaxLLMCalls != 3 {
 		t.Fatalf("expected MaxLLMCalls=3, got %d", opts.MaxLLMCalls)
@@ -180,6 +525,30 @@ func TestWithMaxLimits_OnOptions(t *testing.T) {
 	if opts.MaxToolIterations != 4 {
 		t.Fatalf("expected MaxToolIterations=4, got %d", opts.MaxToolIterations)
 	}
+	require.NotNil(t, opts.llmCallLimitFinalizationInstruction)
+	require.Empty(t, *opts.llmCallLimitFinalizationInstruction)
+	require.NotNil(t, opts.toolIterationLimitFinalizationInstruction)
+	require.Equal(
+		t,
+		"finish with available results",
+		*opts.toolIterationLimitFinalizationInstruction,
+	)
+}
+
+func TestWithToolCallRetryPolicy_OnOptions(t *testing.T) {
+	opts := &Options{}
+	policy := &tool.RetryPolicy{MaxAttempts: 2}
+	WithToolCallRetryPolicy(policy)(opts)
+	require.Same(t, policy, opts.ToolCallRetryPolicy)
+}
+
+func TestWithToolResultAttachmentBudget_OnOptionsAndAgent(t *testing.T) {
+	opts := &Options{}
+	WithToolResultAttachmentBudget(3)(opts)
+	require.Equal(t, 3, opts.ToolResultAttachmentBudget)
+
+	a := New("budget-agent", WithToolResultAttachmentBudget(3))
+	require.Equal(t, 3, a.option.ToolResultAttachmentBudget)
 }
 
 func TestWithPreloadMemory(t *testing.T) {
@@ -199,12 +568,12 @@ func TestWithPreloadMemory(t *testing.T) {
 			expectedLimit: -1,
 		},
 		{
-			name:          "load specific number",
+			name:          "use adaptive preload budget",
 			limit:         5,
 			expectedLimit: 5,
 		},
 		{
-			name:          "load large number",
+			name:          "use large adaptive preload budget",
 			limit:         100,
 			expectedLimit: 100,
 		},
@@ -218,6 +587,86 @@ func TestWithPreloadMemory(t *testing.T) {
 			require.Equal(t, tt.expectedLimit, opts.PreloadMemory)
 		})
 	}
+}
+
+func TestWithPreloadMemoryInjectionMode(t *testing.T) {
+	opts := &Options{}
+	WithPreloadMemoryInjectionMode(PreloadMemoryInjectionUser)(opts)
+	require.Equal(t, PreloadMemoryInjectionUser, opts.PreloadMemoryInjectionMode)
+
+	WithPreloadMemoryInjectionMode(PreloadMemoryInjectionSystem)(opts)
+	require.Equal(t, PreloadMemoryInjectionSystem, opts.PreloadMemoryInjectionMode)
+
+	WithPreloadMemoryInjectionMode(processor.PreloadMemoryInjectionMode("invalid"))(opts)
+	require.Equal(t, PreloadMemoryInjectionSystem, opts.PreloadMemoryInjectionMode)
+}
+
+func TestWithPreloadMemoryPlaybook(t *testing.T) {
+	opts := &Options{}
+	WithPreloadMemoryPlaybook("custom playbook")(opts)
+	require.Equal(t, "custom playbook", opts.PreloadMemoryPlaybook)
+
+	WithPreloadMemoryPlaybook("")(opts)
+	require.Empty(t, opts.PreloadMemoryPlaybook)
+}
+
+func TestWithPreloadSessionRecall(t *testing.T) {
+	opts := &Options{}
+	WithPreloadSessionRecall(6)(opts)
+	require.Equal(t, 6, opts.PreloadSessionRecall)
+
+	WithPreloadSessionRecall(0)(opts)
+	require.Equal(t, 0, opts.PreloadSessionRecall)
+}
+
+func TestWithPreloadSessionRecallInjectionMode(t *testing.T) {
+	opts := &Options{}
+	WithPreloadSessionRecallInjectionMode(PreloadSessionRecallInjectionUser)(opts)
+	require.Equal(
+		t,
+		PreloadSessionRecallInjectionUser,
+		opts.PreloadSessionRecallInjectionMode,
+	)
+
+	WithPreloadSessionRecallInjectionMode(PreloadSessionRecallInjectionSystem)(opts)
+	require.Equal(
+		t,
+		PreloadSessionRecallInjectionSystem,
+		opts.PreloadSessionRecallInjectionMode,
+	)
+
+	WithPreloadSessionRecallInjectionMode(
+		processor.PreloadSessionRecallInjectionMode("invalid"),
+	)(opts)
+	require.Equal(
+		t,
+		PreloadSessionRecallInjectionSystem,
+		opts.PreloadSessionRecallInjectionMode,
+	)
+}
+
+func TestWithPreloadSessionRecallMinScore(t *testing.T) {
+	opts := &Options{}
+	WithPreloadSessionRecallMinScore(0.42)(opts)
+	require.Equal(t, 0.42, opts.PreloadSessionRecallMinScore)
+}
+
+func TestWithPreloadSessionRecallSearchMode(t *testing.T) {
+	opts := &Options{}
+	WithPreloadSessionRecallSearchMode(session.SearchModeDense)(opts)
+	require.Equal(t, session.SearchModeDense, opts.PreloadSessionRecallSearchMode)
+
+	WithPreloadSessionRecallSearchMode(session.SearchMode("invalid"))(opts)
+	require.Equal(t, session.SearchModeHybrid, opts.PreloadSessionRecallSearchMode)
+}
+
+func TestWithEnableOnDemandSession(t *testing.T) {
+	opts := &Options{}
+	WithEnableOnDemandSession(true)(opts)
+	require.True(t, opts.EnableOnDemandSession)
+
+	WithEnableOnDemandSession(false)(opts)
+	require.False(t, opts.EnableOnDemandSession)
 }
 
 func TestWithSkillRunAllowedCommands_CopiesSlice(t *testing.T) {
@@ -236,6 +685,88 @@ func TestWithSkillRunDeniedCommands_CopiesSlice(t *testing.T) {
 
 	in[0] = "rm"
 	require.Equal(t, []string{"echo", "ls"}, opts.skillRunDeniedCommands)
+}
+
+func TestWithWorkspaceExecAllowedCommands_CopiesSlice(t *testing.T) {
+	in := []string{"echo", "ls"}
+	opts := &Options{}
+	WithWorkspaceExecAllowedCommands(in...)(opts)
+
+	in[0] = "rm"
+	require.Equal(t,
+		[]string{"echo", "ls"},
+		opts.workspaceExecAllowedCommands,
+	)
+}
+
+func TestWithWorkspaceExecDeniedCommands_CopiesSlice(t *testing.T) {
+	in := []string{"curl", "wget"}
+	opts := &Options{}
+	WithWorkspaceExecDeniedCommands(in...)(opts)
+
+	in[0] = "ssh"
+	require.Equal(t,
+		[]string{"curl", "wget"},
+		opts.workspaceExecDeniedCommands,
+	)
+}
+
+func TestWithSkillRunForceSaveArtifacts(t *testing.T) {
+	opts := &Options{}
+	WithSkillRunForceSaveArtifacts(true)(opts)
+	require.True(t, opts.skillRunForceSaveArtifacts)
+
+	WithSkillRunForceSaveArtifacts(false)(opts)
+	require.False(t, opts.skillRunForceSaveArtifacts)
+}
+
+func TestWithSkillRunOutputLimits(t *testing.T) {
+	opts := &Options{}
+	limits := toolskill.RunOutputLimits{
+		StdoutStderrBytes:  128,
+		PrimaryOutputBytes: 256,
+	}
+	WithSkillRunOutputLimits(limits)(opts)
+	require.Equal(t, limits, opts.skillRunOutputLimits)
+}
+
+func TestWithSkillRunRequireSkillLoaded(t *testing.T) {
+	opts := &Options{}
+	WithSkillRunRequireSkillLoaded(true)(opts)
+	require.True(t, opts.skillRunRequireSkillLoaded)
+
+	WithSkillRunRequireSkillLoaded(false)(opts)
+	require.False(t, opts.skillRunRequireSkillLoaded)
+}
+
+func TestWithSkillRunStager(t *testing.T) {
+	opts := &Options{}
+	stager := stubSkillStager{}
+	WithSkillRunStager(stager)(opts)
+	require.Equal(t, stager, opts.skillRunStager)
+}
+
+func TestWithSkillToolProfile(t *testing.T) {
+	opts := &Options{}
+	WithSkillToolProfile(SkillToolProfileKnowledgeOnly)(opts)
+	require.Equal(t, "knowledge_only", opts.skillToolProfile)
+
+	WithSkillToolProfile(SkillToolProfileFull)(opts)
+	require.Equal(t, "full", opts.skillToolProfile)
+}
+
+func TestWithAllowedSkillTools(t *testing.T) {
+	opts := &Options{}
+	WithAllowedSkillTools(SkillToolLoad, SkillToolRun)(opts)
+	require.Equal(
+		t,
+		[]string{"skill_load", "skill_run"},
+		opts.allowedSkillTools,
+	)
+
+	WithAllowedSkillTools()(opts)
+	require.NotNil(t, opts.allowedSkillTools)
+	require.Empty(t, opts.allowedSkillTools)
 }
 
 func TestWithSummaryFormatter(t *testing.T) {
@@ -368,4 +899,52 @@ func TestBuildRequestProcessorsWithSummaryFormatter(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWithEnablePostToolPrompt(t *testing.T) {
+	opts := &Options{}
+	WithEnablePostToolPrompt(false)(opts)
+
+	require.NotNil(t, opts.postToolPromptEnabled)
+	require.False(t, *opts.postToolPromptEnabled)
+
+	opts = &Options{}
+	WithEnablePostToolPrompt(true)(opts)
+
+	require.NotNil(t, opts.postToolPromptEnabled)
+	require.True(t, *opts.postToolPromptEnabled)
+}
+
+func TestWithToolConcurrencyConfigCopiesGroups(t *testing.T) {
+	config := tool.ConcurrencyConfig{
+		MaxConcurrency: 4,
+		Groups: []tool.ConcurrencyGroup{{
+			ToolNames: []string{"search", "fetch"},
+			Limit:     1,
+		}},
+	}
+	option := WithToolConcurrencyConfig(config)
+	config.Groups[0].ToolNames[0] = "changed"
+
+	opts := &Options{}
+	option(opts)
+
+	require.Equal(t, 4, opts.ToolConcurrencyConfig.MaxConcurrency)
+	require.Equal(
+		t,
+		[]string{"search", "fetch"},
+		opts.ToolConcurrencyConfig.Groups[0].ToolNames,
+	)
+	require.Equal(t, 1, opts.ToolConcurrencyConfig.Groups[0].Limit)
+}
+
+func TestWithToolConcurrencyConfigRejectsDuplicateGroups(t *testing.T) {
+	require.Panics(t, func() {
+		WithToolConcurrencyConfig(tool.ConcurrencyConfig{
+			Groups: []tool.ConcurrencyGroup{
+				{ToolNames: []string{"search"}, Limit: 1},
+				{ToolNames: []string{"search"}, Limit: 2},
+			},
+		})
+	})
 }

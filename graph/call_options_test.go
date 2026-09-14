@@ -38,6 +38,7 @@ const (
 	callOptsTestStopA      = "A"
 	callOptsTestStopB      = "B"
 	callOptsTestEffort     = "high"
+	callOptsTestThinkLevel = "low"
 )
 
 func TestWithCallOptions_MergesCustomAgentConfigs(t *testing.T) {
@@ -81,6 +82,21 @@ func TestWithCallOptions_MergesCustomAgentConfigs(t *testing.T) {
 	require.Equal(t, callOptsTestMaxTokens, *patch.MaxTokens)
 }
 
+func TestWithCallOptions_ThinkingLevelOnlyPatchIsPreserved(t *testing.T) {
+	runOpts := agent.RunOptions{}
+	WithCallOptions(
+		WithCallGenerationConfigPatch(model.GenerationConfigPatch{
+			ThinkingLevel: model.StringPtr(callOptsTestThinkLevel),
+		}),
+	)(&runOpts)
+
+	opts := graphCallOptionsFromConfigs(runOpts.CustomAgentConfigs)
+	require.NotNil(t, opts)
+	patch := generationPatchForNode(opts, "")
+	require.NotNil(t, patch.ThinkingLevel)
+	require.Equal(t, callOptsTestThinkLevel, *patch.ThinkingLevel)
+}
+
 func TestMergeGenPatch_AllFields(t *testing.T) {
 	base := model.GenerationConfigPatch{
 		Stop: []string{callOptsTestStopA},
@@ -96,6 +112,7 @@ func TestMergeGenPatch_AllFields(t *testing.T) {
 		ReasoningEffort:  model.StringPtr(callOptsTestEffort),
 		ThinkingEnabled:  model.BoolPtr(true),
 		ThinkingTokens:   model.IntPtr(callOptsTestThinkTok),
+		ThinkingLevel:    model.StringPtr(callOptsTestThinkLevel),
 	}
 	got := mergeGenPatch(base, override)
 	require.NotNil(t, got.MaxTokens)
@@ -117,9 +134,23 @@ func TestMergeGenPatch_AllFields(t *testing.T) {
 	require.True(t, *got.ThinkingEnabled)
 	require.NotNil(t, got.ThinkingTokens)
 	require.Equal(t, callOptsTestThinkTok, *got.ThinkingTokens)
+	require.NotNil(t, got.ThinkingLevel)
+	require.Equal(t, callOptsTestThinkLevel, *got.ThinkingLevel)
 
 	override.Stop[0] = callOptsTestStopA
 	require.Equal(t, []string{callOptsTestStopB}, got.Stop)
+}
+
+func TestMergeGenPatch_ThinkingLevelOnlyIsNotEmpty(t *testing.T) {
+	patch := model.GenerationConfigPatch{
+		ThinkingLevel: model.StringPtr(callOptsTestThinkLevel),
+	}
+
+	require.False(t, isEmptyGenPatch(patch))
+
+	got := mergeGenPatch(model.GenerationConfigPatch{}, patch)
+	require.NotNil(t, got.ThinkingLevel)
+	require.Equal(t, callOptsTestThinkLevel, *got.ThinkingLevel)
 }
 
 func TestGraphCallOptionsFromConfigs_ClonesValueType(t *testing.T) {
@@ -364,6 +395,68 @@ func TestCallOptions_CloneHelpers_EdgeCases(t *testing.T) {
 	require.Equal(t, []string{callOptsTestStopA}, scoped.generation.Stop)
 }
 
+func TestWithCallResumeStateOverrideKeys_EmptyKeysNoOp(t *testing.T) {
+	opts := &callOptions{}
+	WithCallResumeStateOverrideKeys()(opts)
+	require.Nil(t, opts.resumeStateOverrideKeys)
+
+	WithCallResumeStateOverrideKeys("", "root")(opts)
+	require.Len(t, opts.resumeStateOverrideKeys, 1)
+	_, ok := opts.resumeStateOverrideKeys[""]
+	require.False(t, ok)
+	_, ok = opts.resumeStateOverrideKeys["root"]
+	require.True(t, ok)
+}
+
+func TestDesignateNode_EmptyScopedOptions(t *testing.T) {
+	opts := &callOptions{}
+	DesignateNode(callOptsTestNodeChild, nil)(opts)
+
+	child := opts.nodes[callOptsTestNodeChild]
+	require.NotNil(t, child)
+	require.True(t, isEmptyGenPatch(child.generation))
+	require.Nil(t, child.child)
+}
+
+func TestMergeCallNodes_ReturnsNilWhenInputsSkipAllEntries(t *testing.T) {
+	out := mergeCallNodes(nil, map[string]*callNodeOptions{
+		"skip-nil":   nil,
+		"skip-empty": &callNodeOptions{},
+	})
+	require.Nil(t, out)
+}
+
+func TestStringSetHelpers_EdgeCases(t *testing.T) {
+	require.Nil(t, newStringSet())
+	require.Nil(t, newStringSet("", ""))
+
+	created := newStringSet("", "root")
+	require.Len(t, created, 1)
+	_, ok := created[""]
+	require.False(t, ok)
+	_, ok = created["root"]
+	require.True(t, ok)
+
+	require.Nil(t, cloneStringSet(map[string]struct{}{"": struct{}{}}))
+	cloned := cloneStringSet(map[string]struct{}{"": struct{}{}, "root": struct{}{}})
+	require.Len(t, cloned, 1)
+	_, ok = cloned[""]
+	require.False(t, ok)
+	_, ok = cloned["root"]
+	require.True(t, ok)
+
+	require.Nil(t, mergeStringSet(
+		map[string]struct{}{"": struct{}{}},
+		map[string]struct{}{"": struct{}{}},
+	))
+	merged := mergeStringSet(nil, map[string]struct{}{"": struct{}{}, "root": struct{}{}})
+	require.Len(t, merged, 1)
+	_, ok = merged[""]
+	require.False(t, ok)
+	_, ok = merged["root"]
+	require.True(t, ok)
+}
+
 func TestScopeCallOptionsForSubgraph(t *testing.T) {
 	runOpts := agent.RunOptions{}
 	WithCallOptions(
@@ -395,6 +488,31 @@ func TestScopeCallOptionsForSubgraph(t *testing.T) {
 	require.Equal(t, callOptsTestMaxTokens, *patch.MaxTokens)
 	require.NotNil(t, patch.Temperature)
 	require.Equal(t, callOptsTestTempNode, *patch.Temperature)
+}
+
+func TestWithCallResumeStateOverrideKeys_ScopesToSubgraph(t *testing.T) {
+	runOpts := agent.RunOptions{}
+	WithCallOptions(
+		WithCallResumeStateOverrideKeys("root"),
+		DesignateNode(
+			callOptsTestNodeChild,
+			WithCallResumeStateOverrideKeys("child"),
+		),
+	)(&runOpts)
+
+	parent := graphCallOptionsFromConfigs(runOpts.CustomAgentConfigs)
+	require.NotNil(t, parent)
+	_, ok := parent.resumeStateOverrideKeys["root"]
+	require.True(t, ok)
+	_, ok = parent.resumeStateOverrideKeys["child"]
+	require.False(t, ok)
+
+	child := scopeCallOptionsForSubgraph(parent, callOptsTestNodeChild)
+	require.NotNil(t, child)
+	_, ok = child.resumeStateOverrideKeys["root"]
+	require.True(t, ok)
+	_, ok = child.resumeStateOverrideKeys["child"]
+	require.True(t, ok)
 }
 
 func TestCallOptions_AppliedToNestedSubgraph(t *testing.T) {
@@ -440,6 +558,9 @@ func TestCallOptions_AppliedToNestedSubgraph(t *testing.T) {
 			}),
 		),
 	)(&runOpts)
+	agent.WithModelRequestHeaders(map[string]string{
+		"X-Session-ID": "session-1",
+	})(&runOpts)
 
 	initial := State{
 		StateKeyParentAgent: parent,
@@ -457,6 +578,7 @@ func TestCallOptions_AppliedToNestedSubgraph(t *testing.T) {
 	}
 
 	require.NotNil(t, childModel.lastReq)
+	require.Equal(t, "session-1", childModel.lastReq.Headers["X-Session-ID"])
 	gen := childModel.lastReq.GenerationConfig
 	require.NotNil(t, gen.MaxTokens)
 	require.Equal(t, callOptsTestMaxTokens, *gen.MaxTokens)

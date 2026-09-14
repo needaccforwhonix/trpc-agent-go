@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"sort"
 	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/memory"
@@ -97,6 +96,8 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 		opts.extractor,
 		opts.toolCreators,
 		opts.enabledTools,
+		opts.toolExposed,
+		opts.toolHidden,
 		s.cachedTools,
 	)
 
@@ -106,11 +107,12 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 			opts.extractor, opts.enabledTools,
 		)
 		config := imemory.AutoMemoryConfig{
-			Extractor:        opts.extractor,
-			AsyncMemoryNum:   opts.asyncMemoryNum,
-			MemoryQueueSize:  opts.memoryQueueSize,
-			MemoryJobTimeout: opts.memoryJobTimeout,
-			EnabledTools:     opts.enabledTools,
+			Extractor:                opts.extractor,
+			AsyncMemoryNum:           opts.asyncMemoryNum,
+			MemoryQueueSize:          opts.memoryQueueSize,
+			MemoryJobTimeout:         opts.memoryJobTimeout,
+			DisableOnExternalContext: opts.disableAutoMemoryOnExternalContext,
+			EnabledTools:             opts.enabledTools,
 		}
 		s.autoMemoryWorker = imemory.NewAutoMemoryWorker(config, s)
 		s.autoMemoryWorker.Start()
@@ -120,10 +122,14 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 }
 
 // AddMemory adds or updates a memory for a user (idempotent).
-func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryStr string, topics []string) error {
+func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey,
+	memoryStr string, topics []string,
+	opts ...memory.AddOption) error {
 	if err := userKey.CheckUserKey(); err != nil {
 		return err
 	}
+
+	ep := memory.ResolveAddOptions(opts)
 
 	// Enforce memory limit.
 	if s.opts.memoryLimit > 0 {
@@ -147,6 +153,7 @@ func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryS
 		Topics:      topics,
 		LastUpdated: &now,
 	}
+	imemory.ApplyMetadata(mem, ep)
 	entry := &memory.Entry{
 		ID:        imemory.GenerateMemoryID(mem, userKey.AppName, userKey.UserID),
 		AppName:   userKey.AppName,
@@ -161,35 +168,34 @@ func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryS
 		return fmt.Errorf("marshal memory entry failed: %w", err)
 	}
 
-	// Note: memory_data contains the full JSON with topics, so updating memory_data
-	// will also update the topics field.
 	insertQuery := fmt.Sprintf(
 		"INSERT INTO `%s` (app_name, user_id, memory_id, memory_data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "+
-			"ON DUPLICATE KEY UPDATE memory_data = VALUES(memory_data), updated_at = VALUES(updated_at)",
+			"ON DUPLICATE KEY UPDATE memory_data = VALUES(memory_data), "+
+			"updated_at = VALUES(updated_at), deleted_at = NULL",
 		s.tableName,
 	)
 	_, err = s.db.Exec(ctx, insertQuery, userKey.AppName, userKey.UserID, entry.ID, memoryData, now, now)
 	if err != nil {
 		return fmt.Errorf("store memory entry failed: %w", err)
 	}
-
 	return nil
 }
 
 // UpdateMemory updates an existing memory for a user.
-func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key, memoryStr string, topics []string) error {
+func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key,
+	memoryStr string, topics []string,
+	opts ...memory.UpdateOption) error {
 	if err := memoryKey.CheckMemoryKey(); err != nil {
 		return err
 	}
 
-	// Get existing entry.
+	ep := memory.ResolveUpdateOptions(opts)
+
 	selectQuery := fmt.Sprintf(
-		"SELECT memory_data FROM %s WHERE app_name = ? AND user_id = ? AND memory_id = ?",
+		"SELECT memory_data FROM %s WHERE app_name = ? AND user_id = ? AND memory_id = ? "+
+			"AND deleted_at IS NULL",
 		s.tableName,
 	)
-	if s.opts.softDelete {
-		selectQuery += " AND deleted_at IS NULL"
-	}
 	var memoryData []byte
 	err := s.db.QueryRow(ctx, []any{&memoryData}, selectQuery, memoryKey.AppName, memoryKey.UserID, memoryKey.MemoryID)
 	if err != nil {
@@ -203,31 +209,235 @@ func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key, memory
 	if err := json.Unmarshal(memoryData, entry); err != nil {
 		return fmt.Errorf("unmarshal memory entry failed: %w", err)
 	}
+	imemory.NormalizeEntry(entry)
 
 	now := time.Now()
-	entry.Memory.Memory = memoryStr
-	entry.Memory.Topics = topics
-	entry.Memory.LastUpdated = &now
-	entry.UpdatedAt = now
+	newID := imemory.ApplyMemoryUpdate(
+		entry,
+		memoryKey.AppName,
+		memoryKey.UserID,
+		memoryStr,
+		topics,
+		ep,
+		now,
+	)
 
 	updated, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("marshal updated memory entry failed: %w", err)
 	}
 
+	if newID == memoryKey.MemoryID {
+		err = s.updateInPlace(ctx, memoryKey, newID, updated, now)
+	} else {
+		err = s.rotateMemory(ctx, memoryKey, newID, entry, updated, now)
+		if err != nil {
+			return fmt.Errorf("rotate memory entry failed: %w", err)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if result := memory.ResolveUpdateResult(opts); result != nil {
+		result.MemoryID = newID
+	}
+	return nil
+}
+
+// updateInPlace updates a memory entry without changing its ID.
+func (s *Service) updateInPlace(
+	ctx context.Context,
+	memoryKey memory.Key,
+	newID string,
+	updated []byte,
+	now time.Time,
+) error {
 	updateQuery := fmt.Sprintf(
-		"UPDATE %s SET memory_data = ?, updated_at = ? WHERE app_name = ? AND user_id = ? AND memory_id = ?",
+		"UPDATE %s SET memory_id = ?, memory_data = ?, updated_at = ? "+
+			"WHERE app_name = ? AND user_id = ? AND memory_id = ? AND deleted_at IS NULL",
 		s.tableName,
 	)
-	if s.opts.softDelete {
-		updateQuery += " AND deleted_at IS NULL"
-	}
-	_, err = s.db.Exec(ctx, updateQuery, updated, now, memoryKey.AppName, memoryKey.UserID, memoryKey.MemoryID)
+	res, err := s.db.Exec(
+		ctx,
+		updateQuery,
+		newID,
+		updated,
+		now,
+		memoryKey.AppName,
+		memoryKey.UserID,
+		memoryKey.MemoryID,
+	)
 	if err != nil {
 		return fmt.Errorf("update memory entry failed: %w", err)
 	}
-
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update memory entry rows affected failed: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("memory with id %s not found", memoryKey.MemoryID)
+	}
 	return nil
+}
+
+// rotateMemory replaces a memory entry with a new ID in a transaction.
+//
+//nolint:gosec // All interpolated table names are validated by WithTableName.
+func (s *Service) rotateMemory(
+	ctx context.Context,
+	memoryKey memory.Key,
+	newID string,
+	entry *memory.Entry,
+	updated []byte,
+	now time.Time,
+) error {
+	return s.db.Transaction(ctx, func(tx *sql.Tx) error {
+		checkQuery := fmt.Sprintf(
+			"SELECT deleted_at IS NULL, memory_data FROM %s "+
+				"WHERE app_name = ? AND user_id = ? AND memory_id = ? FOR UPDATE",
+			s.tableName,
+		)
+		var (
+			targetActive bool
+			targetData   []byte
+		)
+		err := tx.QueryRowContext(
+			ctx,
+			checkQuery,
+			memoryKey.AppName,
+			memoryKey.UserID,
+			newID,
+		).Scan(&targetActive, &targetData)
+
+		insertTarget := false
+		switch {
+		case err == sql.ErrNoRows:
+			insertTarget = true
+		case err != nil:
+			return fmt.Errorf("check rotated memory target failed: %w", err)
+		case targetActive:
+			return fmt.Errorf("memory with id %s already exists", newID)
+		case s.opts.softDelete:
+			targetEntry := &memory.Entry{}
+			if err := json.Unmarshal(targetData, targetEntry); err != nil {
+				return fmt.Errorf("unmarshal rotated memory target failed: %w", err)
+			}
+			revived := *entry
+			revived.CreatedAt = targetEntry.CreatedAt
+			revivedData, err := json.Marshal(&revived)
+			if err != nil {
+				return fmt.Errorf("marshal rotated memory target failed: %w", err)
+			}
+			updateTargetQuery := fmt.Sprintf(
+				"UPDATE %s SET memory_data = ?, updated_at = ?, deleted_at = NULL "+
+					"WHERE app_name = ? AND user_id = ? AND memory_id = ? "+
+					"AND deleted_at IS NOT NULL",
+				s.tableName,
+			)
+			res, err := tx.ExecContext(
+				ctx,
+				updateTargetQuery,
+				revivedData,
+				entry.UpdatedAt,
+				memoryKey.AppName,
+				memoryKey.UserID,
+				newID,
+			)
+			if err != nil {
+				return fmt.Errorf("revive rotated memory target failed: %w", err)
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("revive rotated memory target rows affected failed: %w", err)
+			}
+			if affected == 0 {
+				return fmt.Errorf("memory with id %s not found", newID)
+			}
+		default:
+			deleteTargetQuery := fmt.Sprintf(
+				"DELETE FROM %s WHERE app_name = ? AND user_id = ? "+
+					"AND memory_id = ? AND deleted_at IS NOT NULL",
+				s.tableName,
+			)
+			res, err := tx.ExecContext(
+				ctx,
+				deleteTargetQuery,
+				memoryKey.AppName,
+				memoryKey.UserID,
+				newID,
+			)
+			if err != nil {
+				return fmt.Errorf("delete rotated memory target failed: %w", err)
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("delete rotated memory target rows affected failed: %w", err)
+			}
+			if affected == 0 {
+				return fmt.Errorf("memory with id %s not found", newID)
+			}
+			insertTarget = true
+		}
+
+		if insertTarget {
+			insertQuery := fmt.Sprintf(
+				"INSERT INTO %s "+
+					"(app_name, user_id, memory_id, memory_data, created_at, updated_at) "+
+					"VALUES (?, ?, ?, ?, ?, ?)",
+				s.tableName,
+			)
+			if _, err := tx.ExecContext(
+				ctx,
+				insertQuery,
+				entry.AppName,
+				entry.UserID,
+				entry.ID,
+				updated,
+				entry.CreatedAt,
+				entry.UpdatedAt,
+			); err != nil {
+				return fmt.Errorf("insert rotated memory target failed: %w", err)
+			}
+		}
+
+		var (
+			removeQuery string
+			removeArgs  []any
+		)
+		if s.opts.softDelete {
+			removeQuery = fmt.Sprintf(
+				"UPDATE %s SET deleted_at = ? "+
+					"WHERE app_name = ? AND user_id = ? AND memory_id = ? "+
+					"AND deleted_at IS NULL",
+				s.tableName,
+			)
+			removeArgs = []any{
+				now,
+				memoryKey.AppName,
+				memoryKey.UserID,
+				memoryKey.MemoryID,
+			}
+		} else {
+			removeQuery = fmt.Sprintf(
+				"DELETE FROM %s WHERE app_name = ? AND user_id = ? AND memory_id = ? "+
+					"AND deleted_at IS NULL",
+				s.tableName,
+			)
+			removeArgs = []any{memoryKey.AppName, memoryKey.UserID, memoryKey.MemoryID}
+		}
+		res, err := tx.ExecContext(ctx, removeQuery, removeArgs...)
+		if err != nil {
+			return fmt.Errorf("remove rotated memory source failed: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("remove rotated memory source rows affected failed: %w", err)
+		}
+		if affected == 0 {
+			return fmt.Errorf("memory with id %s not found", memoryKey.MemoryID)
+		}
+		return nil
+	})
 }
 
 // DeleteMemory deletes a memory for a user (soft delete).
@@ -319,6 +529,7 @@ func (s *Service) ReadMemories(ctx context.Context, userKey memory.UserKey, limi
 		if err := json.Unmarshal(memoryData, e); err != nil {
 			return fmt.Errorf("unmarshal memory entry failed: %w", err)
 		}
+		imemory.NormalizeEntry(e)
 		entries = append(entries, e)
 		return nil
 	}, query, userKey.AppName, userKey.UserID)
@@ -331,12 +542,14 @@ func (s *Service) ReadMemories(ctx context.Context, userKey memory.UserKey, limi
 }
 
 // SearchMemories searches memories for a user.
-func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, query string) ([]*memory.Entry, error) {
+// Results are ranked by a normalized BM25-style keyword score and only
+// the top entries above the minimum threshold are returned.
+func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey,
+	query string, opts ...memory.SearchOption) ([]*memory.Entry, error) {
 	if err := userKey.CheckUserKey(); err != nil {
 		return nil, err
 	}
 
-	// Get all memories for the user.
 	selectQuery := fmt.Sprintf(
 		"SELECT memory_data FROM %s WHERE app_name = ? AND user_id = ?",
 		s.tableName,
@@ -345,7 +558,8 @@ func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, qu
 		selectQuery += " AND deleted_at IS NULL"
 	}
 
-	results := make([]*memory.Entry, 0)
+	entries := make([]*memory.Entry, 0)
+
 	err := s.db.Query(ctx, func(rows *sql.Rows) error {
 		var memoryData []byte
 		if err := rows.Scan(&memoryData); err != nil {
@@ -356,10 +570,8 @@ func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, qu
 		if err := json.Unmarshal(memoryData, e); err != nil {
 			return fmt.Errorf("unmarshal memory entry failed: %w", err)
 		}
-
-		if imemory.MatchMemoryEntry(e, query) {
-			results = append(results, e)
-		}
+		imemory.NormalizeEntry(e)
+		entries = append(entries, e)
 		return nil
 	}, selectQuery, userKey.AppName, userKey.UserID)
 
@@ -367,21 +579,19 @@ func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, qu
 		return nil, fmt.Errorf("search memories failed: %w", err)
 	}
 
-	// Stable sort by updated time desc.
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].UpdatedAt.Equal(results[j].UpdatedAt) {
-			return results[i].CreatedAt.After(results[j].CreatedAt)
-		}
-		return results[i].UpdatedAt.After(results[j].UpdatedAt)
-	})
-
-	return results, nil
+	return imemory.SearchEntries(
+		entries,
+		memory.ResolveSearchOptions(query, opts),
+		s.opts.searchMinScore,
+		s.opts.maxSearchResults,
+	), nil
 }
 
 // Tools returns the list of available memory tools.
-// In auto memory mode (extractor is set), only front-end tools are returned.
-// By default, only Search is enabled; Load can be enabled explicitly.
-// In agentic mode, all enabled tools are returned.
+// In auto memory mode (extractor is set), memory_search is exposed by default,
+// memory_load is exposed once enabled, and other enabled tools remain hidden
+// unless explicitly exposed.
+// Without an extractor, enabled tools are exposed directly.
 // The tools list is pre-computed at service creation time.
 func (s *Service) Tools() []tool.Tool {
 	return slices.Clone(s.precomputedTools)

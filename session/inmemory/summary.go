@@ -20,7 +20,7 @@ import (
 // CreateSessionSummary generates a summary for the session and stores it on the session object.
 // This implementation preserves original events and updates session.Summaries only.
 func (s *SessionService) CreateSessionSummary(ctx context.Context, sess *session.Session, filterKey string, force bool) error {
-	if s.opts.summarizer == nil {
+	if !isummary.HasSummarizer(s.opts.summarizer) {
 		return nil
 	}
 
@@ -32,8 +32,18 @@ func (s *SessionService) CreateSessionSummary(ctx context.Context, sess *session
 	if err := key.CheckSessionKey(); err != nil {
 		return fmt.Errorf("check session key failed: %w", err)
 	}
+	if !isummary.NewSummaryDispatchPolicy(
+		s.opts.summaryFilterAllowlist,
+		s.opts.shouldCascadeFullSessionSummary(),
+	).AllowsFilterKey(filterKey) {
+		return nil
+	}
+
+	ctx, att := isummary.BeginAttempt(ctx, sess, filterKey)
+	defer att.Report()
 
 	updated, err := isummary.SummarizeSession(ctx, s.opts.summarizer, sess, filterKey, force)
+	att.Summarized(updated, err)
 	if err != nil || !updated {
 		return err
 	}
@@ -44,16 +54,17 @@ func (s *SessionService) CreateSessionSummary(ctx context.Context, sess *session
 	sess.SummariesMu.RUnlock()
 
 	if sum == nil {
+		att.Persisted(isummary.PersistNoSummary)
 		return nil
 	}
 
 	// Get app to write summary. Session must exist in storage.
 	app, ok := s.getAppSessions(key.AppName)
 	if !ok {
-		return fmt.Errorf("session not found: %s", key.SessionID)
+		return att.RecordWrite(fmt.Errorf("session not found: %s", key.SessionID))
 	}
 
-	return s.writeSummaryUnderLock(app, key, filterKey, sum)
+	return att.RecordWrite(s.writeSummaryUnderLock(app, key, filterKey, sum))
 }
 
 // writeSummaryUnderLock writes a summary for a filterKey under app lock and refreshes TTL.
@@ -77,8 +88,7 @@ func (s *SessionService) writeSummaryUnderLock(app *appSessions, key session.Key
 		cur.Summaries = make(map[string]*session.Summary)
 	}
 	// Copy the summary to preserve UpdatedAt calculated by isummary.SummarizeSession.
-	sumCopy := *sum
-	cur.Summaries[filterKey] = &sumCopy
+	cur.Summaries[filterKey] = sum.Clone()
 	cur.UpdatedAt = sum.UpdatedAt
 	swt.session = cur
 	swt.expiredAt = calculateExpiredAt(s.opts.sessionTTL)
@@ -105,7 +115,7 @@ func (s *SessionService) GetSessionSummaryText(ctx context.Context, sess *sessio
 
 // EnqueueSummaryJob enqueues a summary job for asynchronous processing.
 func (s *SessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Session, filterKey string, force bool) error {
-	if s.opts.summarizer == nil {
+	if !isummary.HasSummarizer(s.opts.summarizer) {
 		return nil
 	}
 
@@ -122,6 +132,17 @@ func (s *SessionService) EnqueueSummaryJob(ctx context.Context, sess *session.Se
 		return s.asyncWorker.EnqueueJob(ctx, sess, filterKey, force)
 	}
 
-	// Fallback to synchronous processing.
-	return isummary.CreateSessionSummaryWithCascade(ctx, sess, filterKey, force, s.CreateSessionSummary)
+	// Fallback to synchronous processing with the same detached context that
+	// async workers use.
+	return isummary.CreateSessionSummaryWithCascade(
+		isummary.DetachContext(ctx),
+		sess,
+		filterKey,
+		force,
+		isummary.NewSummaryDispatchPolicy(
+			s.opts.summaryFilterAllowlist,
+			s.opts.shouldCascadeFullSessionSummary(),
+		),
+		s.CreateSessionSummary,
+	)
 }

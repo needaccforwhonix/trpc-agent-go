@@ -1,5 +1,7 @@
 # Knowledge Documentation
 
+![Knowledge Chunking Viewer](../../assets/img/knowledge/chunk-viewer.png)
+
 ## Overview
 
 Knowledge is the knowledge management system in the tRPC-Agent-Go framework, providing Retrieval-Augmented Generation (RAG) capabilities for Agents. By integrating vector data, embedding models, and document processing components, the Knowledge system helps Agents access and retrieve relevant knowledge information, providing more accurate and well-grounded responses.
@@ -18,6 +20,7 @@ This pattern provides:
 
 - **Intelligent Retrieval**: Semantic search based on vector similarity
 - **Multi-source Support**: Support for files, directories, URLs, and other knowledge sources
+- **Complex Document Extraction**: Support extracting PDFs, HTML, and other complex formats into Markdown or text before loading
 - **Flexible Storage**: Support for in-memory, PostgreSQL, TcVector, and other storage backends
 - **High-performance Processing**: Concurrent processing and batch document loading
 - **Knowledge Filtering**: Support for static filtering and Agent intelligent filtering via metadata
@@ -173,12 +176,16 @@ knowledge/
 │   ├── transform.go     # Transformer interface definition
 │   ├── charfilter.go    # Character filter (remove specified characters)
 │   └── chardedup.go     # Character deduplicator (merge consecutive duplicate characters)
+├── extractor/            # Content extractors (convert complex formats into markdown/text first)
+│   ├── extractor.go     # Extractor interface definition
+│   └── docling/         # Docling extractor implementation
 ├── document/             # Document processing
 │   ├── document.go      # Document structure definition
 │   └── reader/          # Document readers (supports txt/md/csv/json/docx/pdf, etc.)
 ├── query/                # Query enhancers
 │   ├── query.go         # QueryEnhancer interface definition
-│   └── passthrough.go   # Default passthrough enhancer
+│   ├── passthrough.go   # Default passthrough enhancer
+│   └── llm.go           # LLM query rewriting enhancer
 └── ocr/                  # OCR text recognition
     ├── ocr.go           # Extractor interface definition
     └── tesseract/       # Tesseract OCR implementation (separate go.mod)
@@ -320,11 +327,81 @@ err := kb.Load(ctx,
 > - Adjust `WithSourceConcurrency()` and `WithDocConcurrency()` according to throughput, cost, and rate limits.
 > - Default values are balanced for most scenarios; increase for speed if needed, decrease if rate limiting occurs.
 
+### Batch Embedding
+
+By default each document is embedded with its own request, so loading a source of `N` documents issues `N` embedding requests. `WithEmbeddingBatchSize(B)` groups documents into a single multi-input request, reducing the request count for that source to `ceil(N/B)`:
+
+```go
+err := kb.Load(ctx,
+    knowledge.WithDocConcurrency(4),       // Up to 4 batches in flight
+    knowledge.WithEmbeddingBatchSize(32),  // Up to 32 documents per request
+)
+```
+
+Batching is off by default and only applies when the configured embedder implements `embedder.BatchEmbedder`. The built-in OpenAI-compatible embedder (`knowledge/embedder/openai`) implements it and sends the texts as an input array. When the embedder does not support batching, when no embedder is configured (vector stores that embed remotely), or when source sync is enabled via `WithEnableSourceSync(true)`, loading keeps the unchanged per-document path and logs that the configured batch size was ignored, so an ineffective configuration is visible.
+
+The two options compose: `WithDocConcurrency(n)` bounds the number of concurrent batches, so up to `n * B` documents may be in flight at once.
+
+> **About Correctness and Limits**:
+>
+> - A batch never spans sources, because each source is loaded as an independent unit of work. Loading `k` sources issues the sum of `ceil(Ni/B)` requests over all sources, so splitting the same documents across many small sources reduces the benefit; `k` sources of one document each still issue `k` requests.
+> - A batch is embedded and validated as a whole. If the provider returns the wrong number of vectors, an empty vector, an inconsistent dimension, or a non-finite value, the whole batch fails and none of its documents are written.
+> - A failed batch is not retried as individual requests, so it never silently multiplies the request count. An embedder may still retry the batch as a whole, exactly as it may retry a per-document request, so `N` and `ceil(N/B)` count the requests loading issues rather than the attempts that reach the provider.
+> - If a vector store write fails part-way through a batch, the documents already written are kept and `Load` returns the error, matching the existing non-transactional behavior.
+> - Choose `B` within the provider's per-request limits on input count, total tokens, and payload size. The framework does not split a batch to satisfy those limits.
+> - Each input still receives exactly one vector, matched back to it by response index. Whether a provider returns identical vectors for a text embedded alone and in a batch is a property of that provider, not a framework guarantee.
+> - Batching reduces the number of embedding requests. It does not change the input text or the model, and it does not reduce the number of vector store writes; measure your own workload before assuming an end-to-end throughput gain.
+
+The [batch embedding example](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/features/batch-embedding) loads the same file with and without a batch size and prints how many embedding requests each load issued.
+
+### Load Progress Callback
+
+Use `WithLoadProgressCallback` to register a structured progress callback for driving custom UIs, metrics collection, or other observability integrations without parsing log output:
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/knowledge"
+
+err := kb.Load(ctx,
+    knowledge.WithLoadProgressCallback(func(ctx context.Context, evt knowledge.LoadProgressEvent) {
+        if evt.Done {
+            fmt.Printf("All sources loaded. total: %d docs, elapsed: %s\n",
+                evt.Total, evt.TotalElapsed)
+            return
+        }
+        if evt.Err != nil {
+            fmt.Printf("Source %s failed: %v\n", evt.SourceName, evt.Err)
+            return
+        }
+        fmt.Printf("Source %s: %d/%d docs, ETA: %s\n",
+            evt.SourceName, evt.SourceProcessed, evt.SourceTotal, evt.SourceETA)
+    }),
+)
+```
+
+`LoadProgressEvent` contains the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `SourceNames` | `[]string` | All source names involved in the current Load call |
+| `SourceName` | `string` | Name of the source currently being loaded |
+| `SourceProcessed` | `int` | Number of documents processed so far in this source |
+| `SourceTotal` | `int` | Total number of documents in this source |
+| `SourceElapsed` | `time.Duration` | Time elapsed since this source started loading |
+| `SourceETA` | `time.Duration` | Estimated time remaining for this source |
+| `Total` | `int` | Cumulative documents processed across all sources |
+| `TotalElapsed` | `time.Duration` | Wall-clock time elapsed since the Load call started |
+| `Done` | `bool` | Whether the entire Load operation has finished |
+| `Err` | `error` | Non-nil when a source encounters an error |
+
+> **Note**: When using concurrent loading (`WithSourceConcurrency > 1` or `WithDocConcurrency > 1`), the callback may be invoked from multiple goroutines concurrently. Callers must synchronize any shared state accessed inside the callback.
+
+For a complete example, see [examples/knowledge/basic](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/basic), which demonstrates a multi-line progress bar UI built on top of the progress callback.
+
 ## Evaluation and Comparison
 
 We have conducted comprehensive RAG quality evaluation of tRPC-Agent-Go, LangChain, Agno, and CrewAI using the [RAGAS](https://docs.ragas.io/) framework.
 
-> **Detailed Documentation**: For complete evaluation plan, parameter configuration, and result analysis, please refer to [examples/knowledge/evaluation/README.md](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/evaluation/README.md)
+> **Detailed Documentation**: For complete evaluation plan, parameter configuration, and result analysis, please refer to [knowledge/README.md](https://github.com/trpc-group/trpc-agent-go-benchmark/blob/main/knowledge/README.md)
 
 
 ### Evaluation Plan
@@ -347,14 +424,21 @@ To ensure fair comparison, all four systems use identical configurations:
 | **Vector Store** | PGVector (CrewAI uses ChromaDB) |
 | **Agent Model** | DeepSeek-V3.2 |
 
+### Corpus-Specific Contextual Retrieval Trial
+
+The [contextual retrieval example](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/contextual-retrieval) uses the existing public `source.Source` and `document.Document.EmbeddingText` contracts to compare original and contextualized index text while returning the original chunk content to the Agent.
+
+This is an opt-in, corpus-specific evaluation recipe, not a default Knowledge behavior or a claim of general benefit. Keep the model, embedder, chunking, vector store, retrieval settings, query set, and evaluation protocol identical between variants, and review the example's data-handling and cost notes before sending parent documents to the configured context model.
+
 
 ## More Content
 
 - [Vector Store](vectorstore/index.md) - Configure various vector database backends
 - [Embedder](embedder.md) - Text vectorization model configuration
 - [Reranker](reranker.md) - Retrieval result reranking
+- [Query Enhancer](query-enhancer.md) - Multi-turn query rewriting and enhancement
 - [Document Sources](source.md) - File, directory, URL, and other knowledge source configuration
-- [OCR Text Recognition](ocr.md) - Configure Tesseract OCR for text extraction
+- [OCR Text Recognition](ocr.md) - Configure OCR-based text extraction for images and scanned content
 - [Filters](filter.md) - Basic filters and intelligent filters
 - [Knowledge Base Management](management.md) - Dynamic source management and status monitoring
 - [Common Issues](troubleshooting.md) - Common issues and solutions

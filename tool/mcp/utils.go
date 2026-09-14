@@ -38,6 +38,9 @@ func convertMCPSchemaToSchema(mcpSchema any) *tool.Schema {
 	if descVal, ok := schemaMap["description"].(string); ok {
 		schema.Description = descVal
 	}
+	if patternVal, ok := schemaMap["pattern"].(string); ok {
+		schema.Pattern = patternVal
+	}
 	if propsVal, ok := schemaMap["properties"].(map[string]any); ok {
 		schema.Properties = convertProperties(propsVal)
 	}
@@ -50,8 +53,25 @@ func convertMCPSchemaToSchema(mcpSchema any) *tool.Schema {
 		}
 		schema.Required = required
 	}
+	if refVal, ok := schemaMap["$ref"].(string); ok {
+		schema.Ref = refVal
+	}
+	if defsVal, ok := schemaMap["$defs"].(map[string]any); ok {
+		schema.Defs = convertDefs(defsVal)
+	}
 
 	return schema
+}
+
+// convertDefs converts JSON Schema $defs definitions from map[string]any to map[string]*Schema.
+func convertDefs(defs map[string]any) map[string]*tool.Schema {
+	result := make(map[string]*tool.Schema, len(defs))
+	for name, def := range defs {
+		if defMap, ok := def.(map[string]any); ok {
+			result[name] = convertMCPSchemaToSchema(defMap)
+		}
+	}
+	return result
 }
 
 // convertProperties converts property definitions from map[string]any to map[string]*Schema.
@@ -69,6 +89,9 @@ func convertProperties(props map[string]any) map[string]*tool.Schema {
 			}
 			if descVal, ok := propMap["description"].(string); ok {
 				propSchema.Description = descVal
+			}
+			if patternVal, ok := propMap["pattern"].(string); ok {
+				propSchema.Pattern = patternVal
 			}
 			if defaultVal, exists := propMap["default"]; exists {
 				propSchema.Default = defaultVal
@@ -101,6 +124,12 @@ func convertProperties(props map[string]any) map[string]*tool.Schema {
 			// Handle additionalProperties field.
 			if additionalPropsVal, exists := propMap["additionalProperties"]; exists {
 				propSchema.AdditionalProperties = additionalPropsVal
+			}
+			if refVal, ok := propMap["$ref"].(string); ok {
+				propSchema.Ref = refVal
+			}
+			if defsVal, ok := propMap["$defs"].(map[string]any); ok {
+				propSchema.Defs = convertDefs(defsVal)
 			}
 			result[name] = propSchema
 		}

@@ -161,12 +161,13 @@ type BeforeToolArgs struct {
     ToolCallID   string               // 模型发出的工具调用 ID
     ToolName     string               // 工具名称
     Declaration  *tool.Declaration    // 工具声明元数据
-    Arguments    []byte               // JSON 参数（可修改）
+    Arguments    []byte               // 当前 JSON 参数
 }
 
 type BeforeToolResult struct {
     Context           context.Context  // 可选，用于后续操作的上下文
     CustomResult      any              // 非空时跳过工具执行并返回此结果
+    SkipStateDelta    bool             // 跳过 CustomResult 的 state-delta provider
     ModifiedArguments []byte           // 可选，修改后的参数用于工具执行
 }
 
@@ -174,14 +175,17 @@ type AfterToolArgs struct {
     ToolCallID   string               // 模型发出的工具调用 ID
     ToolName     string               // 工具名称
     Declaration  *tool.Declaration    // 工具声明元数据
-    Arguments    []byte               // 原始 JSON 参数
+    Arguments    []byte               // before-tool 回调后的最终 JSON 参数
     Result       any                  // 工具执行结果（可能为 nil）
     Error        error                // 工具执行过程中发生的错误
 }
 
 type AfterToolResult struct {
-    Context      context.Context  // 可选，用于后续操作的上下文
-    CustomResult any              // 非空时替换原始结果
+    Context             context.Context  // 可选，用于后续操作的上下文
+    CustomResult        any              // 非空时替换原始结果
+    SkipResultFormatter bool             // 对 CustomResult 使用默认 JSON 序列化
+    SkipStateDelta      bool             // 跳过 CustomResult 的 state-delta provider
+    SkipSummarization   bool             // 为 true 时在 tool.response 后结束本轮
 }
 ```
 
@@ -197,9 +201,19 @@ type AfterToolCallbackStructured  func(ctx context.Context, args *tool.AfterTool
 - 结构化参数提供更好的类型安全性和更清晰的意图
 - `BeforeToolResult.ModifiedArguments` 允许修改工具参数
 - `BeforeToolResult.Context` 和 `AfterToolResult.Context` 可在操作之间传递上下文
-- 可通过 `args.Arguments` 直接修改参数
+- 为了让工具执行使用修改后的参数，需要返回 `BeforeToolResult.ModifiedArguments`；
+  只给 `args.Arguments` 重新赋值，只会影响当前回调链中后续读取该字段的逻辑
 - BeforeToolCallbackStructured 返回非空自定义结果时，会跳过工具执行并直接使用该结果
 - `BeforeToolArgs` 和 `AfterToolArgs` 中提供了 `ToolCallID`
+- `AfterToolResult.SkipResultFormatter` 会让非空 `CustomResult` 跳过工具配置的 result
+  formatter，并使用默认 JSON 序列化。适用于替换结果是协议或错误 envelope、而不是工具
+  声明输出类型的正常值时
+- `BeforeToolResult.SkipStateDelta` 和 `AfterToolResult.SkipStateDelta` 会阻止非空
+  `CustomResult` 触发工具的 state-delta provider，适用于替换结果并非工具成功输出的场景
+- `AfterToolResult.SkipSummarization` 允许回调在判断工具结果后，让本轮在
+  `tool.response` 后直接结束
+- `SkipSummarization` 只会跳过额外的总结型 LLM 调用；真正的结束信号仍然是
+  `runner.completion` / `event.IsRunnerCompletion()`
 
 
 ### 回调执行控制
@@ -248,10 +262,20 @@ toolCallbacks := tool.NewCallbacks(
 toolCallbacks := tool.NewCallbacks().
   RegisterBeforeTool(func(ctx context.Context, args *tool.BeforeToolArgs) (*tool.BeforeToolResult, error) {
     if args.Arguments != nil && args.ToolName == "calculator" {
-      // 丰富参数
-      original := string(args.Arguments)
-      enriched := []byte(fmt.Sprintf(`{"original":%s,"ts":%d}`, original, time.Now().Unix()))
-      args.Arguments = enriched
+      // 规范化 operation，同时保留 calculator 的参数结构。
+      var payload map[string]any
+      if err := json.Unmarshal(args.Arguments, &payload); err != nil {
+        return nil, err
+      }
+      if op, ok := payload["operation"].(string); ok {
+        payload["operation"] = strings.ToLower(op)
+      }
+      modifiedJSON, err := json.Marshal(payload)
+      if err != nil {
+        return nil, err
+      }
+      args.Arguments = modifiedJSON
+      return &tool.BeforeToolResult{ModifiedArguments: modifiedJSON}, nil
     }
     return nil, nil
   }).
@@ -267,6 +291,27 @@ toolCallbacks := tool.NewCallbacks().
     return nil, nil
   })
 ```
+
+动态 skip summarization 示例：
+
+```go
+toolCallbacks.RegisterAfterTool(func(ctx context.Context, args *tool.AfterToolArgs) (*tool.AfterToolResult, error) {
+  if args.Error != nil {
+    return nil, nil
+  }
+  out, ok := args.Result.(map[string]any)
+  if ok && out["action"] != nil {
+    return &tool.AfterToolResult{
+      SkipSummarization: true,
+    }, nil
+  }
+  return nil, nil
+})
+```
+
+这会让本轮在工具响应后结束，但不会把 `tool.response` 变成最终
+assistant 响应。若消费侧需要真正的终止标记，仍应持续读取直到
+`runner.completion`。
 
 **使用方式**：创建 callbacks 后，需要在创建 LLM Agent 时通过 `llmagent.WithToolCallbacks()` 选项传入：
 
@@ -561,7 +606,7 @@ translateCallbacks := translator.NewCallbacks().
   })
 ```
 
-TranslateCallbacks 的详细介绍参见 [agui](./agui.md)
+TranslateCallbacks 的详细介绍参见 [agui](./agui/index.md)
 
 ---
 
@@ -752,6 +797,12 @@ toolCallbacks := tool.NewCallbacks().
 用户认证与授权示例（使用 Invocation State 进行权限检查和审计日志）请参考：
 [examples/callbacks/auth](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/callbacks/auth)
 
+注意：`BeforeToolCallback` 只会在“模型实际发起工具调用”时触发。
+如果你把工具结果写入 session 历史，而权限会在同一 session 中发生变化，
+模型可能复用历史答案而不再调用工具，从而绕过工具前回调的鉴权。
+这类场景需要在 Prompt 构建阶段做历史隔离/过滤，参考 Session 文档中的
+「权限变更与历史隔离」章节。
+
 ---
 
 ## 全局回调与链式注册
@@ -814,9 +865,19 @@ toolCallbacks := tool.NewCallbacks().
 toolCallbacks := tool.NewCallbacks().
   RegisterBeforeTool(func(ctx context.Context, args *tool.BeforeToolArgs) (*tool.BeforeToolResult, error) {
     if args.Arguments != nil && args.ToolName == "calculator" {
-      originalArgs := string(args.Arguments)
-      modifiedArgs := fmt.Sprintf(`{"original":%s,"timestamp":"%d"}`, originalArgs, time.Now().Unix())
-      args.Arguments = []byte(modifiedArgs)
+      var payload map[string]any
+      if err := json.Unmarshal(args.Arguments, &payload); err != nil {
+        return nil, err
+      }
+      if op, ok := payload["operation"].(string); ok {
+        payload["operation"] = strings.ToLower(op)
+      }
+      modifiedJSON, err := json.Marshal(payload)
+      if err != nil {
+        return nil, err
+      }
+      args.Arguments = modifiedJSON
+      return &tool.BeforeToolResult{ModifiedArguments: modifiedJSON}, nil
     }
     return nil, nil
   })

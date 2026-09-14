@@ -16,11 +16,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	aguisse "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/eventstream"
 	aguirunner "trpc.group/trpc-go/trpc-agent-go/server/agui/runner"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/service"
 )
@@ -35,6 +37,7 @@ type sse struct {
 	handler                 http.Handler
 	messagesSnapshotEnabled bool
 	cancelEnabled           bool
+	heartbeatInterval       time.Duration
 }
 
 // New creates a new SSE service.
@@ -48,6 +51,7 @@ func New(runner aguirunner.Runner, opt ...service.Option) service.Service {
 		writer:                  aguisse.NewSSEWriter(),
 		messagesSnapshotEnabled: opts.MessagesSnapshotEnabled,
 		cancelEnabled:           opts.CancelEnabled,
+		heartbeatInterval:       opts.HeartbeatInterval,
 	}
 	h := http.NewServeMux()
 	h.HandleFunc(s.path, s.handle)
@@ -113,8 +117,10 @@ func (s *sse) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	eventsCh, err := s.runner.Run(ctx, runAgentInput)
+	runCtx, finishConsuming := eventstream.WithConsumer(ctx)
+	eventsCh, err := s.runner.Run(runCtx, runAgentInput)
 	if err != nil {
+		finishConsuming()
 		log.ErrorfContext(
 			ctx,
 			"agui handle: threadID: %s, runID: %s, run agent: %v",
@@ -129,11 +135,24 @@ func (s *sse) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), status)
 		return
 	}
+	if eventsCh == nil {
+		finishConsuming()
+		const message = "runner returned nil event channel"
+		log.ErrorfContext(
+			ctx,
+			"agui handle: threadID: %s, runID: %s, run agent: %s",
+			runAgentInput.ThreadID,
+			runAgentInput.RunID,
+			message,
+		)
+		http.Error(w, message, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if err := s.handleEvents(ctx, w, eventsCh, true); err != nil {
+	if err := s.handleEvents(ctx, w, eventsCh, true, finishConsuming); err != nil {
 		log.ErrorfContext(
 			ctx,
 			"agui handle: threadID: %s, runID: %s, write event: %v",
@@ -224,7 +243,7 @@ func (s *sse) handleMessagesSnapshot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if err := s.handleEvents(ctx, w, eventsCh, false); err != nil {
+	if err := s.handleEvents(ctx, w, eventsCh, false, nil); err != nil {
 		log.ErrorfContext(
 			ctx,
 			"agui handle messages snapshot: threadID: %s, "+
@@ -242,26 +261,47 @@ func (s *sse) handleEvents(
 	w http.ResponseWriter,
 	events <-chan aguievents.Event,
 	drain bool,
+	finishConsuming func(),
 ) error {
+	var heartbeat <-chan time.Time
+	if s.heartbeatInterval > 0 {
+		ticker := time.NewTicker(s.heartbeatInterval)
+		defer ticker.Stop()
+		heartbeat = ticker.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			if drain {
-				go drainEvents(events)
-			}
+			finishEventConsumption(events, drain, finishConsuming)
 			return nil
+		case <-heartbeat:
+			if err := writeHeartbeat(w); err != nil {
+				finishEventConsumption(events, drain, finishConsuming)
+				return err
+			}
 		case evt, ok := <-events:
 			if !ok {
+				if finishConsuming != nil {
+					finishConsuming()
+				}
 				return nil
 			}
 			if err := s.writer.WriteEvent(ctx, w, evt); err != nil {
-				if drain {
-					go drainEvents(events)
-				}
+				finishEventConsumption(events, drain, finishConsuming)
 				return err
 			}
 		}
 	}
+}
+
+func writeHeartbeat(w http.ResponseWriter) error {
+	if _, err := w.Write([]byte(":\n\n")); err != nil {
+		return err
+	}
+	if flusher, ok := w.(interface{ Flush() }); ok {
+		flusher.Flush()
+	}
+	return nil
 }
 
 // handleCancel cancels a running run identified by the request payload.
@@ -352,4 +392,23 @@ func runAgentInputFromReader(r io.Reader) (*adapter.RunAgentInput, error) {
 func drainEvents(events <-chan aguievents.Event) {
 	for range events {
 	}
+}
+
+func finishEventConsumption(
+	events <-chan aguievents.Event,
+	drain bool,
+	finishConsuming func(),
+) {
+	if !drain {
+		if finishConsuming != nil {
+			finishConsuming()
+		}
+		return
+	}
+	go func() {
+		drainEvents(events)
+		if finishConsuming != nil {
+			finishConsuming()
+		}
+	}()
 }

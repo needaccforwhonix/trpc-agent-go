@@ -11,8 +11,10 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
+	"trpc.group/trpc-go/trpc-agent-go/tool"
 	mcp "trpc.group/trpc-go/trpc-mcp-go"
 )
 
@@ -100,6 +102,82 @@ func TestMCPTool_Declaration(t *testing.T) {
 	}
 }
 
+func TestMCPTool_ToolMetadata(t *testing.T) {
+	testCases := []struct {
+		name        string
+		annotations *mcp.ToolAnnotations
+		want        tool.ToolMetadata
+	}{
+		{
+			name: "nil annotations",
+			want: tool.ToolMetadata{},
+		},
+		{
+			name: "title only annotations",
+			annotations: &mcp.ToolAnnotations{
+				Title: "Human title",
+			},
+			want: tool.ToolMetadata{},
+		},
+		{
+			name: "explicit safety hints",
+			annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    mcp.BoolPtr(true),
+				DestructiveHint: mcp.BoolPtr(true),
+				OpenWorldHint:   mcp.BoolPtr(true),
+			},
+			want: tool.ToolMetadata{
+				ReadOnly:    true,
+				Destructive: true,
+				OpenWorld:   true,
+			},
+		},
+		{
+			name: "partial safety hints",
+			annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint: mcp.BoolPtr(true),
+			},
+			want: tool.ToolMetadata{
+				ReadOnly: true,
+			},
+		},
+		{
+			name: "title and idempotent are ignored",
+			annotations: &mcp.ToolAnnotations{
+				Title:          "Ignored title",
+				IdempotentHint: mcp.BoolPtr(true),
+			},
+			want: tool.ToolMetadata{},
+		},
+		{
+			name: "explicit false stays zero value",
+			annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    mcp.BoolPtr(false),
+				DestructiveHint: mcp.BoolPtr(false),
+				OpenWorldHint:   mcp.BoolPtr(false),
+			},
+			want: tool.ToolMetadata{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mcpTool := newMCPTool(mcp.Tool{
+				Name:        "metadata_tool",
+				Description: "Tool with metadata",
+				Annotations: tc.annotations,
+			}, &mcpSessionManager{})
+
+			if got := mcpTool.ToolMetadata(); got != tc.want {
+				t.Fatalf("expected metadata %+v, got %+v", tc.want, got)
+			}
+			if got := tool.MetadataOf(mcpTool); got != tc.want {
+				t.Fatalf("expected MetadataOf metadata %+v, got %+v", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestMCPTool_Call_InvalidJSON(t *testing.T) {
 	mcpToolData := mcp.Tool{
 		Name:        "test_tool",
@@ -176,5 +254,91 @@ func TestMCPTool_WithSchemas(t *testing.T) {
 	}
 	if decl.Name != "schema_tool" {
 		t.Errorf("expected name 'schema_tool', got %q", decl.Name)
+	}
+}
+
+func TestMCPToolResult_GetMeta(t *testing.T) {
+	// Nil meta
+	result := &mcpToolResult{Meta: nil}
+	if result.GetMeta() != nil {
+		t.Error("expected nil meta")
+	}
+
+	// With meta data
+	result.Meta = map[string]any{"key": "value", "count": 42}
+	meta := result.GetMeta()
+	if meta == nil {
+		t.Fatal("expected non-nil meta")
+	}
+	if meta["key"] != "value" {
+		t.Errorf("expected key='value', got %v", meta["key"])
+	}
+}
+
+func TestMCPToolResult_MarshalJSON(t *testing.T) {
+	// Verify backward compatibility: Meta is not included in JSON
+	result := &mcpToolResult{
+		Content: []mcp.Content{mcp.NewTextContent("hello")},
+		Meta:    map[string]any{"metadata": "ignored"},
+	}
+
+	data, err := result.MarshalJSON()
+	if err != nil {
+		t.Fatalf("MarshalJSON failed: %v", err)
+	}
+
+	// Should match raw Content marshaling
+	expected, _ := json.Marshal([]mcp.Content{mcp.NewTextContent("hello")})
+	if string(data) != string(expected) {
+		t.Errorf("expected %q, got %q", string(expected), string(data))
+	}
+}
+
+func TestMCPToolResult_MarshalJSON_EmptyContentAsArray(t *testing.T) {
+	tests := []struct {
+		name   string
+		result *mcpToolResult
+	}{
+		{name: "nil result", result: nil},
+		{name: "nil content", result: &mcpToolResult{}},
+		{name: "empty content", result: &mcpToolResult{Content: []mcp.Content{}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := tt.result.MarshalJSON()
+			if err != nil {
+				t.Fatalf("MarshalJSON failed: %v", err)
+			}
+			if string(data) != "[]" {
+				t.Fatalf("expected empty JSON array, got %q", string(data))
+			}
+		})
+	}
+}
+
+func TestMCPToolResult_GetCallbackResult(t *testing.T) {
+	expected := []mcp.Content{mcp.NewTextContent("hello")}
+	result := &mcpToolResult{
+		Content: expected,
+		Meta:    map[string]any{"metadata": "ignored"},
+	}
+
+	callbackResult, ok := result.GetCallbackResult().([]mcp.Content)
+	if !ok {
+		t.Fatalf("expected []mcp.Content, got %T", result.GetCallbackResult())
+	}
+	if len(callbackResult) != len(expected) {
+		t.Fatalf("expected %d content item(s), got %d", len(expected), len(callbackResult))
+	}
+}
+
+func TestMCPToolResult_RetryResultError(t *testing.T) {
+	result := &mcpToolResult{IsError: true}
+	if !result.RetryResultError() {
+		t.Fatal("expected RetryResultError to report true")
+	}
+	result.IsError = false
+	if result.RetryResultError() {
+		t.Fatal("expected RetryResultError to report false")
 	}
 }

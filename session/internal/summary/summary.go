@@ -14,22 +14,25 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/event"
-	"trpc.group/trpc-go/trpc-agent-go/internal/util"
+	"trpc.group/trpc-go/trpc-agent-go/internal/summarytrigger"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	isummarycontext "trpc.group/trpc-go/trpc-agent-go/session/internal/summarycontext"
+	isummaryscope "trpc.group/trpc-go/trpc-agent-go/session/internal/summaryscope"
 	"trpc.group/trpc-go/trpc-agent-go/session/summary"
 )
 
 // authorSystem is the system author.
 const authorSystem = "system"
 
-// computeDeltaSince returns events that occurred strictly after the given
-// time and match the filterKey, along with the latest event timestamp among
-// the returned events. When since is zero, all events are considered. When
-// filterKey is empty, all events are considered (no filtering).
+// computeDeltaSince returns events that occurred strictly after the given time
+// and match the filterKey, along with the latest event timestamp among the
+// returned events. When since is zero, all events are considered. When filterKey
+// is empty, all events are considered.
 func computeDeltaSince(sess *session.Session, since time.Time, filterKey string) ([]event.Event, time.Time) {
 	sess.EventMu.RLock()
 	defer sess.EventMu.RUnlock()
@@ -52,6 +55,82 @@ func computeDeltaSince(sess *session.Session, since time.Time, filterKey string)
 	return out, latest
 }
 
+// computeDeltaAfterBoundary returns events after the structural summary
+// boundary. Exact boundaries use event order, while legacy timestamp-only
+// boundaries keep same-timestamp events to avoid dropping uncovered history.
+func computeDeltaAfterBoundary(
+	sess *session.Session,
+	boundary *session.SummaryBoundary,
+	filterKey string,
+) ([]event.Event, *session.SummaryBoundary) {
+	sess.EventMu.RLock()
+	defer sess.EventMu.RUnlock()
+
+	startIndex := deltaStartIndex(sess.Events, boundary)
+	out := make([]event.Event, 0, len(sess.Events))
+	var latest *session.SummaryBoundary
+	for i, e := range sess.Events {
+		if !eventAfterBoundaryIndex(i, e, startIndex, boundary) {
+			continue
+		}
+		if filterKey != "" && !e.Filter(filterKey) {
+			continue
+		}
+		out = append(out, e)
+		latest = laterBoundary(filterKey, latest, e)
+	}
+	return out, latest
+}
+
+func deltaStartIndex(
+	events []event.Event,
+	boundary *session.SummaryBoundary,
+) int {
+	if boundary == nil || boundary.LastEventID == "" {
+		return -1
+	}
+	for i, e := range events {
+		if e.ID == boundary.LastEventID {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+func eventAfterBoundaryIndex(
+	index int,
+	evt event.Event,
+	startIndex int,
+	boundary *session.SummaryBoundary,
+) bool {
+	if startIndex >= 0 {
+		return index >= startIndex
+	}
+	if boundary == nil {
+		return true
+	}
+	cutoff := boundary.CutoffTime()
+	if cutoff.IsZero() {
+		return true
+	}
+	return !evt.Timestamp.Before(cutoff)
+}
+
+func laterBoundary(
+	filterKey string,
+	current *session.SummaryBoundary,
+	evt event.Event,
+) *session.SummaryBoundary {
+	if current != nil && evt.Timestamp.Before(current.CutoffAt) {
+		return current
+	}
+	return session.NewSummaryBoundaryWithEventID(
+		filterKey,
+		evt.Timestamp,
+		evt.ID,
+	)
+}
+
 // prependPrevSummary returns a new slice that prepends the previous summary as
 // a synthetic system event when prevSummary is non-empty, followed by delta.
 func prependPrevSummary(prevSummary string, delta []event.Event, now time.Time) []event.Event {
@@ -71,7 +150,7 @@ func prependPrevSummary(prevSummary string, delta []event.Event, now time.Time) 
 // buildFilterSession builds a temporary session containing filterKey events.
 // When filterKey=="", it represents the full-session input.
 func buildFilterSession(base *session.Session, filterKey string, evs []event.Event) *session.Session {
-	return &session.Session{
+	tmp := &session.Session{
 		ID:        base.ID + ":" + filterKey,
 		AppName:   base.AppName,
 		UserID:    base.UserID,
@@ -80,6 +159,8 @@ func buildFilterSession(base *session.Session, filterKey string, evs []event.Eve
 		UpdatedAt: time.Now(),
 		CreatedAt: base.CreatedAt,
 	}
+	isummaryscope.SetScopeFilterKey(tmp, filterKey)
+	return tmp
 }
 
 // SummarizeSession performs per-filterKey delta summarization using the given
@@ -95,108 +176,548 @@ func SummarizeSession(
 	filterKey string,
 	force bool,
 ) (updated bool, err error) {
-	if m == nil || base == nil {
+	if base == nil {
 		return false, nil
 	}
-
-	// Get previous summary info.
-	var prevText string
-	var prevAt time.Time
-	var needsPersistOnly bool
-	base.SummariesMu.RLock()
-	if base.Summaries != nil {
-		if s := base.Summaries[filterKey]; s != nil {
-			prevText = s.Summary
-			prevAt = s.UpdatedAt
-			// Zero UpdatedAt indicates summary was copied and needs persistence.
-			needsPersistOnly = prevText != "" && prevAt.IsZero()
-		}
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	base.SummariesMu.RUnlock()
+	defer func() {
+		if updated {
+			recordSummaryMaterialized(ctx, filterKey)
+		}
+	}()
+	unlock, err := lockSessionSummary(ctx, base, filterKey)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 
-	// Handle copied summary that needs persistence only (no LLM call).
-	if needsPersistOnly {
-		// Compute the latest event timestamp for proper UpdatedAt.
-		_, latestTs := computeDeltaSince(base, time.Time{}, filterKey)
-		if latestTs.IsZero() {
-			latestTs = time.Now()
-		}
-		base.SummariesMu.Lock()
-		if base.Summaries != nil && base.Summaries[filterKey] != nil {
-			base.Summaries[filterKey].UpdatedAt = latestTs.UTC()
-		}
-		base.SummariesMu.Unlock()
+	prev := readPreviousSummary(base, filterKey)
+	if prev.needsPersistOnly {
+		persistCopiedSummary(base, filterKey)
+		recordSummaryCopied(ctx)
 		return true, nil
 	}
-
-	// Compute delta events with both time and filterKey filtering in one pass.
-	delta, latestTs := computeDeltaSince(base, prevAt, filterKey)
-	if !force && len(delta) == 0 {
+	if m == nil {
 		return false, nil
 	}
 
-	// Build input with previous summary prepended.
-	input := prependPrevSummary(prevText, delta, time.Now())
-	tmp := buildFilterSession(base, filterKey, input)
-	if !force && !m.ShouldSummarize(tmp) {
+	input, ok := buildSummaryInput(ctx, m, base, filterKey, force, prev)
+	if !ok {
 		return false, nil
 	}
-
-	// Generate summary.
-	text, err := m.Summarize(ctx, tmp)
+	// Default the observation to unknown for the summary call itself. The
+	// built-in summarizer republishes precise counts while it selects its
+	// input, so anything left here means this call did not publish a built-in
+	// event selection.
+	isummarycontext.RecordEventSelection(ctx, isummarycontext.UnknownSelection(
+		isummarycontext.SourceCustom,
+		isummarycontext.ReasonCustom,
+	))
+	text, err := m.Summarize(input.ctx, input.session)
 	if err != nil {
 		return false, fmt.Errorf("summarize session %s failed: %w", base.ID, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 	if text == "" {
 		return false, nil
 	}
 
-	// Update summaries. UpdatedAt reflects the latest event included in this
-	// summarization to avoid skipping events during future delta computations.
-	// When no new events were summarized (e.g., force==true and delta empty),
-	// keep the previous timestamp.
-	updatedAt := selectUpdatedAt(tmp, prevAt, latestTs, len(delta) > 0)
-
-	// Acquire write lock to protect Summaries access.
-	base.SummariesMu.Lock()
-	defer base.SummariesMu.Unlock()
-
-	if base.Summaries == nil {
-		base.Summaries = make(map[string]*session.Summary)
-	}
-	base.Summaries[filterKey] = &session.Summary{Summary: text, UpdatedAt: updatedAt}
+	boundary := selectSummaryBoundary(
+		input.session,
+		filterKey,
+		prev.boundary,
+		input.latestBoundary,
+		input.hasDelta,
+	)
+	updatedAt := boundary.CutoffTime()
+	writeSummary(
+		base,
+		filterKey,
+		text,
+		updatedAt,
+		boundary,
+	)
 	return true, nil
 }
 
-func selectUpdatedAt(tmp *session.Session, prevAt, latestTs time.Time, hasDelta bool) time.Time {
-	updatedAt := prevAt.UTC()
-	if !hasDelta || latestTs.IsZero() {
-		return updatedAt
-	}
-
-	if ts := readLastIncludedTimestamp(tmp); !ts.IsZero() {
-		return ts.UTC()
-	}
-	return latestTs.UTC()
+type previousSummary struct {
+	text             string
+	boundary         *session.SummaryBoundary
+	needsPersistOnly bool
 }
 
-// lastIncludedTsKey is the key for the last included timestamp.
-// This key is used to store the last included timestamp in the session state.
-const lastIncludedTsKey = "summary:last_included_ts"
+type summaryInput struct {
+	session        *session.Session
+	ctx            context.Context
+	latestBoundary *session.SummaryBoundary
+	hasDelta       bool
+}
 
-func readLastIncludedTimestamp(tmp *session.Session) time.Time {
-	if tmp == nil {
-		return time.Time{}
+// readPreviousSummary returns the current summary state for filterKey.
+func readPreviousSummary(base *session.Session, filterKey string) previousSummary {
+	var prev previousSummary
+	base.SummariesMu.RLock()
+	defer base.SummariesMu.RUnlock()
+	if base.Summaries == nil {
+		return prev
 	}
-	raw, ok := tmp.GetState(lastIncludedTsKey)
+	s := base.Summaries[filterKey]
+	if s == nil {
+		return prev
+	}
+	prev.text = s.Summary
+	prev.boundary = s.CutoffBoundary()
+	// Zero UpdatedAt indicates summary was copied and needs persistence.
+	prev.needsPersistOnly = prev.text != "" && s.UpdatedAt.IsZero()
+	return prev
+}
+
+// persistCopiedSummary marks a copied in-memory summary as persisted-ready.
+func persistCopiedSummary(base *session.Session, filterKey string) {
+	summary := readSummaryClone(base, filterKey)
+	if summary == nil {
+		return
+	}
+	boundary := summary.CutoffBoundary()
+	updatedAt := time.Time{}
+	if boundary != nil {
+		updatedAt = boundary.CutoffTime()
+	}
+	if updatedAt.IsZero() {
+		_, latestTs := computeDeltaSince(base, time.Time{}, filterKey)
+		updatedAt = latestTs
+	}
+	if updatedAt.IsZero() {
+		updatedAt = time.Now()
+	}
+	if boundary == nil {
+		boundary = session.NewSummaryBoundary(filterKey, updatedAt)
+	} else {
+		boundary.FilterKey = filterKey
+		if boundary.CutoffAt.IsZero() {
+			boundary.CutoffAt = updatedAt.UTC()
+		}
+	}
+	base.SummariesMu.Lock()
+	defer base.SummariesMu.Unlock()
+	if base.Summaries != nil && base.Summaries[filterKey] != nil {
+		base.Summaries[filterKey].UpdatedAt = updatedAt.UTC()
+		base.Summaries[filterKey].Boundary = boundary
+	}
+}
+
+func readSummaryClone(base *session.Session, filterKey string) *session.Summary {
+	if base == nil {
+		return nil
+	}
+	base.SummariesMu.RLock()
+	defer base.SummariesMu.RUnlock()
+	if base.Summaries == nil {
+		return nil
+	}
+	return base.Summaries[filterKey].Clone()
+}
+
+// buildSummaryInput prepares the temporary session used for summary generation.
+func buildSummaryInput(
+	ctx context.Context,
+	m summary.SessionSummarizer,
+	base *session.Session,
+	filterKey string,
+	force bool,
+	prev previousSummary,
+) (summaryInput, bool) {
+	delta, latestBoundary := computeDeltaAfterBoundary(base, prev.boundary, filterKey)
+	if !force && len(delta) == 0 {
+		recordSummarySkip(ctx, outcomeNoDelta)
+		return summaryInput{}, false
+	}
+	input := prependPrevSummary(prev.text, delta, time.Now())
+	tmp := buildFilterSession(base, filterKey, input)
+	report, ok := summary.ReportFromContext(ctx)
+	reportCtx := ctx
+	if !ok {
+		report = &summary.Report{}
+		reportCtx = summary.ContextWithReport(ctx, report)
+	}
+	reportCtx = isummarycontext.WithPreviousSummary(reportCtx, prev.text)
+	if !shouldGenerateSummary(
+		reportCtx,
+		m,
+		base,
+		tmp,
+		input,
+		filterKey,
+		force,
+		prev.boundary,
+		report,
+	) {
+		return summaryInput{}, false
+	}
+	return summaryInput{
+		session:        tmp,
+		ctx:            reportCtx,
+		latestBoundary: latestBoundary,
+		hasDelta:       len(delta) > 0,
+	}, true
+}
+
+// shouldGenerateSummary runs configured summary checks for the prepared input.
+func shouldGenerateSummary(
+	ctx context.Context,
+	m summary.SessionSummarizer,
+	base *session.Session,
+	tmp *session.Session,
+	input []event.Event,
+	filterKey string,
+	force bool,
+	previousBoundary *session.SummaryBoundary,
+	report *summary.Report,
+) bool {
+	if force {
+		if shouldSkipBranchForkFullSessionCascade(ctx, m, tmp, filterKey) {
+			recordSummarySkip(ctx, outcomeCascadeSuppressed)
+			return false
+		}
+		trigger := summary.Trigger{
+			Fired:     true,
+			Name:      "force",
+			Metric:    "custom",
+			FilterKey: reportFilterKey(ctx, filterKey),
+		}
+		if report != nil {
+			report.Trigger = trigger
+		}
+		recordPublishedTrigger(ctx, true, trigger)
+		return true
+	}
+	checkTmp := tmp
+	if filterKey == session.SummaryFilterKeyAllContents {
+		if triggerFilterKey := summaryTriggerFilterKeyFromContext(ctx); triggerFilterKey != "" {
+			if shouldSkipBranchForkFullSessionCascade(ctx, m, tmp, filterKey) {
+				recordSummarySkip(ctx, outcomeCascadeSuppressed)
+				return false
+			}
+			checkTmp = buildFilterSession(base, triggerFilterKey, input)
+		}
+	}
+	attachRequestGapObservation(ctx, base, checkTmp, previousBoundary)
+	fired := ShouldSummarize(ctx, m, checkTmp)
+	recordAttemptGate(ctx, fired)
+	return fired
+}
+
+func attachRequestGapObservation(
+	ctx context.Context,
+	base *session.Session,
+	checkSess *session.Session,
+	previousBoundary *session.SummaryBoundary,
+) {
+	start, ok := summarytrigger.RequestStartFromContext(ctx)
+	if !ok {
+		return
+	}
+	filterKey := isummaryscope.GetScopeFilterKey(checkSess)
+	observation := summarytrigger.ObserveRequestGap(
+		base,
+		start,
+		filterKey,
+	)
+	if previousBoundary != nil {
+		cutoff := previousBoundary.CutoffTime()
+		if !cutoff.IsZero() && !cutoff.Before(start.StartedAt) {
+			observation.Available = false
+			observation.Elapsed = 0
+		}
+	}
+	summarytrigger.SetObservation(checkSess, observation)
+}
+
+// shouldSkipBranchForkFullSessionCascade suppresses only the full-session target
+// that is explicitly marked as a branch cascade. This also applies to force=true:
+// force should not turn a branch fork request into a full-session summary.
+func shouldSkipBranchForkFullSessionCascade(
+	ctx context.Context,
+	m summary.SessionSummarizer,
+	tmp *session.Session,
+	filterKey string,
+) bool {
+	if !skipBranchForkFullSessionCascadeFromContext(ctx) {
+		return false
+	}
+	if filterKey != session.SummaryFilterKeyAllContents {
+		return false
+	}
+	if summaryTriggerFilterKeyFromContext(ctx) == "" {
+		return false
+	}
+	if _, ok := summary.CacheSafeForkRequestFromContext(ctx); !ok {
+		return false
+	}
+	return cacheSafeForkingEnabled(ctx, m, tmp)
+}
+
+type cacheSafeForkingResolver interface {
+	CacheSafeForkingEnabled(context.Context, *session.Session) bool
+}
+
+func cacheSafeForkingEnabled(
+	ctx context.Context,
+	m summary.SessionSummarizer,
+	sess *session.Session,
+) bool {
+	if m == nil {
+		return false
+	}
+	if resolver, ok := m.(cacheSafeForkingResolver); ok {
+		return resolver.CacheSafeForkingEnabled(ctx, sess)
+	}
+	metadata := m.Metadata()
+	enabled, _ := metadata["cache_safe_forking"].(bool)
+	return enabled
+}
+
+func reportFilterKey(ctx context.Context, filterKey string) string {
+	if filterKey != session.SummaryFilterKeyAllContents {
+		return filterKey
+	}
+	if triggerFilterKey := summaryTriggerFilterKeyFromContext(ctx); triggerFilterKey != "" {
+		return triggerFilterKey
+	}
+	return filterKey
+}
+
+// writeSummary stores the generated summary under filterKey.
+func writeSummary(
+	base *session.Session,
+	filterKey string,
+	text string,
+	updatedAt time.Time,
+	boundary *session.SummaryBoundary,
+) {
+	base.SummariesMu.Lock()
+	defer base.SummariesMu.Unlock()
+	if base.Summaries == nil {
+		base.Summaries = make(map[string]*session.Summary)
+	}
+	base.Summaries[filterKey] = &session.Summary{
+		Summary:   text,
+		UpdatedAt: updatedAt,
+		Boundary:  boundary,
+	}
+}
+
+func selectSummaryBoundary(
+	tmp *session.Session,
+	filterKey string,
+	prevBoundary *session.SummaryBoundary,
+	latestBoundary *session.SummaryBoundary,
+	hasDelta bool,
+) *session.SummaryBoundary {
+	boundary := prevBoundary.Clone()
+	if boundary == nil {
+		boundary = session.NewSummaryBoundary(filterKey, time.Time{})
+	}
+	boundary.FilterKey = filterKey
+	if !hasDelta || latestBoundary == nil || latestBoundary.CutoffTime().IsZero() {
+		return boundary
+	}
+
+	if recorded := readLastIncludedBoundary(tmp, filterKey); recorded != nil {
+		return recorded
+	}
+	latest := latestBoundary.Clone()
+	latest.FilterKey = filterKey
+	return latest
+}
+
+type summaryTriggerFilterKeyContextKey struct{}
+type skipBranchForkFullSessionCascadeContextKey struct{}
+type summaryMaterializationObserverContextKey struct{}
+
+type summaryMaterializationObserver struct {
+	filterKey string
+	observed  atomic.Bool
+}
+
+// contextWithSummaryMaterializationObserver returns a request-scoped observer
+// that only SummarizeSession calls using the derived context can satisfy.
+func contextWithSummaryMaterializationObserver(
+	ctx context.Context,
+	filterKey string,
+) (context.Context, *summaryMaterializationObserver) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	observer := &summaryMaterializationObserver{filterKey: filterKey}
+	return context.WithValue(
+		ctx,
+		summaryMaterializationObserverContextKey{},
+		observer,
+	), observer
+}
+
+// recordSummaryMaterialized attributes a successful summary update to the
+// observer attached to this exact call context.
+func recordSummaryMaterialized(ctx context.Context, filterKey string) {
+	if ctx == nil {
+		return
+	}
+	observer, _ := ctx.Value(
+		summaryMaterializationObserverContextKey{},
+	).(*summaryMaterializationObserver)
+	if observer == nil || observer.filterKey != filterKey {
+		return
+	}
+	observer.observed.Store(true)
+}
+
+func (o *summaryMaterializationObserver) didMaterialize() bool {
+	return o != nil && o.observed.Load()
+}
+
+// summaryLockKey identifies the summary scope that must be serialized.
+type summaryLockKey struct {
+	appName   string
+	userID    string
+	sessionID string
+	filterKey string
+}
+
+// summaryLock is a cancelable binary semaphore with reference counting.
+type summaryLock struct {
+	ch   chan struct{}
+	refs int
+}
+
+// summaryLockGroup stores in-flight summary locks keyed by session scope.
+type summaryLockGroup struct {
+	mu    sync.Mutex
+	locks map[summaryLockKey]*summaryLock
+}
+
+// sessionSummaryLocks prevents duplicate concurrent summaries in this process.
+var sessionSummaryLocks summaryLockGroup
+
+// lock acquires the keyed summary semaphore or returns when ctx is canceled.
+func (g *summaryLockGroup) lock(ctx context.Context, key summaryLockKey) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	g.mu.Lock()
+	if g.locks == nil {
+		g.locks = make(map[summaryLockKey]*summaryLock)
+	}
+	l := g.locks[key]
+	if l == nil {
+		l = &summaryLock{ch: make(chan struct{}, 1)}
+		l.ch <- struct{}{}
+		g.locks[key] = l
+	}
+	l.refs++
+	g.mu.Unlock()
+
+	select {
+	case <-l.ch:
+	case <-ctx.Done():
+		g.release(key, l)
+		return nil, ctx.Err()
+	}
+	return func() {
+		select {
+		case l.ch <- struct{}{}:
+		default:
+		}
+		g.release(key, l)
+	}, nil
+}
+
+// release drops one reference and removes the lock after the last waiter exits.
+func (g *summaryLockGroup) release(key summaryLockKey, l *summaryLock) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	l.refs--
+	if l.refs == 0 && g.locks[key] == l {
+		delete(g.locks, key)
+	}
+}
+
+// lockSessionSummary serializes summary generation for a session/filter pair.
+func lockSessionSummary(ctx context.Context, sess *session.Session, filterKey string) (func(), error) {
+	if sess == nil {
+		return func() {}, nil
+	}
+	return sessionSummaryLocks.lock(ctx, summaryLockKey{
+		appName:   sess.AppName,
+		userID:    sess.UserID,
+		sessionID: sess.ID,
+		filterKey: filterKey,
+	})
+}
+
+func contextWithSummaryTriggerFilterKey(ctx context.Context, filterKey string) context.Context {
+	if filterKey == "" {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, summaryTriggerFilterKeyContextKey{}, filterKey)
+}
+
+func contextWithSkipBranchForkFullSessionCascade(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, skipBranchForkFullSessionCascadeContextKey{}, true)
+}
+
+func summaryTriggerFilterKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	filterKey, _ := ctx.Value(summaryTriggerFilterKeyContextKey{}).(string)
+	return filterKey
+}
+
+func skipBranchForkFullSessionCascadeFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	skip, _ := ctx.Value(skipBranchForkFullSessionCascadeContextKey{}).(bool)
+	return skip
+}
+
+func readLastIncludedBoundary(
+	tmp *session.Session,
+	filterKey string,
+) *session.SummaryBoundary {
+	if tmp == nil {
+		return nil
+	}
+	raw, ok := tmp.GetState(session.SummaryLastIncludedTimestampStateKey)
 	if !ok || len(raw) == 0 {
-		return time.Time{}
+		return nil
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, string(raw))
 	if err != nil {
-		return time.Time{}
+		return nil
 	}
-	return parsed
+	eventID := ""
+	if rawID, ok := tmp.GetState(session.SummaryLastIncludedEventIDStateKey); ok {
+		eventID = string(rawID)
+	}
+	return session.NewSummaryBoundaryWithEventID(filterKey, parsed, eventID)
 }
 
 // meetsTimeCriteria checks if a summary meets the minimum time requirement.
@@ -234,6 +755,47 @@ func PickSummaryText(
 		}
 	}
 	return "", false
+}
+
+func contextWithIsolatedReport(ctx context.Context) context.Context {
+	report, ok := summary.ReportFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	// Cascade targets keep per-target report writes isolated. The cloned
+	// report is emitted through that target's hook and is not merged back to the
+	// caller-attached root report.
+	cloned := report.Clone()
+	return summary.ContextWithReport(ctx, &cloned)
+}
+
+func contextForSummaryTarget(
+	ctx context.Context,
+	triggerFilterKey string,
+	targetFilterKey string,
+) context.Context {
+	if targetFilterKey != session.SummaryFilterKeyAllContents ||
+		triggerFilterKey == session.SummaryFilterKeyAllContents {
+		return ctx
+	}
+	return contextWithSummaryTriggerFilterKey(ctx, triggerFilterKey)
+}
+
+// contextForCascadeTarget prepares ctx for one cascade target. Full-session
+// targets that were triggered by a branch keep the trigger filter key so the
+// token gate can reuse the model-visible view, and they opt into skipping a
+// second LLM call when cache-safe forking is active.
+func contextForCascadeTarget(
+	ctx context.Context,
+	triggerFilterKey string,
+	targetFilterKey string,
+) context.Context {
+	ctx = contextForSummaryTarget(ctx, triggerFilterKey, targetFilterKey)
+	if targetFilterKey == session.SummaryFilterKeyAllContents &&
+		triggerFilterKey != session.SummaryFilterKeyAllContents {
+		ctx = contextWithSkipBranchForkFullSessionCascade(ctx)
+	}
+	return ctx
 }
 
 // GetSummaryTextFromSession attempts to retrieve summary text from the session's
@@ -293,84 +855,212 @@ func isSingleFilterKey(sess *session.Session, targetKey string) bool {
 
 // copySummaryToKey copies a summary from srcKey to dstKey within the session.
 // This avoids duplicate LLM calls when the summaries would be identical.
-// Sets UpdatedAt to zero to mark the summary as needing persistence.
-func copySummaryToKey(sess *session.Session, srcKey, dstKey string) {
+// Sets UpdatedAt to zero to mark the summary as needing persistence and reports
+// whether a source summary was available to copy.
+func copySummaryToKey(sess *session.Session, srcKey, dstKey string) bool {
 	if sess == nil {
-		return
+		return false
 	}
 	sess.SummariesMu.Lock()
 	defer sess.SummariesMu.Unlock()
 	if sess.Summaries == nil {
-		return
+		return false
 	}
 	src, ok := sess.Summaries[srcKey]
 	if !ok || src == nil {
-		return
+		return false
 	}
-	// Copy Topics slice to avoid sharing underlying array.
-	var topics []string
-	if len(src.Topics) > 0 {
-		topics = make([]string, len(src.Topics))
-		copy(topics, src.Topics)
+	copied := src.Clone()
+	if boundary := copied.CutoffBoundary(); boundary != nil {
+		boundary.FilterKey = dstKey
+		copied.Boundary = boundary
 	}
 	// Use zero UpdatedAt to mark as needing persistence.
 	// SummarizeSession will detect this and return updated=true.
-	sess.Summaries[dstKey] = &session.Summary{
-		Summary:   src.Summary,
-		Topics:    topics,
-		UpdatedAt: time.Time{},
+	copied.UpdatedAt = time.Time{}
+	if len(copied.Topics) == 0 {
+		copied.Topics = nil
 	}
+	sess.Summaries[dstKey] = copied
+	return true
 }
 
-// CreateSessionSummaryWithCascade creates a session summary for the specified filterKey
-// and cascades to create a full-session summary if the filterKey is not already the full session.
-// The createSummaryFunc should create a summary for the given filterKey and return an error if failed.
-// When all events match the filterKey (single filterKey scenario), it generates only one summary
-// and copies it to both keys to avoid duplicate LLM calls. The copied summary is then persisted
-// via createSummaryFunc which detects existing in-memory summary and triggers persistence.
+// CreateSessionSummaryWithCascade creates one or more session summaries for the
+// specified filterKey according to the dispatch policy.
+//
+// The createSummaryFunc should create a summary for the given filterKey, pass
+// its received context through to SummarizeSession, and return an error if it
+// fails. Preserving the context lets this helper attribute materialization to
+// the exact branch attempt. When the policy selects both the branch key and the
+// full-session key and all events match the branch, the helper generates only
+// one summary and copies it to both keys to avoid duplicate LLM calls. The
+// copied summary is then persisted via createSummaryFunc which detects the
+// existing in-memory summary and triggers persistence. Dependent-target errors
+// are returned without persisting recovery state; a later call only cascades
+// after its branch target materializes again. Consequently, an unforced retry
+// with no new branch delta can return nil without retrying the failed target.
 func CreateSessionSummaryWithCascade(
 	ctx context.Context,
 	sess *session.Session,
 	filterKey string,
 	force bool,
+	policy SummaryDispatchPolicy,
 	createSummaryFunc func(context.Context, *session.Session, string, bool) error,
 ) error {
-	if filterKey == session.SummaryFilterKeyAllContents {
-		return createSummaryFunc(ctx, sess, filterKey, force)
+	targets := policy.SummaryTargets(filterKey)
+	if len(targets) == 0 {
+		return nil
+	}
+	ctx = contextWithAsyncSummaryDispatch(ctx)
+	if len(targets) == 1 {
+		target := targets[0]
+		ctx = contextForSummaryTarget(ctx, filterKey, target)
+		return createSummaryFunc(ctx, sess, target, force)
 	}
 
 	// Optimization: when all events match the filterKey, the filterKey summary
 	// would be identical to the full-session summary. Generate only once via LLM,
 	// then copy to memory and persist both keys.
 	if isSingleFilterKey(sess, filterKey) {
-		if err := createSummaryFunc(ctx, sess, filterKey, force); err != nil {
-			return fmt.Errorf("create session summary for filterKey %q failed: %w",
-				filterKey, err)
-		}
-		// Copy to in-memory session for immediate access.
-		copySummaryToKey(sess, filterKey, session.SummaryFilterKeyAllContents)
-		// Persist the full-session key to storage. SummarizeSession detects
-		// existing in-memory summary with empty delta and returns updated=true.
-		if err := createSummaryFunc(ctx, sess, session.SummaryFilterKeyAllContents, false); err != nil {
-			return fmt.Errorf("persist full-session summary failed: %w", err)
-		}
+		return cascadeSingleFilterSummary(
+			ctx,
+			sess,
+			filterKey,
+			force,
+			len(targets),
+			createSummaryFunc,
+		)
+	}
+
+	return cascadeDependentSummary(
+		ctx,
+		sess,
+		filterKey,
+		force,
+		len(targets),
+		createSummaryFunc,
+	)
+}
+
+// cascadeSingleFilterSummary generates one summary for a session whose events
+// all match filterKey and reuses it for the full-session target only when this
+// pass materialized the branch source.
+func cascadeSingleFilterSummary(
+	ctx context.Context,
+	sess *session.Session,
+	filterKey string,
+	force bool,
+	targets int,
+	createSummaryFunc func(context.Context, *session.Session, string, bool) error,
+) error {
+	cascade := beginCascade(cascadeModeSingleFilter, filterKey, targets)
+	defer func() { cascade.report(ctx) }()
+	branchCtx, materialization :=
+		contextWithSummaryMaterializationObserver(ctx, filterKey)
+	err := createSummaryFunc(branchCtx, sess, filterKey, force)
+	// Sample before any error return so a persist failure after
+	// SummarizeSession updated=true still records this-pass materialization.
+	cascade.sourceMaterialized = materialization.didMaterialize()
+	if err != nil {
+		cascade.failed = true
+		return fmt.Errorf("create session summary for filterKey %q failed: %w",
+			filterKey, err)
+	}
+	// A nil error may mean the branch summary was intentionally not updated.
+	// Stop here so the full-session target cannot advance independently.
+	if !cascade.sourceMaterialized {
+		return nil
+	}
+	// Copy to in-memory session for immediate access. A concurrent removal is
+	// treated as a missing source and also stops the cascade. Copy success is
+	// recorded separately so a failed copy cannot be classified as copied.
+	cascade.copied = copySummaryToKey(
+		sess,
+		filterKey,
+		session.SummaryFilterKeyAllContents,
+	)
+	if !cascade.copied {
+		return nil
+	}
+	fullBefore := markSummaryBoundary(sess, session.SummaryFilterKeyAllContents)
+	// Persist the full-session key to storage. SummarizeSession detects
+	// existing in-memory summary with empty delta and returns updated=true.
+	fullCtx := contextForCascadeTarget(
+		ctx,
+		filterKey,
+		session.SummaryFilterKeyAllContents,
+	)
+	err = createSummaryFunc(fullCtx, sess, session.SummaryFilterKeyAllContents, false)
+	cascade.fullUpdated = markSummaryBoundary(
+		sess,
+		session.SummaryFilterKeyAllContents,
+	).advancedFrom(fullBefore)
+	if err != nil {
+		cascade.failed = true
+		return fmt.Errorf("persist full-session summary failed: %w", err)
+	}
+	return nil
+}
+
+// cascadeDependentSummary runs the branch target first, then the full-session
+// target only when this pass materialized the branch source.
+func cascadeDependentSummary(
+	ctx context.Context,
+	sess *session.Session,
+	filterKey string,
+	force bool,
+	targets int,
+	createSummaryFunc func(context.Context, *session.Session, string, bool) error,
+) error {
+	cascade := beginCascade(cascadeModeDependent, filterKey, targets)
+	defer func() { cascade.report(ctx) }()
+	branchCtx := contextForCascadeTarget(
+		contextWithIsolatedReport(ctx),
+		filterKey,
+		filterKey,
+	)
+	branchCtx, materialization :=
+		contextWithSummaryMaterializationObserver(branchCtx, filterKey)
+	err := createSummaryFunc(branchCtx, sess, filterKey, force)
+	// Sample before any error return so a persist failure after
+	// SummarizeSession updated=true still records this-pass materialization.
+	cascade.sourceMaterialized = materialization.didMaterialize()
+	if err != nil {
+		cascade.failed = true
+		return fmt.Errorf(
+			"create session summary for filterKey %q failed: %w",
+			filterKey,
+			err,
+		)
+	}
+	if !cascade.sourceMaterialized {
 		return nil
 	}
 
-	// Multiple filterKeys detected: generate both summaries in parallel.
-	var summaryWg sync.WaitGroup
-	result := make([]error, 2)
-	summaryWg.Add(2)
-	for i, fk := range []string{filterKey, session.SummaryFilterKeyAllContents} {
-		go func(i int, fk string) {
-			defer summaryWg.Done()
-			err := createSummaryFunc(ctx, sess, fk, force)
-			if err != nil {
-				result[i] = fmt.Errorf("create session summary for filterKey %q failed: %w", fk, err)
-			}
-		}(i, fk)
+	fullBefore := markSummaryBoundary(sess, session.SummaryFilterKeyAllContents)
+	fullCtx := contextForCascadeTarget(
+		contextWithIsolatedReport(ctx),
+		filterKey,
+		session.SummaryFilterKeyAllContents,
+	)
+	cascade.dependentStarted = true
+	err = createSummaryFunc(
+		fullCtx,
+		sess,
+		session.SummaryFilterKeyAllContents,
+		force,
+	)
+	cascade.fullUpdated = markSummaryBoundary(
+		sess,
+		session.SummaryFilterKeyAllContents,
+	).advancedFrom(fullBefore)
+	if err != nil {
+		cascade.failed = true
+		return fmt.Errorf(
+			"create session summary for filterKey %q failed: %w",
+			session.SummaryFilterKeyAllContents,
+			err,
+		)
 	}
-	summaryWg.Wait()
-
-	return util.If(result[0] != nil, result[0], result[1])
+	return nil
 }

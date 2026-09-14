@@ -27,7 +27,7 @@ import (
 
 func main() {
     // 1. 创建模型实例
-    modelInstance := openai.New("deepseek-chat",
+    modelInstance := openai.New("deepseek-v4-flash",
         openai.WithExtraFields(map[string]interface{}{
             "tool_choice": "auto", // 自动选择工具
         }),
@@ -77,7 +77,7 @@ Model 模块支持多种使用方式和平台接入。以下是基于 Runner 示
 cd examples/runner
 export OPENAI_BASE_URL="https://api.deepseek.com/v1"
 export OPENAI_API_KEY="your-api-key"
-go run main.go -model deepseek-chat
+go run main.go -model deepseek-v4-flash
 ```
 
 #### 平台接入配置
@@ -118,7 +118,7 @@ go run main.go -model gpt-4o-mini
 export OPENAI_BASE_URL="https://api.deepseek.com/v1"
 export OPENAI_API_KEY="your-api-key"
 cd examples/runner
-go run main.go -model deepseek-chat
+go run main.go -model deepseek-v4-flash
 ```
 
 **代码配置方式**
@@ -126,7 +126,7 @@ go run main.go -model deepseek-chat
 在自己的代码中直接使用 Model 时的配置方式：
 
 ```go
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithBaseURL("https://api.deepseek.com/v1"),
     openai.WithAPIKey("your-api-key"),
 )
@@ -152,7 +152,20 @@ type Model interface {
 type Info struct {
     Name string // 模型名称
 }
+
+// IterModel 是 Model 的可选扩展接口，用于降低流式处理时的 channel 开销
+type IterModel interface {
+    Model
+    GenerateContentIter(ctx context.Context, request *Request) (Seq[*Response], error)
+}
+
+// Seq 是一个基于回调的序列类型，用于按需 yield 一个值
+type Seq[T any] func(yield func(T) bool)
 ```
+
+基于 channel 的流式接口通常需要额外 goroutine 驱动读取，并在每个响应片段上产生一次 channel 同步。高频流式输出时，该开销可能成为主要的性能成本。`IterModel` 提供可选的迭代器式接口，使响应在调用方 goroutine 内同步产出，以降低上述开销。
+
+模型实现 `IterModel` 时，框架优先调用 `GenerateContentIter`；否则继续调用 `GenerateContent`。实现方必须串行调用 `yield`，并在其返回 `false` 时停止。
 
 ### Request 结构
 
@@ -192,16 +205,30 @@ type GenerationConfig struct {
     // 存在惩罚
     PresencePenalty *float64 `json:"presence_penalty,omitempty"`
 
-    // 推理努力程度 ("low", "medium", "high")
+    // 推理努力程度。可选值取决于服务方：
+    //   - OpenAI o-series："low"、"medium"、"high"
+    //   - Anthropic adaptive thinking："low"、"medium"、"high"、"max"，
+    //     以及支持该值的模型上的 "xhigh"
+    //   - DeepSeek v4（deepseek-v4-pro / deepseek-v4-flash）："high"、"max"
+    //     （服务端为兼容旧配置，会把 "low"/"medium" 映射为 "high"，
+    //     "xhigh" 映射为 "max"）
+    // OpenAI-compatible 服务会将该字段透传给所选后端模型，
+    // 请使用该后端模型支持的取值。
     ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 
     // 是否启用思考模式
-    ThinkingEnabled *bool `json:"-"`
+    // nil 表示不发送思考开关字段，由服务方默认值决定。
+    ThinkingEnabled *bool `json:"thinking_enabled,omitempty"`
 
     // 思考模式的最大令牌数
-    ThinkingTokens *int `json:"-"`
+    ThinkingTokens *int `json:"thinking_tokens,omitempty"`
 }
 ```
+
+`GenerationConfig` 本身只是一个普通结构体，它的零值等价于
+`Stream=false`。对 `LLMAgent` 来说，如果没有显式传入
+`llmagent.WithGenerationConfig(...)`，框架会直接使用这个零值，
+因此默认是非流式。更上层的封装如果需要不同语义，也可以显式设置自己的默认值。
 
 ### Response 结构
 
@@ -233,7 +260,29 @@ type ResponseError struct {
     Param   string    `json:"param,omitempty"`
     Code    string    `json:"code,omitempty"`
 }
+
+// Usage 表示 token 用量信息
+type Usage struct {
+    PromptTokens            int                     `json:"prompt_tokens"`
+    CompletionTokens        int                     `json:"completion_tokens"`
+    TotalTokens             int                     `json:"total_tokens"`
+    PromptTokensDetails     PromptTokensDetails     `json:"prompt_tokens_details"`
+    CompletionTokensDetails CompletionTokensDetails `json:"completion_tokens_details"`
+    TimingInfo              *TimingInfo             `json:"timing_info,omitempty"`
+}
+
+type PromptTokensDetails struct {
+    CachedTokens        int `json:"cached_tokens"`
+    CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
+    CacheReadTokens     int `json:"cache_read_tokens,omitempty"`
+}
+
+type CompletionTokensDetails struct {
+    ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
 ```
+
+对于 OpenAI-compatible 服务，返回中的 `completion_tokens_details.reasoning_tokens` 会映射到 `Usage.CompletionTokensDetails.ReasoningTokens`。当服务方没有消耗或没有上报 reasoning tokens 时，该值可能为 `0`；如果希望 reasoning 模型进入推理行为，请按模型能力设置 `ReasoningEffort` 和/或 `ThinkingEnabled`。
 
 ## OpenAI Model
 
@@ -251,14 +300,24 @@ type ResponseError struct {
 **2. DeepSeek**
 
 - 基础 URL：`https://api.deepseek.com`
-- 模型名称：`deepseek-chat`、`deepseek-reasoner`
+- 模型名称：`deepseek-v4-flash`、`deepseek-v4-pro`
+
+`deepseek-chat` 和 `deepseek-reasoner` 是兼容旧版本的别名，新的代码建议优先使用明确的 DeepSeek v4 模型名称。
 
 **3. 腾讯混元**
 
 - 基础 URL：`https://api.hunyuan.cloud.tencent.com/v1`
 - 模型名称：`hunyuan-2.0-thinking-20251109`、`hunyuan-2.0-instruct-20251111` 等
 
-**4. 其他提供商**
+**4. Requesty**
+
+- 基础 URL：`https://router.requesty.ai/v1`
+- 鉴权：通过 `REQUESTY_API_KEY` 传入 bearer key
+- 模型名称：`provider/model`，例如 `openai/gpt-4o-mini`（可在 <https://app.requesty.ai/router/list> 浏览可用模型）
+
+可运行示例见 `examples/model/requesty`。
+
+**5. 其他提供商**
 
 - **Qwen**：基础 URL `https://dashscope.aliyuncs.com/compatible-mode/v1`，模型名称：各种 Qwen 模型
 
@@ -298,7 +357,7 @@ import (
 
 func main() {
     // 创建模型实例
-    llm := openai.New("deepseek-chat")
+    llm := openai.New("deepseek-v4-flash")
 
     // 构建请求
     temperature := 0.7
@@ -341,6 +400,54 @@ func main() {
     }
 }
 ```
+
+### 结构化输出
+
+直接调用 `model.GenerateContent` 时，可以用 `model.NewRequest` 和
+`model.WithStructuredOutputJSON` 从 Go 结构体自动生成 JSON schema，并传给支持
+provider-native structured output 的模型适配器。
+
+```go
+type StageParseResult struct {
+    Stage  string `json:"stage"`
+    Reason string `json:"reason"`
+}
+
+request := model.NewRequest(
+    []model.Message{
+        model.NewUserMessage("分析当前用户意图属于哪个阶段。"),
+    },
+    model.WithStructuredOutputJSON(
+        new(StageParseResult),
+        true,
+        "Return stage parse result as JSON.",
+    ),
+)
+
+responseChan, err := llm.GenerateContent(ctx, request)
+if err != nil {
+    return err
+}
+
+var final string
+for response := range responseChan {
+    if response.Error != nil {
+        return fmt.Errorf("model error: %s", response.Error.Message)
+    }
+    if len(response.Choices) > 0 {
+        final = response.Choices[0].Message.Content
+    }
+}
+
+var result StageParseResult
+if err := json.Unmarshal([]byte(final), &result); err != nil {
+    return err
+}
+```
+
+`WithStructuredOutputJSON` 只负责配置模型请求；直接使用 `model` 包时，最终响应仍在
+`model.Response` 中，需要调用方自行解析 JSON。若已经有手写 schema，也可以直接设置
+`request.StructuredOutput`。
 
 ### 流式输出
 
@@ -442,7 +549,7 @@ request := &model.Request{
 
 ```go
 // 设置请求前回调函数
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithChatRequestCallback(func(ctx context.Context, req *openai.ChatCompletionNewParams) {
         // 请求发送前被调用
         log.Printf("发送请求: 模型=%s, 消息数=%d", req.Model, len(req.Messages))
@@ -481,9 +588,224 @@ model := openai.New("deepseek-chat",
 )
 ```
 
+##### 自定义流式 Usage 聚合
+
+OpenAI-compatible adapter 默认会请求流式 usage，并聚合服务方返回的
+usage chunk。大多数应用应保留这一行为。只有兼容服务方对 usage chunk
+采用了非标准语义时，才需要配置 `WithAccumulateChunkTokenUsage`。该 option
+只影响流式 chunk 的聚合；非流式 usage 直接来自完整响应。
+
+###### `WithAccumulateChunkTokenUsage` 的执行方式
+
+配置后，回调会按顺序处理每个流式 chunk。回调签名是：
+
+```go
+func(current model.Usage, delta model.Usage) model.Usage
+```
+
+| 参数 | 含义 |
+| --- | --- |
+| `current` | 处理当前 chunk 之前的累计状态 |
+| `delta` | 当前 chunk 携带的 `Usage` |
+| 返回值 | 处理当前 chunk 之后要保存的完整状态 |
+
+对于每个 chunk，OpenAI-compatible adapter 会先让上游 SDK 聚合这个 chunk。
+如果配置了自定义回调，adapter 随后会还原出处理该 chunk 之前的 usage 状态，
+把当前 chunk 的 usage 映射成 `delta`，调用回调，再用回调返回值整体替换 SDK
+accumulator 中的 usage。因此，下一个 chunk 看到的 `current` 就是上一次的
+返回值，最终模型响应拿到的是最后一次返回值。
+
+`delta` 只是 API 中的参数名，不代表服务方一定发送了数学意义上的增量。
+它可能是真正的增量、截至当前的累计总量、最后一次完整总量，也可能是空值，
+具体取决于服务方。
+
+回调返回值会整体替换累计后的 `model.Usage`。返回值中没有填写的字段，
+不会自动从 `current` 或 `delta` 补回。
+
+标准 OpenAI-compatible stream 的原始内容 chunk 中，`usage` 为 `null`。
+adapter 在调用回调前，会把这个空值映射为零值 `model.Usage`。最后的
+usage-only chunk 才包含完整总量：
+
+```text
+原始内容 chunk:     usage = null
+回调收到的内容 chunk: delta = model.Usage{}
+原始最后一个 chunk:  usage = {prompt: 100, completion: 20, total: 120, cached: 80}
+回调收到的最后 chunk: delta = {prompt: 100, completion: 20, total: 120, cached: 80}
+```
+
+默认聚合器可以直接处理这种形态，不需要自定义 accumulator。
+
+###### `model.Usage` 字段说明
+
+Accumulator 保存的是一个完整的 `model.Usage`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `PromptTokens` | 服务方上报的本次请求输入 token 总量。缓存命中的输入 token 通常已经包含在该值中，不应再次相加 |
+| `CompletionTokens` | 服务方上报的模型输出 token 总量 |
+| `TotalTokens` | 服务方上报的总 token，通常等于 prompt 加 completion |
+| `PromptTokensDetails.CachedTokens` | OpenAI-compatible Prompt Cache 命中的输入 token，通常是 `PromptTokens` 的子集 |
+| `PromptTokensDetails.CacheCreationTokens` | 用于创建显式缓存的 token，主要对应 Anthropic 风格缓存 |
+| `PromptTokensDetails.CacheReadTokens` | 从显式缓存中读取的 token，主要对应 Anthropic 风格缓存 |
+| `CompletionTokensDetails.ReasoningTokens` | Completion usage 中服务方上报的推理 token |
+| `TimingInfo` | 可选的框架耗时信息，不属于计费 token |
+| `TimingInfo.FirstTokenDuration` | 每次模型调用从请求开始到第一个有效 reasoning、content 或 tool-call chunk 的耗时，多个模型调用会累加 |
+| `TimingInfo.ReasoningDuration` | 流式 reasoning 阶段的累计耗时；非流式请求无法精确计算区间，因此保持为零 |
+
+这些字段组成 provider-agnostic 结构。
+`WithAccumulateChunkTokenUsage` 属于 OpenAI-compatible adapter，因此回调
+只会收到上游 OpenAI-compatible 响应和 adapter 映射支持的字段；其他服务方
+专用字段保持为零。
+
+`TimingInfo` 包含 `FirstTokenDuration` 和 `ReasoningDuration`。框架会在
+OpenAI chunk usage 聚合之外附加这些耗时，因此自定义 token accumulator
+通常不需要创建或合并 `TimingInfo`。
+
+Token 计数细节仍以具体服务方定义为准。例如，不应把 `CachedTokens` 再加到
+`PromptTokens` 上，也不应在服务方没有要求时自行重算 `TotalTokens`。
+
+###### 根据服务方选择聚合策略
+
+先根据服务方的响应格式选择配置：
+
+| 服务方响应格式 | 直接累加会重复计数吗 | 推荐配置 |
+| --- | --- | --- |
+| 最后的 usage-only chunk 包含完整总量 | 不会，之前的 chunk 不携带 usage | 使用默认聚合器 |
+| 每个 usage chunk 都是独立增量 | 不会 | 使用默认聚合器 |
+| usage chunk 是累计快照，或重复上报已经出现的字段 | 会 | 自定义“最新非零值”聚合器 |
+
+对于累计快照或重复字段，保留最新的非零 usage。空 chunk 必须保留
+`current`，否则最后一次有效 usage 后的空 chunk 可能把结果清零。
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+func latestNonZeroUsage(current, delta model.Usage) model.Usage {
+    if delta.PromptTokens == 0 &&
+        delta.CompletionTokens == 0 &&
+        delta.TotalTokens == 0 &&
+        delta.PromptTokensDetails.CachedTokens == 0 &&
+        delta.PromptTokensDetails.CacheCreationTokens == 0 &&
+        delta.PromptTokensDetails.CacheReadTokens == 0 &&
+        delta.CompletionTokensDetails.ReasoningTokens == 0 {
+        return current
+    }
+    return delta
+}
+
+llm := openai.New("your-model",
+    openai.WithAccumulateChunkTokenUsage(latestNonZeroUsage),
+)
+```
+
+返回完整 `delta` 可以保留 `CachedTokens`、`ReasoningTokens` 等嵌套明细；
+“空”的判断应覆盖服务方可能上报的每个字段。
+
+选择自定义策略前，应检查服务方一次完整请求的原始 chunk，确认 usage
+究竟是增量还是累计值，以及是否存在最后的 usage-only chunk。
+
+##### 通过回调动态修改请求体
+
+`WithChatRequestCallback` 接收 `*openai.ChatCompletionNewParams` 指针，
+允许在每次请求发送前动态添加或修改 HTTP 请求体中的字段。可以通过
+`SetExtraFields` 注入自定义 JSON 字段：
+
+```go
+import (
+    "context"
+
+    openai "github.com/openai/openai-go"
+    oaimodel "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+model := oaimodel.New("deepseek-v4-flash",
+    oaimodel.WithChatRequestCallback(func(ctx context.Context, req *openai.ChatCompletionNewParams) {
+        // 根据运行时上下文动态设置额外字段
+        userID, _ := ctx.Value("user_id").(string)
+        req.SetExtraFields(map[string]any{
+            "user":            userID,
+            "custom_metadata": map[string]string{"session_id": "abc"},
+        })
+    }),
+)
+```
+
+**请求体自定义方式的区别**：
+
+| 维度 | `WithExtraFields` | `agent.WithModelRequestExtraFields` | 回调中 `SetExtraFields` |
+| --- | --- | --- | --- |
+| 设置时机 | 创建模型时一次性设置 | 单次 `runner.Run(...)` 调用时设置 | 每次模型请求发送前调用 |
+| 动态性 | 仅支持静态值 | 适合运行时已知的动态值 | 可基于 `ctx` 或运行时状态动态设置 |
+| 实现机制 | 通过 `openaiopt.WithJSONSet`（RequestOption 层）注入 | 写入 `model.Request.ExtraFields`，再由支持的 adapter 注入 | 设置在 `ChatCompletionNewParams` 结构体上（序列化层） |
+| 同名 key 冲突 | 会被请求级 extra fields 覆盖 | 优先级高于模型级 extra fields | 如果存在同名 key，会被 RequestOption 层的 extra fields 覆盖 |
+
+当多种方式使用**不同的 key** 时，所有字段都会出现在最终的 JSON body 中，
+互不干扰。当它们设置了**相同的 key** 时，在 OpenAI 兼容 adapter 中，
+通过 `agent.WithModelRequestExtraFields` 传入的请求级 extra fields 优先生效。
+
+##### 从 Runner 传递请求级 extra fields
+
+如果某个供应商的顶层请求体字段需要随每次 `runner.Run(...)` 动态变化，
+可以使用 `agent.WithModelRequestExtraFields`。例如 OpenAI 兼容接口中的
+`prompt_cache_key`：
+
+```go
+import (
+    "context"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+)
+
+func runOnce(ctx context.Context, r runner.Runner, cacheKey string) error {
+    events, err := r.Run(
+        ctx,
+        "user-001",
+        "session-001",
+        model.NewUserMessage("Hello"),
+        agent.WithModelRequestExtraFields(map[string]any{
+            "prompt_cache_key": cacheKey,
+        }),
+    )
+    if err != nil {
+        return err
+    }
+    for range events {
+    }
+    return nil
+}
+```
+
+如果供应商同时要求同一会话携带请求体缓存键和路由 Header，可以组合使用
+请求级 extra fields 与请求级 headers：
+
+```go
+events, err := r.Run(
+    ctx,
+    "user-001",
+    "session-001",
+    model.NewUserMessage("Hello"),
+    agent.WithModelRequestExtraFields(map[string]any{
+        "prompt_cache_key": cacheKey,
+    }),
+    agent.WithModelRequestHeaders(map[string]string{
+        "X-Session-ID": "session-001",
+    }),
+)
+```
+
+该选项会作用于本次运行中创建的每一次模型调用，包括普通 LLM Agent、
+Graph LLM 节点，以及经由 failover 或 hedge model 路由的请求。内置 OpenAI
+和 HuggingFace/OpenAI 兼容 adapter 会把这些字段合并到顶层 JSON 请求体中。
+其他供应商 adapter 默认不会使用该字段，除非后续显式增加对应的供应商映射。
+
 #### 2. 模型切换（Model Switching）
 
-模型切换允许在运行时动态更换 Agent 使用的 LLM 模型。框架提供两种方式：Agent 级别切换（影响所有后续请求）和请求级别切换（仅影响单次请求）。
+模型切换允许在运行时动态更换 Agent 使用的 LLM 模型。本小节展示 OpenAI 及其兼容模型实例在 Agent 级别和请求级别的静态切换用法。如果需要在同一次 `runner.Run(...)` 内对每次 LLM 调用分别选择模型，可以使用 [ModelSelector](#modelselector)。
 
 ##### Agent 级别切换
 
@@ -496,16 +818,16 @@ Agent 级别切换会改变 Agent 的默认模型，影响所有后续请求。
 ```go
 import (
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
 // 创建 Agent.
 agent := llmagent.New("my-agent",
-    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")),
+    llmagent.WithModel(openai.New("gpt-4o-mini")),
 )
 
 // 切换到其他模型.
-agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))
+agent.SetModel(openai.New("gpt-4o"))
 ```
 
 **使用场景**：
@@ -513,9 +835,9 @@ agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))
 ```go
 // 根据任务复杂度选择模型.
 if isComplexTask {
-    agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))  // 使用强大模型.
+    agent.SetModel(openai.New("gpt-4o"))  // 使用强大模型.
 } else {
-    agent.SetModel(anthropic.New("claude-3-5-haiku-20241022"))  // 使用快速模型.
+    agent.SetModel(openai.New("gpt-4o-mini"))  // 使用快速模型.
 }
 ```
 
@@ -527,20 +849,20 @@ if isComplexTask {
 import (
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
     "trpc.group/trpc-go/trpc-agent-go/model"
-    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
 // 创建多个模型实例.
-sonnet := anthropic.New("claude-3-5-sonnet-20241022")
-haiku := anthropic.New("claude-3-5-haiku-20241022")
+strong := openai.New("gpt-4o")
+fast := openai.New("gpt-4o-mini")
 
 // 创建 Agent 时注册所有模型.
 agent := llmagent.New("my-agent",
     llmagent.WithModels(map[string]model.Model{
-        "smart": sonnet,
-        "fast":  haiku,
+        "smart": strong,
+        "fast":  fast,
     }),
-    llmagent.WithModel(haiku), // 指定初始模型.
+    llmagent.WithModel(fast), // 指定初始模型.
     llmagent.WithInstruction("你是一个智能助手。"),
 )
 
@@ -591,12 +913,12 @@ if hour >= 22 || hour < 8 {
 ```go
 import (
     "trpc.group/trpc-go/trpc-agent-go/agent"
-    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
 // 为这次请求使用特定模型.
 eventChan, err := runner.Run(ctx, userID, sessionID, message,
-    agent.WithModel(anthropic.New("claude-3-5-sonnet-20241022")),
+    agent.WithModel(openai.New("gpt-4o")),
 )
 ```
 
@@ -608,10 +930,11 @@ eventChan, err := runner.Run(ctx, userID, sessionID, message,
 // 创建 Agent 时预注册多个模型.
 agent := llmagent.New("my-agent",
     llmagent.WithModels(map[string]model.Model{
-        "smart": anthropic.New("claude-3-5-sonnet-20241022"),
-        "fast":  anthropic.New("claude-3-5-haiku-20241022"),
+        "smart":  openai.New("gpt-4o"),
+        "fast":   openai.New("gpt-4o-mini"),
+        "vision": openai.New("gpt-4o"),
     }),
-    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")), // 默认模型.
+    llmagent.WithModel(openai.New("gpt-4o-mini")), // 默认模型.
 )
 
 runner := runner.NewRunner("app", agent)
@@ -621,7 +944,7 @@ eventChan, err := runner.Run(ctx, userID, sessionID, message,
     agent.WithModelName("smart"),
 )
 
-// 下一次请求仍然使用默认模型 "claude-3-5-haiku-20241022".
+// 下一次请求仍然使用默认模型 "gpt-4o-mini".
 eventChan2, err := runner.Run(ctx, userID, sessionID, message2)
 ```
 
@@ -970,7 +1293,10 @@ OpenAI SDK 自动重试以下错误：
 - **500+ Server Errors**：服务器内部错误（5xx）
 - **网络连接错误**：无响应或连接失败
 
-**注意**：SDK 默认最大重试次数为 2 次。
+**注意**：SDK 默认最大重试次数为 2 次。这表示初始请求失败后最多再重试
+2 次，因此一次调用默认最多会发起 3 次 HTTP 请求。`openaiopt.WithMaxRetries(n)`
+中的 `n` 指重试次数，不是总请求次数；设置为 `0` 可关闭 SDK 自动重试，
+只发送初始请求。
 
 ##### 重试策略
 
@@ -1010,6 +1336,18 @@ llm := openai.New("gpt-4o-mini",
 )
 ```
 
+**关闭重试**：
+
+```go
+// 需要完全关闭 SDK 自动重试的场景
+llm := openai.New("gpt-4o-mini",
+    openai.WithOpenAIOptions(
+        openaiopt.WithMaxRetries(0),  // 不重试，只发起一次请求
+        openaiopt.WithRequestTimeout(10*time.Second),
+    ),
+)
+```
+
 ##### 工作原理
 
 重试机制的执行流程：
@@ -1042,6 +1380,7 @@ llm := openai.New("gpt-4o-mini",
 - **无框架重试**：框架本身不实现重试逻辑
 - **客户端级重试**：所有重试由 OpenAI 客户端处理
 - **配置透传**：使用 `WithOpenAIOptions` 配置重试行为
+- **关闭重试**：设置 `openaiopt.WithMaxRetries(0)` 可关闭 SDK 自动重试
 - **自动处理**：速率限制（429）自动处理，无需额外代码
 
 ##### 使用示例
@@ -1052,23 +1391,24 @@ llm := openai.New("gpt-4o-mini",
 
 在网关、专有平台或代理环境中，请求模型 API 往往需要额外的
 HTTP Header（例如组织/租户标识、灰度路由、自定义鉴权等）。Model 模块
-提供两种可靠方式为“所有模型请求”添加 Header，适用于普通请求、流式、
-文件上传、批处理等全链路。
+提供多种可靠方式添加 Header。
 
 推荐顺序：
 
 - 通过 `openai.WithHeaders` 快速追加静态 Header（简便）
+- 通过 `agent.WithModelRequestHeaders` 设置请求级 Header（适合
+  `runner.Run(...)` 调用中按用户、会话或租户变化的 Header）
 - 通过 OpenAI RequestOption 设置全局 Header（灵活、可组合中间件）
 - 通过自定义 `http.RoundTripper` 注入（进阶、横切能力更强）
 
-上述三种方式同样影响流式请求，因为底层使用的是同一个客户端。
+上述方式同样影响流式请求，因为底层使用的是同一个客户端。
 
 ##### 1. 使用 openai.WithHeaders 追加 Header
 
 ```go
 import "trpc.group/trpc-go/trpc-agent-go/model/openai"
 
-llm := openai.New("deepseek-chat",
+llm := openai.New("deepseek-v4-flash",
     openai.WithHeaders(map[string]string{
         "X-Custom-Header": "custom-value",
         "X-Request-ID":    "req-123",
@@ -1076,7 +1416,26 @@ llm := openai.New("deepseek-chat",
 )
 ```
 
-##### 2. 使用 OpenAI RequestOption 设置全局 Header
+##### 2. 从 Runner 传递请求级 Header
+
+如果 Header 需要随每次 `runner.Run(...)` 动态变化，可以使用
+`agent.WithModelRequestHeaders`。典型例子是供应商要求通过 `X-Session-ID`
+把同一会话路由到同一推理实例。内置 OpenAI adapter 会在模型级 Header 之后
+合并这些请求级 Header，因此同名 Header 以请求级值为准。
+
+```go
+events, err := r.Run(
+    ctx,
+    "user-001",
+    "session-001",
+    model.NewUserMessage("Hello"),
+    agent.WithModelRequestHeaders(map[string]string{
+        "X-Session-ID": "session-001",
+    }),
+)
+```
+
+##### 3. 使用 OpenAI RequestOption 设置全局 Header
 
 通过 `WithOpenAIOptions` 配合 `openaiopt.WithHeader` 或
 `openaiopt.WithMiddleware`，可为底层 OpenAI 客户端发起的“每个请求”
@@ -1088,7 +1447,7 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
-llm := openai.New("deepseek-chat",
+llm := openai.New("deepseek-v4-flash",
     // 若你的平台要求额外头部
     openai.WithOpenAIOptions(
         openaiopt.WithHeader("X-Custom-Header", "custom-value"),
@@ -1102,7 +1461,7 @@ llm := openai.New("deepseek-chat",
 若需要按条件设置（例如仅对某些路径或依赖调用上下文值），可使用中间件：
 
 ```go
-llm := openai.New("deepseek-chat",
+llm := openai.New("deepseek-v4-flash",
     openai.WithOpenAIOptions(
         openaiopt.WithMiddleware(
             func(r *http.Request, next openaiopt.MiddlewareNext) (*http.Response, error) {
@@ -1156,7 +1515,7 @@ import (
 
 const streamContentType = "text/event-stream"
 
-llm := openai.New("deepseek-chat",
+llm := openai.New("deepseek-v4-flash",
     openai.WithOpenAIOptions(
         openaiopt.WithMiddleware(
             func(req *http.Request, next openaiopt.MiddlewareNext) (*http.Response, error) {
@@ -1208,7 +1567,7 @@ llm := openai.New("deepseek-chat",
 ```
 
 
-##### 3. 使用自定义 http.RoundTripper（进阶）
+##### 4. 使用自定义 http.RoundTripper（进阶）
 
 在 HTTP 传输层统一注入 Header，适合同时需要代理、TLS、自定义监控等
 能力的场景。
@@ -1223,7 +1582,7 @@ func (rt headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
     return rt.base.RoundTrip(req)
 }
 
-llm := openai.New("deepseek-chat",
+llm := openai.New("deepseek-v4-flash",
     openai.WithHTTPClientOptions(
         openai.WithHTTPClientTransport(headerRoundTripper{base: http.DefaultTransport}),
     ),
@@ -1253,7 +1612,13 @@ Token 计数器用于估算文本内容的 token 数量。框架提供了 `Simpl
 
 **估算原理：**
 
-使用启发式规则：每 token 大约对应 `N` 个 UTF-8 字符，其中 `N` 可通过 `WithApproxRunesPerToken` 配置。
+使用启发式规则：每 token 大约对应 `N` 个 UTF-8 字符，其中 `N` 可通过 `WithApproxRunesPerToken` 配置。这里的 `N` 是除数，不是乘数：
+
+```text
+estimatedTokens = countedUTF8Runes / N
+```
+
+因此 `WithApproxRunesPerToken(1.5)` 表示约 `1.5` 字符/token；如果传入 `2.0/3.0`，则表示约 `0.67` 字符/token，等价于约 `1.5` token/字符。
 
 **使用方式：**
 
@@ -1282,6 +1647,7 @@ counter := model.NewSimpleTokenCounter(
 - **类型**：float64
 - **默认值**：4.0（约每 4 个字符对应 1 个 token，适合英文场景）
 - **值限制**：<= 0 的值会被忽略，保持默认值
+- **计算方式**：估算 token 数 = 统计到的 UTF-8 字符数 / `v`；例如 `v=1.5` 才是约 `1.5` 字符/token
 
 **常见语言的推荐值：**
 
@@ -1359,7 +1725,7 @@ func (c *MyCustomCounter) CountTokensRange(ctx context.Context, messages []model
 }
 
 // 在创建模型时使用自定义计数器
-llm := openai.New("deepseek-chat",
+llm := openai.New("deepseek-v4-flash",
     openai.WithTokenCounter(&MyCustomCounter{}),
 )
 ```
@@ -1401,7 +1767,7 @@ import (
 )
 
 // 只需启用 token tailoring，其他参数自动配置
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithEnableTokenTailoring(true),
 )
 ```
@@ -1410,7 +1776,7 @@ model := openai.New("deepseek-chat",
 
 ```go
 // 自定义 token 限制和策略
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithEnableTokenTailoring(true),               // 必需：启用 token tailoring
     openai.WithMaxInputTokens(10000),                    // 自定义 token 限制
     openai.WithTokenCounter(customCounter),              // 可选：自定义计数器
@@ -1420,32 +1786,44 @@ model := openai.New("deepseek-chat",
 
 **Token 计算公式**：
 
-框架会根据模型的上下文窗口自动计算 "maxInputTokens"：
+框架会根据模型的上下文窗口自动计算 `maxInputTokens`。对 OpenAI-compatible
+模型，自动预算还会考虑本次请求的输出上限和工具定义：
 
-```
-safetyMargin = contextWindow × 10%
-calculatedMax = contextWindow - 2048（输出预留）- 512（协议开销）- safetyMargin
-ratioLimit = contextWindow × 100%（最大输入比例）
-maxInputTokens = max(min(calculatedMax, ratioLimit), 1024（最小值）)
+> **Context Window 注册**
+>
+> Token 裁剪和会话摘要的 `WithContextThreshold` 都需要模型 context window。内置模型名会自动解析。Token 裁剪对未知模型名使用 128000 tokens 的 fallback。对于私有部署、租户自定义模型、endpoint ID 或更小的未知模型，优先使用模型实例配置，例如 `openai.WithContextWindow(32768)` 或统一入口的 `provider.WithContextWindow(32768)`；对于单次运行覆盖，使用 `agent.WithModelContextWindow(32768)`。只有当模型名在当前进程中有稳定全局含义时，才使用 `model.RegisterModelContextWindow("my-model", 32768)`。完整示例参见[会话摘要文档](session/summary.md)。
+
+```text
+outputReserve = max(ReserveOutputTokens, request.MaxTokens, request.ThinkingTokens)
+safetyMargin = contextWindow × SafetyMarginRatio
+calculatedMax = contextWindow - outputReserve - ProtocolOverheadTokens - safetyMargin
+ratioLimit = contextWindow × MaxInputTokensRatio
+messageBudget = min(max(min(calculatedMax, ratioLimit), InputTokensFloor), calculatedMax)
+maxInputTokens = max(messageBudget - estimatedToolsTokens, 0)
 ```
 
 例如 "gpt-4o"（contextWindow = 128000）：
 
-```
+```text
 safetyMargin = 128000 × 0.10 = 12800 tokens
-calculatedMax = 128000 - 2048 - 512 - 12800 = 112640 tokens
+outputReserve = max(2048, request.MaxTokens, request.ThinkingTokens)
+calculatedMax = 128000 - outputReserve - 512 - 12800
 ratioLimit = 128000 × 1.0 = 128000 tokens
-maxInputTokens = 112640 tokens（约占 context window 的 88%）
+maxInputTokens = messageBudget - estimatedToolsTokens
 ```
+
+如果显式设置了 `WithMaxInputTokens`，框架会保留该值作为配置的 messages 预算，
+不会再从中扣除估算的 `Tools` schema 预算。该显式值仍会在应用输出预留和安全边际
+后，被限制在 context-safe 的硬预算内。
 
 **默认预算参数**：
 
 框架使用以下默认值进行 token 分配（**建议保留默认值**）：
 
 - **协议开销（ProtocolOverheadTokens）**: 512 tokens - 用于请求/响应格式化
-- **输出预留（ReserveOutputTokens）**: 2048 tokens - 为输出生成预留
+- **输出预留（ReserveOutputTokens）**: 2048 tokens - 输出生成的最小预留；OpenAI-compatible 请求会在该值、`GenerationConfig.MaxTokens`、`GenerationConfig.ThinkingTokens` 中取最大值
 - **输入最小值（InputTokensFloor）**: 1024 tokens - 确保模型正常处理
-- **输出最小值（OutputTokensFloor）**: 256 tokens - 确保有意义的响应
+- **输出最小值（OutputTokensFloor）**: 已废弃，不再用于自动计算输出 `MaxTokens`
 - **安全边际比例（SafetyMarginRatio）**: 10% - token 计数不准确的缓冲
 - **最大输入比例（MaxInputTokensRatio）**: 100% - 上下文窗口的最大输入比例
 
@@ -1476,7 +1854,7 @@ func (s *CustomStrategy) Tailor(
     return messages, nil
 }
 
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithEnableTokenTailoring(true),
     openai.WithTailoringStrategy(&CustomStrategy{}),
 )
@@ -1487,7 +1865,7 @@ model := openai.New("deepseek-chat",
 如果默认的 token 分配策略不满足您的需求，可以通过 `WithTokenTailoringConfig` 自定义预算参数。**注意：除非有特殊需求，否则建议保留默认值。**
 
 ```go
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithEnableTokenTailoring(true),
     openai.WithTokenTailoringConfig(&model.TokenTailoringConfig{
         ProtocolOverheadTokens: 1024,   // 自定义协议开销
@@ -1513,7 +1891,7 @@ model := anthropic.New("claude-sonnet-4-0",
 
 #### 7. Variant 优化：平台特有行为适配
 
-Variant 机制是 Model 模块的重要优化，用于处理不同 OpenAI 兼容平台的特有行为差异。通过指定不同的 Variant，框架能够自动适配各平台的 API 差异，特别是文件上传、删除和处理逻辑。
+Variant 机制是 Model 模块的重要优化，用于处理不同 OpenAI 兼容平台的特有行为差异。通过指定不同的 Variant，框架能够自动适配各平台的 API 差异，包括文件处理和思考开关字段的序列化格式。
 
 ##### 7.1. 支持的 Variant 类型
 
@@ -1538,6 +1916,8 @@ Variant 机制是 Model 模块的重要优化，用于处理不同 OpenAI 兼容
 - DeepSeek 平台适配
 - 默认 BaseURL：`https://api.deepseek.com`
 - API Key 环境变量名：`DEEPSEEK_API_KEY`
+- 显式设置 `WithVariant(openai.VariantDeepSeek)`，或使用官方 DeepSeek API BaseURL 时，才会启用 DeepSeek 特有行为
+- 按 [DeepSeek Chat Completions API](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion) 文档定义，将 `GenerationConfig.MaxTokens` 序列化为 `max_tokens`；其他 variant 继续使用 `max_completion_tokens`
 - 其他行为与标准 OpenAI 一致
 
 **4. VariantQwen（千问）**
@@ -1546,6 +1926,31 @@ Variant 机制是 Model 模块的重要优化，用于处理不同 OpenAI 兼容
 - 默认 BaseURL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
 - API Key 环境变量名：`DASHSCOPE_API_KEY`
 - 其他行为与标准 OpenAI 一致
+
+**5. VariantGLM（智谱 GLM）**
+
+- GLM OpenAI-compatible 接口适配
+- 使用 GLM 的 `thinking` 对象格式序列化思考开关
+- 当部分 GLM 网关把最终答案放在 `reasoning_content` 且 `content` 为空时，框架会将其回退为可见内容
+
+**6. VariantKimi**
+
+- Kimi 开放平台适配
+- 默认 BaseURL：`https://api.moonshot.ai/v1`
+- API Key 环境变量名：`MOONSHOT_API_KEY`
+- 对官方 `api.moonshot.ai` 和 `api.moonshot.cn` host 自动推断
+- 将思考开关序列化为 `{"thinking": {"type": "enabled"}}`
+- 文件上传默认使用 `file-extract` purpose
+
+**7. VariantMiniMax**
+
+- MiniMax OpenAI 兼容接口适配
+- 默认 BaseURL：`https://api.minimax.io/v1`
+- API Key 环境变量名：`MINIMAX_API_KEY`
+- 对官方 `api.minimax.io` 和 `api.minimaxi.com` host 自动推断
+- 开启思考时序列化为 `{"thinking": {"type": "adaptive"}}`，关闭时序列化为 `{"thinking": {"type": "disabled"}}`
+- 保持 MiniMax 原生 `<think>...</think>` 内容不变，以便工具调用间完整回传交错思考
+- 文件上传和删除使用 MiniMax 的 `/v1/files/upload` 与 `/v1/files/delete` 接口，默认 purpose 为 `video_understanding`
 
 ##### 7.2. 使用方式
 
@@ -1562,10 +1967,20 @@ model := openai.New("hunyuan-model",
 )
 
 // 使用 DeepSeek 平台
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithBaseURL("https://api.deepseek.com/v1"),
     openai.WithAPIKey("your-api-key"),
     openai.WithVariant(openai.VariantDeepSeek), // 指定 DeepSeek
+)
+
+// 使用 Kimi 开放平台
+model = openai.New("kimi-k2.6",
+    openai.WithVariant(openai.VariantKimi), // 自动读取 MOONSHOT_API_KEY
+)
+
+// 使用 MiniMax OpenAI 兼容接口
+model = openai.New("MiniMax-M3",
+    openai.WithVariant(openai.VariantMiniMax), // 自动读取 MINIMAX_API_KEY
 )
 ```
 
@@ -1598,16 +2013,90 @@ message := model.Message{
 # DeepSeek 自动配置
 export DEEPSEEK_API_KEY="your-api-key"
 # 无需显式调用 WithAPIKey，框架会自动读取
+
+# Kimi 自动配置
+export MOONSHOT_API_KEY="your-api-key"
+
+# MiniMax 自动配置
+export MINIMAX_API_KEY="your-api-key"
 ```
 
 ```go
 import "trpc.group/trpc-go/trpc-agent-go/model"
 
 // DeepSeek 自动配置示例
-model := openai.New("deepseek-chat",
+model := openai.New("deepseek-v4-flash",
     openai.WithVariant(openai.VariantDeepSeek), // 自动读取 DEEPSEEK_API_KEY
 )
 ```
+
+##### 7.4. 思考开关与 Variant
+
+`Variant` 和 `GenerationConfig.ThinkingEnabled` 负责不同的事情：
+
+- `WithVariant(...)` 选择服务方协议，决定思考开关应使用哪个字段和 JSON 格式；
+- `ThinkingEnabled` 决定是否显式开启或关闭思考。
+
+仅设置 `Variant` **不会自动发送思考开关**。当 `ThinkingEnabled == nil` 时，框架不发送任何开关字段，由服务方使用默认值。即使某个服务方当前默认开启思考，如果调用方需要确定性行为，也应显式设置 `ThinkingEnabled`。
+
+各 OpenAI-compatible Variant 的序列化结果如下：
+
+| Variant | `ThinkingEnabled=true` 的请求字段 |
+| --- | --- |
+| `VariantOpenAI` | `"thinking_enabled": true` |
+| `VariantDeepSeek` | `"thinking": {"type": "enabled"}` |
+| `VariantHunyuan` | `"thinking": {"type": "enabled"}` |
+| `VariantGLM` | `"thinking": {"type": "enabled"}` |
+| `VariantQwen` | `"enable_thinking": true` |
+| `VariantKimi` | `"thinking": {"type": "enabled"}` |
+| `VariantMiniMax` | `"thinking": {"type": "adaptive"}` |
+
+例如，通过官方 DeepSeek API 确定性地开启思考：
+
+```go
+thinking := true
+
+llm := openai.New("deepseek-v4-flash",
+    openai.WithBaseURL("https://api.deepseek.com"),
+    openai.WithAPIKey("your-api-key"),
+    openai.WithVariant(openai.VariantDeepSeek),
+)
+
+request := &model.Request{
+    Messages: []model.Message{
+        model.NewUserMessage("分析这个问题。"),
+    },
+    GenerationConfig: model.GenerationConfig{
+        Stream:          true,
+        ThinkingEnabled: &thinking,
+    },
+}
+```
+
+`ThinkingEnabled` 只适用于提供显式思考开关的模型；如果模型只支持推理预算，请改用 `ReasoningEffort`。对实现上述思考开关格式的外部服务，通常显式设置对应 `Variant` 和 `ThinkingEnabled` 即可。如果代理网关使用了不同字段或需要额外参数，可以通过 `openai.WithExtraFields(...)` 添加或覆盖服务方特有字段。
+
+对于要求始终开启思考的 Kimi 模型，应省略 `ThinkingEnabled`。如需让
+Kimi K2.6 在多轮对话间保留推理内容，可显式传入完整的服务方扩展：
+
+```go
+llm := openai.New(
+    "kimi-k2.6",
+    openai.WithVariant(openai.VariantKimi),
+    openai.WithExtraFields(map[string]any{
+        "thinking": map[string]string{
+            "type": "enabled",
+            "keep": "all",
+        },
+    }),
+)
+```
+
+对 MiniMax-M3，`ThinkingEnabled=false` 会发送
+`thinking.type=disabled`；MiniMax M2.x 虽然接受该值，但仍会继续思考。
+适配器有意不设置 `reasoning_split`：MiniMax 原生 OpenAI 格式会把推理保留在
+assistant `content` 的 `<think>...</think>` 中，框架会在工具调用历史中原样保存。
+返回工具结果前，不应删除 assistant 历史中的这些标签。服务方的多轮要求参见
+[MiniMax OpenAI SDK 文档](https://platform.minimax.io/docs/api-reference/text-openai-api)。
 
 #### 8. 流式工具调用增量：ShowToolCallDelta
 
@@ -1804,6 +2293,57 @@ request := &model.Request{
 }
 ```
 
+### 多模态输入
+
+Anthropic Model 支持在 `user` 消息中传入图片和文件：
+
+- 图片：可以使用 URL 或原始数据，支持 `image/jpeg`、`image/png`、`image/gif`、`image/webp`，会作为 Anthropic image block 发送。
+- PDF：可以使用 URL 或原始数据，使用 `application/pdf`，会作为 Anthropic document block 发送。
+- 文本内容：只能使用原始数据，使用 `text/plain` 会作为 Anthropic document block 发送；使用 `text/csv`、`text/html` 等文本型 MIME type 会作为 Anthropic text block 发送。
+- 其他格式：Office 文档、JSON 等不会自动解析，请先转换为文本或 PDF。音频和 `FileID` 不支持。非 PDF 文件 URL 只会作为 URL 文本发送。
+
+```go
+import (
+    "context"
+    "os"
+
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+func main() {
+    llm := anthropic.New("claude-sonnet-4-6")
+    imageData, _ := os.ReadFile("diagram.png")
+    request := &model.Request{
+        Messages: []model.Message{
+            model.NewSystemMessage("你是一个专业的文档和图像分析助手。"),
+            {
+                Role:    model.RoleUser,
+                Content: "请结合图片和 PDF 总结关键信息。",
+                ContentParts: []model.ContentPart{
+                    {
+                        Type: model.ContentTypeImage,
+                        Image: &model.Image{
+                            Data:   imageData,
+                            Format: "png",
+                        },
+                    },
+                    {
+                        Type: model.ContentTypeFile,
+                        File: &model.File{
+                            Name:     "report.pdf",
+                            URL:      "https://example.com/report.pdf",
+                            MimeType: "application/pdf",
+                        },
+                    },
+                },
+            },
+        },
+    }
+    _, _ = llm.GenerateContent(context.Background(), request)
+}
+```
+
 ### 高级功能
 
 #### 1. 回调函数
@@ -1841,7 +2381,7 @@ model := anthropic.New(
 
 #### 2. 模型切换（Model Switching）
 
-模型切换允许在运行时动态更换 Agent 使用的 LLM 模型。框架提供两种方式：Agent 级别切换（影响所有后续请求）和请求级别切换（仅影响单次请求）。
+模型切换允许在运行时动态更换 Agent 使用的 LLM 模型。本小节展示 Anthropic 模型实例在 Agent 级别和请求级别的静态切换用法。如果需要在同一次 `runner.Run(...)` 内对每次 LLM 调用分别选择模型，可以使用 [ModelSelector](#modelselector)。
 
 ##### Agent 级别切换
 
@@ -2205,7 +2745,34 @@ model := anthropic.New("claude-3-5-sonnet",
 )
 ```
 
-关于 Token 计算公式、裁剪策略和自定义策略的详细说明，请参考 [OpenAI Model 的 Token 裁剪部分](#6-token-裁剪token-tailoring)。
+关于 Token 计算公式、裁剪策略和自定义策略的详细说明，请参考 [OpenAI Model 的 Token 裁剪部分](#7-token-token-tailoring)。
+
+#### 5. 流式工具调用增量：ShowToolCallDelta
+
+默认情况下，Anthropic 适配层会先在内部累积工具调用参数，等模型完成这次工具调用后，再通过最终响应的 `Response.Choices[0].Message.ToolCalls` 一次性返回完整参数。
+
+`WithShowToolCallDelta` 用于在流式阶段透出 Anthropic 的 `input_json_delta` 分片。工具参数较长，或前端需要展示参数生成过程时，可以开启这个选项：
+
+```go
+llm := anthropic.New(
+    "claude-sonnet-4-0",
+    anthropic.WithShowToolCallDelta(true),
+)
+```
+
+当启用 `WithShowToolCallDelta(true)` 时：
+
+- 流式响应中会出现 `Response.Choices[0].Delta.ToolCalls`；
+- `Delta.ToolCalls[*].Function.Arguments` 是本次新增的参数字符串片段，通常不是完整 JSON；
+- `Delta.ToolCalls[*].ID` 和 `Index` 可用于把同一个工具调用的多个片段串起来；
+- 最终响应仍然会在 `Response.Choices[0].Message.ToolCalls` 中返回完整工具调用，原有工具执行链路可以继续复用。
+
+典型处理方式：
+
+1. 在每个部分响应中读取
+   `Response.Choices[0].Delta.ToolCalls[*].Function.Arguments`；
+2. 按工具调用 `ID` 或 `Index` 分组，并按顺序追加 `Arguments` 片段；
+3. 将累积后的字符串作为 JSON 参数处理；边生成边展示的场景可以先按字符串渲染，等它构成合法 JSON 后再反序列化。
 
 ## Provider
 
@@ -2238,7 +2805,7 @@ import (
 )
 
 providerName := "openai"        // provider 支持 openai 和 anthropic.
-modelName := "deepseek-chat"
+modelName := "deepseek-v4-flash"
 
 modelInstance, err := provider.Model(
     providerName,
@@ -2276,7 +2843,7 @@ config := &model.TokenTailoringConfig{
 
 modelInstance, err := provider.Model(
     "openai",
-    "deepseek-chat",
+    "deepseek-v4-flash",
     provider.WithAPIKey(c.apiKey),
     provider.WithEnableTokenTailoring(true),
     provider.WithTokenTailoringConfig(config),
@@ -2300,3 +2867,166 @@ provider.Register("custom-provider", func(opts *provider.Options) (model.Model, 
 
 customModel, err := provider.Model("custom-provider", "custom-model")
 ```
+
+## 模型容灾（Failover）
+
+`model/failover` 提供了一个按优先级顺序兜底的模型包装器。它可将多个 `model.Model` 组成主备链路，在主模型不可用时自动切到下一个候选模型，适用于主备域名、主备网关或不同模型提供方之间的切换场景。
+
+**快速开始：**
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model/failover"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+primary := openai.New(
+    "gpt-4o-mini",
+    openai.WithBaseURL("https://api.openai.com/v1"),
+)
+backup := openai.New(
+    "deepseek-v4-flash",
+    openai.WithBaseURL("https://api.deepseek.com/v1"),
+)
+
+llm, err := failover.New(
+    failover.WithCandidates(primary, backup),
+)
+if err != nil {
+    return err
+}
+```
+
+`failover.New(...)` 返回普通的 `model.Model`，可以直接传给 `llmagent.WithModel(...)` 等接受 `model.Model` 的位置使用。完整示例见 [examples/model/failover](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/failover)。
+
+**切换规则：**
+
+- 按 `WithCandidates(...)` 传入的顺序依次尝试候选模型。
+- 只有在收到首个非错误 chunk 之前，才允许从当前候选模型切换到下一个候选模型。
+- 如果当前候选模型在此之前直接返回 `error`，或返回带 `Response.Error` 的错误响应，就会继续尝试下一个候选模型。
+- 一旦已经向调用方返回过任意非错误 chunk，后续即使流式过程中再出错，也不会重放到备模型，而是直接将错误返回给调用方。
+
+## 模型对冲（Hedge）
+
+`model/hedge` 提供了一个用于对冲首 token 尾延迟的模型包装器。它会先启动主候选，再按配置的 hedge delay 逐步补发后续候选；如果当前已启动候选都已经失败，则会提前拉起下一个候选。谁先返回首个有意义响应，谁就成为本次请求的胜者，其余候选会被取消。
+
+**快速开始：**
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model/hedge"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+primary := openai.New(
+    "gpt-4o-mini",
+    openai.WithBaseURL("https://api.openai.com/v1"),
+)
+backup := openai.New(
+    "deepseek-v4-flash",
+    openai.WithBaseURL("https://api.deepseek.com/v1"),
+)
+
+llm, err := hedge.New(
+    hedge.WithName("chat-hedge"),
+    hedge.WithCandidates(primary, backup),
+)
+if err != nil {
+    return err
+}
+```
+
+`hedge.New(...)` 同样返回普通的 `model.Model`，可以直接传给 `llmagent.WithModel(...)` 等接受 `model.Model` 的位置使用。上面这段代码使用包默认 delay；如果要显式控制补发时序，可继续使用 `WithDelay(...)` 或 `WithDelays(...)`。如果 hedge wrapper 会配合 context-threshold summary 或 token tailoring 使用，且候选模型的 context window 不同或未知，可以通过 `hedge.WithContextWindow(...)` 显式设置稳定的 wrapper window；否则只有当所有候选都暴露相同正数窗口时，wrapper 才会自动透传该共享窗口。完整示例见 [examples/model/hedge](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/hedge)。
+
+**调度与提交规则：**
+
+- 第一个候选总是在请求开始时立即启动。
+- `WithDelay(...)` 表示相邻 hedge 候选的固定补发间隔；`WithDelays(...)` 可显式指定候选 `1..n` 的启动偏移。
+- 如果当前所有已启动候选都已经失败，且仍有未启动候选，包装器会立即拉起下一个候选，而不是继续等待定时器。
+- 只有真正开始产出有效内容的候选才会成为胜者；只返回空内容或元数据的响应不会抢占胜者。
+- 一旦已经提交胜者，其他候选会被取消，后续只继续向调用方转发胜者的流。
+
+**配置示例：**
+
+下面的片段只展示调度配置差异。
+
+```go
+llm, err := hedge.New(
+    hedge.WithCandidates(primary, backupA, backupB),
+    hedge.WithDelay(100*time.Millisecond),
+)
+```
+
+上面这段配置表示：
+
+- `candidate[0]` 在 `0ms` 启动。
+- `candidate[1]` 在 `100ms` 启动。
+- `candidate[2]` 在 `200ms` 启动。
+
+```go
+llm, err := hedge.New(
+    hedge.WithCandidates(primary, backupA, backupB),
+    hedge.WithDelays(80*time.Millisecond, 250*time.Millisecond),
+)
+```
+
+上面这段配置表示：
+
+- `candidate[0]` 在 `0ms` 启动。
+- `candidate[1]` 在 `80ms` 启动。
+- `candidate[2]` 在 `250ms` 启动。
+
+这里 `WithDelays(...)` 传入的是相对请求开始时刻的绝对启动偏移，不是相对上一个候选的增量间隔。
+
+```go
+llm, err := hedge.New(
+    hedge.WithCandidates(primary, backupA, backupB),
+    hedge.WithDelays(0, 0),
+)
+```
+
+上面这段配置表示：
+
+- `candidate[0]` 在 `0ms` 启动。
+- `candidate[1]` 在 `0ms` 启动。
+- `candidate[2]` 在 `0ms` 启动。
+
+这相当于所有候选在请求开始时立即并发发起；如果是固定间隔模式，也可以写成 `WithDelay(0)`。
+
+## ModelSelector
+
+`ModelSelector` 用于在同一次 `runner.Run(...)` 中，为每次框架托管的 LLM 调用动态选择模型。
+
+```go
+selectModel := func(ctx context.Context, inv *agent.Invocation) (model.Model, error) {
+    if shouldUseAnotherModel(inv) {
+        return anotherModel, nil
+    }
+    return nil, nil
+}
+
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithModelSelector(selectModel),
+)
+```
+
+如果某个 `LLMAgent` 本身就有固定的模型选择策略，也可以在创建 Agent 时配置 `llmagent.WithModelSelector(...)`：
+
+```go
+a := llmagent.New(
+    "assistant",
+    llmagent.WithModel(defaultModel),
+    llmagent.WithModelSelector(selectModel),
+)
+```
+
+注意事项：
+
+- 同时配置时，`agent.WithModelSelector(...)` 优先于 `llmagent.WithModelSelector(...)`。
+- selector 返回 `nil, nil` 表示不切换模型，并保留当前 `inv.Model`；返回 error 会终止本次 LLM 调用。
+
+完整示例见 [examples/model/selector](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/selector)。

@@ -10,7 +10,7 @@ Runner provides the interface to run Agents, responsible for session management 
 - **🔄 Event Handling**: Receive Agent event streams and append non-partial response events to the session.
 - **🆔 ID Generation**: Automatically generate Invocation IDs and event IDs.
 - **📊 Observability Integration**: Integrates telemetry/trace to automatically record spans.
-- **✅ Completion Event**: Generates a runner-completion event after the Agent event stream ends.
+- **✅ Completion Event**: Generates a `runner.completion` event after the Agent event stream ends.
 - **🔌 Plugins**: Register once on a Runner to apply global hooks across agent, tool, and model lifecycles.
 
 ## Architecture
@@ -59,7 +59,7 @@ import (
 
 func main() {
 	// 1. Create model.
-	llmModel := openai.New("DeepSeek-V3-Online-64K")
+	llmModel := openai.New("deepseek-v4-flash")
 
 	// 2. Create Agent.
 	a := llmagent.New("assistant",
@@ -203,6 +203,146 @@ Notes:
 
 - The factory is called once per `Runner.Run(...)`.
 - `agent.WithAgent(...)` still overrides everything (useful for tests).
+- Runner factories select the root Agent for a run. To configure specialists
+  that a parent Agent can delegate to, use `WithSubAgents`. For request-scoped
+  or lazily constructed SubAgents, see
+  [Dynamic SubAgents and Agent Factories](./multiagent.md#dynamic-subagents-and-agent-factories).
+
+#### Resource Ownership Inside Agent Factories
+
+`AgentFactory` is ideal for request-scoped Agent construction, but it
+**does not transfer ownership of resources** created inside the factory.
+
+- The `Runner` only asks the factory for an `agent.Agent`.
+- `Runner.Close()` only closes resources created or owned by the Runner
+  itself; it does **not** automatically close request-scoped
+  `tool.ToolSet` instances, temporary MCP connections, sandbox sessions,
+  or similar resources created inside the factory.
+- The reason is structural: the `agent.Agent` interface does not expose a
+  `Close()` method, so the Runner has no generic way to reclaim those
+  resources.
+
+Recommended patterns:
+
+- If a `ToolSet` or external connection can be reused across requests,
+  create it once outside the factory, reuse it inside the factory, and
+  close it during application shutdown.
+- If a resource must be created per request, the caller should clean it
+  up explicitly after that run finishes. Common patterns are wrapping the
+  Agent with cleanup logic, or running cleanup from an after-agent
+  callback.
+
+This boundary is especially important when using MCP ToolSets. See the
+ToolSet lifecycle notes in the `tool` documentation for more details.
+
+### Resume the Next User Turn at a Specific Agent
+
+In a multi-Agent conversation, a transferred SubAgent may ask the user for
+missing information. The next request is a brand-new `Runner.Run(...)` call, so
+`Runner` needs an explicit signal if that next user message should resume at
+the same Agent instead of the normal entry Agent.
+
+Enable the one-shot route consumer on Runner:
+
+```go
+r := runner.NewRunner(
+    "crm-app",
+    coordinatorAgent,
+    runner.WithAwaitUserReplyRouting(true),
+)
+```
+
+There are two ways to produce that route:
+
+1. `LLMAgent`: enable `llmagent.WithAwaitUserReplyTool(true)` and instruct the
+   model to call `await_user_reply` immediately before it asks the user for
+   missing information.
+2. Custom Agent implementations: call `agent.MarkAwaitingUserReply(invocation)`
+   before you emit the final clarifying question event.
+
+#### Low-Level Example for a Custom Agent
+
+```go
+type clarifierAgent struct{}
+
+func (a *clarifierAgent) Run(
+    ctx context.Context,
+    inv *agent.Invocation,
+) (<-chan *event.Event, error) {
+    ch := make(chan *event.Event, 1)
+    go func() {
+        defer close(ch)
+
+        if missingPhoneNumber(inv.Message) {
+            _ = agent.MarkAwaitingUserReply(inv)
+            _ = agent.EmitEvent(
+                ctx,
+                inv,
+                ch,
+                event.NewResponseEvent(
+                    inv.InvocationID,
+                    inv.AgentName,
+                    &model.Response{
+                        Done: true,
+                        Choices: []model.Choice{{
+                            Index: 0,
+                            Message: model.Message{
+                                Role:    model.RoleAssistant,
+                                Content: "What phone number should I save?",
+                            },
+                        }},
+                    },
+                ),
+            )
+            return
+        }
+
+        _ = agent.EmitEvent(
+            ctx,
+            inv,
+            ch,
+            event.NewResponseEvent(
+                inv.InvocationID,
+                inv.AgentName,
+                &model.Response{
+                    Done: true,
+                    Choices: []model.Choice{{
+                        Index: 0,
+                        Message: model.Message{
+                            Role:    model.RoleAssistant,
+                            Content: "Profile updated.",
+                        },
+                    }},
+                },
+            ),
+        )
+    }()
+    return ch, nil
+}
+```
+
+Behavior summary:
+
+- The route is stored in session state as a stable agent path, not by
+  mutating message roles.
+- It is consumed once, right before the next user turn starts.
+- `agent.WithAgent(...)` and `agent.WithAgentByName(...)` still take
+  precedence.
+- If the recorded Agent path no longer exists, Runner clears the stale route
+  and falls back to the default entry Agent.
+- Nested SubAgents are resumed by their full invocation path, so the common
+  `coordinator + WithSubAgents(...)` setup works without manually registering
+  every child Agent.
+
+Advanced note:
+
+- The built-in `Runner` records the stable root lookup key automatically,
+  including `AgentFactory` cases where the runtime `Info().Name` differs from
+  the registered factory name.
+- If you build and run invocations manually outside `Runner`, and the stable
+  root lookup key is different from `inv.AgentName`, call
+  `agent.SetAwaitUserReplyRootLookupName(inv, rootLookupName)` before the
+  Agent emits its final clarifying reply.
 
 ### 🔌 Plugins
 
@@ -227,6 +367,24 @@ Notes:
 - Plugin names must be unique per Runner.
 - Plugins run in the order they are registered.
 - If a plugin implements `plugin.Closer`, Runner will call it in `Close()`.
+
+If a plugin should affect only one run, pass it to `Run` as a RunOption:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    plugin.WithPlugins(requestPlugin),
+)
+```
+
+Per-run plugins run after Runner-level plugins and only affect this `Run`.
+Runner does not call `Close()` on these plugins when the run ends; if a plugin
+owns external resources, the caller must manage them. See the
+[plugin documentation](plugin.md) for the full scope, execution order, and
+lifecycle details.
 
 ### 🔄 Ralph Loop Mode
 
@@ -295,6 +453,186 @@ _ = ok
 managed.Cancel(requestID)
 ```
 
+#### Queue a New User Message into the Same Run
+
+Sometimes you do not want to start a second run. You want to keep the current
+`requestID`, queue a new `role=user` message, and insert it only after the
+current assistant round is finished.
+
+Use `runner.EnqueueUserMessage(...)`:
+
+```go
+requestID := "req-123"
+
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Draft a launch note."),
+    agent.WithRequestID(requestID),
+)
+if err != nil {
+    panic(err)
+}
+
+go func() {
+    time.Sleep(time.Second)
+    err := runner.EnqueueUserMessage(
+        r,
+        requestID,
+        model.NewUserMessage("Also make the tone warmer."),
+    )
+    if err != nil {
+        log.Printf("enqueue steer failed: %v", err)
+    }
+}()
+
+_ = eventChan
+```
+
+Think of one assistant output as one round:
+
+- If the assistant only replies with text, the round ends at that reply
+- If the assistant emits `tool_call`s, the round ends only after that whole
+  tool batch finishes
+
+The queued user message can only be inserted between rounds. It is never
+inserted in the middle of a round.
+
+The simplest valid shape is:
+
+```text
+user(Q1)
+assistant(tool_call A)
+tool(result A)
+user(Q2, queued steer)
+assistant(...)
+```
+
+If one assistant message emits multiple tool calls, the framework still waits
+for the whole round:
+
+```text
+user(Q1)
+assistant(tool_calls A, B)
+tool(result A)
+tool(result B)
+user(Q2, queued steer)
+assistant(...)
+```
+
+It will not insert like this:
+
+```text
+user(Q1)
+assistant(tool_calls A, B)
+tool(result A)
+user(Q2, queued steer)
+tool(result B)
+```
+
+because that would break the `tool_call -> tool_response` structure of the
+same assistant round.
+
+So the behavior is:
+
+- This does **not** start a second run
+- The message is queued first, not written to session immediately
+- It is appended only after the previous assistant round and its tool work are
+  fully finished
+- This keeps the `tool_call -> tool_response` structure intact
+- If the run has already finished, enqueue returns an error
+
+If you want the implementation-level mapping, this happens after one
+`runOneStep()` finishes and before the next `runOneStep()` starts.
+
+Runnable example: `examples/steer/`
+
+#### Receive a Result Event for Each Tool Call
+
+When one model response requests multiple tools, Runner normally waits for all
+of them to finish and emits one combined `tool.response` event. To emit one
+result event as each tool call completes instead, enable this option for the
+`Run` call:
+
+This option applies only to multi-tool rounds handled entirely by Runner with
+no long-running tools; all other rounds keep their existing execution and event
+behavior.
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithToolResultEventPerCallEnabled(true),
+)
+```
+
+With the option enabled:
+
+- `eventChan` receives one final `tool.response` event as each call completes.
+  Each event contains one call result; use the result message's `ToolID` to
+  match it to the original call.
+- No additional combined result event is emitted.
+- Each result event is saved separately in the Session.
+- Results from parallel tools arrive in completion order, which may differ
+  from the order in which the model requested the tools.
+- `StateDelta` and `Actions.SkipSummarization` describe the whole tool-call
+  round, not an individual result. Earlier result events do not carry them;
+  read them from the last result event, or from the terminal error event if
+  the round ends early.
+
+For example, if the model requests A and then B, but B finishes first:
+
+```text
+eventChan receives: result B -> result A
+results sent to model: result A -> result B
+```
+
+This option only changes when your application receives the results. Runner
+still waits for every tool call to finish before making the next model
+request, and sends the results to the model in the original tool-call order.
+
+#### Per-Request App Name Override (multi-tenant isolation)
+
+By default, Runner uses the `appName` supplied at construction for session keys
+and event filter keys. If a single Runner instance serves multiple projects or
+tenants, you can override the app name on each `Run` call with
+`agent.WithAppName`:
+
+```go
+// One runner, two projects.
+r := runner.NewRunner("default-app", myAgent)
+
+// Project A — sessions are stored under "project-a".
+evA, _ := r.Run(ctx, userID, sessionID, msg,
+    agent.WithAppName("project-a"),
+)
+
+// Project B — sessions are stored under "project-b", fully isolated from A.
+evB, _ := r.Run(ctx, userID, sessionID, msg,
+    agent.WithAppName("project-b"),
+)
+```
+
+When `WithAppName` is **not** provided (or the value is empty), the runner
+falls back to the constructor-supplied default app name. The override affects:
+
+| Dimension | Default (no override) | With `WithAppName("X")` |
+|---|---|---|
+| `session.Key.AppName` | constructor `appName` | `"X"` |
+| Default `EventFilterKey` | constructor `appName` | `"X"` |
+
+Other runner-level registrations (observability `appid`, agent registry) remain
+bound to the original constructor `appName`.
+
+> **Note**
+>
+> `appName` must not be empty. If neither the constructor nor `WithAppName`
+> provides a non-empty value, the session service returns
+> `session.ErrAppNameRequired`.
+
 #### Detached Cancellation (background execution)
 
 In Go, `context.Context` (often named `ctx`) carries both cancellation and a
@@ -319,6 +657,57 @@ Runner enforces the earlier of:
 
 - the parent context deadline (if any)
 - `MaxRunDuration` (if set)
+
+#### Persist Interrupted Assistant Text (opt-in)
+
+By default, cancelling a streaming run does not write partial assistant chunks
+to the Session. This preserves the common "cancel means discard the unfinished
+reply" behavior.
+
+If your product has a "continue from where it stopped" interaction, you can
+opt in to persisting already-emitted assistant text when cancellation happens
+before the model produces a normal final assistant message. Runner aggregates
+assistant text deltas, synthesizes one non-partial assistant event, runs it
+through event plugins, and appends it to the Session.
+
+Enable it as a Runner default:
+
+```go
+r := runner.NewRunner("my-app", myAgent,
+    runner.WithPersistInterruptedAssistant(true),
+)
+```
+
+Or override it for one run:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithPersistInterruptedAssistant(true),
+)
+```
+
+You can also disable it for a single run even when the Runner default is
+enabled:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithPersistInterruptedAssistant(false),
+)
+```
+
+This option only persists text assistant deltas. Tool-call deltas, tool
+responses, and already-completed assistant messages are not converted into an
+interrupted assistant event. GraphAgent workflows use the same Runner event
+pipeline, so this option also applies to graph LLM node text chunks; no
+graph-specific option is required.
 
 #### Resume Interrupted Runs (tools-first resume)
 
@@ -378,8 +767,8 @@ msgs := []model.Message{
 ch, err := runner.RunWithMessages(ctx, r, userID, sessionID, msgs, agent.WithRequestID("request-ID"))
 ```
 
-Example: `examples/runwithmessages` (uses `RunWithMessages`; runner auto-seeds and
-continues reusing the session)
+Example: `examples/runwithmessages` (uses `session/noop` and passes the
+caller-owned complete history to `RunWithMessages` on every request)
 
 Option B: Pass via RunOption explicitly (same philosophy as ADK Python)
 
@@ -394,6 +783,164 @@ option; it only derives messages from session events (or falls back to the
 single `invocation.Message` if the session has no events). `RunWithMessages`
 still sets `invocation.Message` to the latest user turn so graph/flow agents
 that inspect it continue to work.
+
+If the upstream application persists the complete history and Runner should not retain Sessions across requests, inject `session/noop` and pass the updated complete history through `RunWithMessages` on every request. Noop keeps the transient Session required by a single `Run`, but it does not restore data from a previous run. See [No Persistence (Noop)](./session/noop.md).
+
+### User Message Rewriting
+
+`agent.WithUserMessageRewriter(...)` rewrites the current-turn user message
+before the run starts. The rewritten result is written into the session as the
+effective input for the current turn and continues to participate in subsequent
+turns. This is useful for adding business context, normalizing user wording, or
+splitting one input into multiple messages that are easier for the model to
+process.
+
+The signature of `UserMessageRewriter` is:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+type UserMessageRewriter func(
+    ctx context.Context,
+    args *UserMessageRewriteArgs,
+) ([]model.Message, error)
+
+type UserMessageRewriteArgs struct {
+    AppName         string
+    UserID          string
+    SessionID       string
+    RequestID       string
+    OriginalMessage model.Message
+}
+```
+
+`OriginalMessage` is the raw user input for the current turn. The other fields
+provide stable identifiers for the current run.
+
+The returned messages are processed in order. The last message becomes
+`invocation.Message`, and any preceding messages are persisted as leading
+messages for the same turn. This allows the interface to support both `1 -> 1`
+rewrites and `1 -> N` expansions. If the same call also passes historical
+messages via `agent.WithMessages(...)`, the rewritten result is written
+together with that history. The rewriter must not return an empty slice; if it
+does, the runner returns an error immediately.
+
+Example:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+func rewriteUserMessage(
+    ctx context.Context,
+    args *agent.UserMessageRewriteArgs,
+) ([]model.Message, error) {
+    raw := strings.TrimSpace(args.OriginalMessage.Content)
+    if raw == "" {
+        return []model.Message{args.OriginalMessage}, nil
+    }
+    if needsContext(raw) {
+        const toolCallID = "call_business_context"
+        businessContext := loadBusinessContext(raw)
+        return []model.Message{
+            model.NewUserMessage("Please interpret the following request with the business context below."),
+            {
+                Role:    model.RoleAssistant,
+                Content: "I will load the business context before refining the user request.",
+                ToolCalls: []model.ToolCall{{
+                    Type: "function",
+                    ID:   toolCallID,
+                    Function: model.FunctionDefinitionParam{
+                        Name:      "load_business_context",
+                        Arguments: []byte(`{"source":"crm"}`),
+                    },
+                }},
+            },
+            model.NewToolMessage(toolCallID, "load_business_context", businessContext),
+            model.NewUserMessage(raw),
+        }, nil
+    }
+    return []model.Message{
+        model.NewUserMessage("Please rewrite the following request into a clearer and more complete user message: " + raw),
+    }, nil
+}
+
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    userMessage,
+    agent.WithUserMessageRewriter(rewriteUserMessage),
+)
+```
+
+A complete example is available at [examples/usermessagerewriter](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/usermessagerewriter).
+
+#### Inject Per-run Context Messages (non-persistent)
+
+If you need to provide extra context for **this turn only** (for example:
+“rules”, dynamic constraints, retrieved passages, background knowledge) without
+writing it into the session transcript, use one of these RunOptions:
+
+- `agent.WithInjectedContextMessages(...)`: inject messages **before session history**
+- `agent.WithLateContextMessages(...)`: inject messages **near the latest user turn**
+  (after history, inserted before the latest user message)
+
+Both options affect only the current model request and are not persisted into
+the session events.
+
+Runnable example: `examples/prompt/late_context_messages`.
+
+### Override Runtime Surfaces for a Specific Node by `nodeID`
+
+If you need to change one specific node in a `runner.Run(...)` call instead of
+changing the entire agent, pass `agent.WithSurfacePatchForNode(nodeID, patch)`.
+
+```go
+var patch agent.SurfacePatch
+patch.SetInstruction("Answer in one short paragraph.")
+
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Summarize this report."),
+    agent.WithSurfacePatchForNode(nodeID, patch),
+)
+```
+
+Prefer obtaining a stable `nodeID` from `structure.Export(...)` and then pass
+it to `WithSurfacePatchForNode(...)`. If you need to patch multiple nodes in
+the same run, pass multiple `WithSurfacePatchForNode(...)` options. For full
+details and more examples, see [Agent: Override Runtime Surfaces by `nodeID`](./agent.md#override-runtime-surfaces-by-nodeid).
+
+### Override `code executor` Per Run
+
+If you need to specify a different execution environment for a particular
+request on an agent that resolves its executor from `RunOptions.CodeExecutor`,
+such as `LLMAgent`, pass `agent.WithCodeExecutor(exec)` to `runner.Run(...)`.
+
+```go
+events, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.NewUserMessage("Run the release checklist skill."),
+    agent.WithCodeExecutor(containerExec),
+)
+```
+
+Notes:
+
+- This option applies only to the current `runner.Run(...)` call and does not change the agent's default configuration.
+- This option only applies to agents that read `RunOptions.CodeExecutor`. If you use a custom agent, make sure its implementation handles this run option.
+- If the agent was created with `llmagent.WithCodeExecutor(...)`, the executor passed here temporarily overrides that default for this run.
+- Capabilities that resolve their executor from `RunOptions.CodeExecutor` (for example `workspace_exec`) use the executor passed here for this run.
+- If you do not want Markdown fenced code blocks in model replies to auto-execute, set `llmagent.WithEnableCodeExecutionResponseProcessor(false)` when creating the agent. See [Skill](./skill.md) for more details.
 
 ### ✅ Detecting End-of-Run and Reading Final Output (Graph-friendly)
 
@@ -431,6 +978,150 @@ for e := range eventChan {
 
 This keeps application code simple and consistent across Agent types while still
 preserving detailed graph events for advanced use.
+
+#### Fatal Errors Before a Graph Completion Event
+
+For the full framework-level recommendation, including the standard graph
+collector and A2A conventions, see [Error Handling](error-handling.md).
+
+Sometimes a run stops early because of a fatal error before the graph emits its
+final `graph.execution` event. A common example is:
+
+- a node callback emits a custom state delta with fatal-error details
+- the run then aborts before the graph can produce its normal final snapshot
+
+In that case, Runner still emits the final `runner.completion` event. When the
+terminal error is a real fatal error (not `stop_agent_error`), Runner now copies
+the accumulated fallback business state onto that last event for you:
+
+- `StateDelta`: the accumulated state delta from the error path
+
+Two details matter here:
+
+- Runner keeps the original fatal event as the only carrier of
+  `Response.Error`, so downstream translators can still treat
+  `runner.completion` as a normal finish signal.
+- Graph metadata keys such as `graph.MetadataKeyNode` and
+  `graph.MetadataKeyTool` are filtered out from the fallback delta to avoid
+  re-translating node/tool lifecycle events in consumers such as AGUI.
+
+This lets application code keep the same simple rule: read the last event first
+for business-level fatal details, instead of scanning the whole stream to find
+the callback/error event.
+
+If the graph uses `graph.NewExecutionErrorCollector()`, any collected
+`execution_errors` in that `StateDelta` may come from the default recoverable
+contract as well, for example errors that implement `Recoverable() bool` or
+errors wrapped by `graph.MarkRecoverable(err)`.
+
+Example:
+
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+
+    "trpc.group/trpc-go/trpc-agent-go/event"
+    "trpc.group/trpc-go/trpc-agent-go/graph"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+const stateKeyNodeFatal = "node_fatal_error"
+
+type RunSummary struct {
+    TransportError  *model.ResponseError
+    FatalDetail     map[string]any
+    ExecutionErrors []graph.ExecutionError
+}
+
+func ConsumeRun(
+    ctx context.Context,
+    eventChan <-chan *event.Event,
+) (*RunSummary, error) {
+    summary := &RunSummary{}
+
+    for {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case evt, ok := <-eventChan:
+            if !ok {
+                return summary, nil
+            }
+            if evt.Response != nil && evt.Response.Error != nil {
+                summary.TransportError = evt.Response.Error
+            }
+            if !evt.IsRunnerCompletion() {
+                continue
+            }
+
+            if b, ok := evt.StateDelta[stateKeyNodeFatal]; ok {
+                var detail map[string]any
+                if err := json.Unmarshal(b, &detail); err != nil {
+                    return nil, err
+                }
+                summary.FatalDetail = detail
+            }
+
+            executionErrors, err := graph.ExecutionErrorsFromStateDelta(
+                evt.StateDelta,
+                graph.StateKeyExecutionErrors,
+            )
+            if err != nil {
+                return nil, err
+            }
+            summary.ExecutionErrors = executionErrors
+            return summary, nil
+        }
+    }
+}
+
+func PrintSummary(summary *RunSummary) {
+    if summary.TransportError != nil {
+        fmt.Printf(
+            "transport error: type=%s code=%s message=%s\n",
+            summary.TransportError.Type,
+            ptrValue(summary.TransportError.Code),
+            summary.TransportError.Message,
+        )
+    }
+    if summary.FatalDetail != nil {
+        fmt.Printf("fatal detail: %+v\n", summary.FatalDetail)
+    }
+    for _, record := range summary.ExecutionErrors {
+        if record.Error == nil {
+            continue
+        }
+        fmt.Printf(
+            "execution error: severity=%s node=%s code=%s message=%s\n",
+            record.Severity,
+            record.NodeName,
+            ptrValue(record.Error.Code),
+            record.Error.Message,
+        )
+    }
+}
+
+func ptrValue(value *string) string {
+    if value == nil {
+        return ""
+    }
+    return *value
+}
+```
+
+Recommended mental model:
+
+- Success path with graph completion: read final output from the completion
+  event’s `StateDelta` (for example, `graph.StateKeyLastResponse`)
+- Fatal exit before graph completion: read your custom fatal keys from the same
+  completion event; if you also need the structured `Response.Error`, it
+  remains on the original fatal event
+- `stop_agent_error`: still behaves like a controlled stop signal and is not
+  duplicated onto the completion event
 
 #### 🔁 Option: Emit Final Graph LLM Responses
 
@@ -492,6 +1183,46 @@ Recommendation: for GraphAgent workflows, always read the final output from the
 Runner completion event’s `StateDelta` (for example,
 `graph.StateKeyLastResponse`). Treat `Response.Choices` on the completion event
 as optional when this option is enabled.
+
+#### Option: Keep Only Terminal Graph Message Events
+
+When a graph contains multiple Large Language Model (LLM) nodes or sub-agent
+nodes, the caller-visible message stream may include intermediate drafts from
+earlier nodes. To preserve full backward compatibility, that behavior remains
+the default.
+
+If you want the caller-visible stream to keep only terminal graph message
+events, enable:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithGraphTerminalMessagesOnly(true),
+)
+```
+
+Behavior summary:
+
+- Default (`false`): unchanged. Intermediate graph node message events are
+  still forwarded.
+- Enabled (`true`): caller-visible message events are limited to terminal LLM
+  nodes and terminal sub-agent nodes.
+- Parallel terminal nodes are all preserved. The option does not collapse a
+  fan-out graph into a single winner.
+- Internal graph execution is unchanged. State handoff, history aggregation,
+  tracing, and token accounting still use the full raw graph event stream.
+
+This option is especially useful when your product experience should stream
+only the last user-facing graph step, while keeping intermediate graph
+messages internal.
+
+For graph LLM nodes, pair this option with
+`agent.WithGraphEmitFinalModelResponses(true)` when you also want terminal
+`Done=true` assistant message events to be forwarded. See
+`examples/graph/terminal_messages_only`.
 
 #### 🎛️ Option: StreamMode
 
@@ -680,6 +1411,17 @@ r := runner.NewRunner("multi-app", multiAgent)
 
 ## 📊 Event Processing
 
+### Completion Semantics
+
+Runner uses a few related but different completion signals:
+
+- `Done=true`: the current event itself is complete. This can appear on final
+  assistant messages, tool responses, graph events, and runner completion
+  events.
+- `runner.completion` / `event.IsRunnerCompletion()`: the entire
+  `Runner.Run()` call has finished. This is the recommended condition for
+  stopping consumption of `eventChan`.
+
 ### Event Types
 
 ```go
@@ -705,8 +1447,8 @@ for event := range eventChan {
         }
     }
 
-    // Completion event.
-    if event.Done {
+    // Entire Runner run finished.
+    if event.IsRunnerCompletion() {
         break
     }
 }
@@ -759,7 +1501,7 @@ func processEvents(eventChan <-chan *event.Event) error {
             }
         }
 
-        if event.Done {
+        if event.IsRunnerCompletion() {
             fmt.Println() // New line.
             break
         }
@@ -871,7 +1613,7 @@ for evt := range eventCh {
         continue
     }
     // ... handle evt ...
-    if evt.IsFinalResponse() {
+    if evt.IsRunnerCompletion() {
         break
     }
     turns++
@@ -1053,7 +1795,7 @@ if err != nil {
 
 for event := range eventChan {
 	// Process events
-	if event.Done {
+	if event.IsRunnerCompletion() {
 		break
 	}
 }
@@ -1083,13 +1825,231 @@ func checkRunner(r runner.Runner, ctx context.Context) error {
         if event.Error != nil {
             return fmt.Errorf("Received error event: %s", event.Error.Message)
         }
-        if event.Done {
+        if event.IsRunnerCompletion() {
             break
         }
     }
 
     return nil
 }
+```
+
+## Online Best-of-N Candidate Selection
+
+Best-of-N completes multiple generations, evaluation-based ranking, and best-result output within one `Runner.Run`. After Runner receives the same user message, it asks the same Agent to generate N candidate results based on the current session context, uses [EvalMetric](evaluation/metric.md#evalmetric) to judge candidate quality, and finally returns only the highest-quality candidate as the output for this turn.
+
+`runner/bestofn` integrates with an existing Runner as a `runner.Option`. The business Agent generates candidates, [Evaluation](evaluation/index.md) evaluates candidate results, and Runner manages sessions, event streams, and final result submission. Candidate selection is driven by the [EvalMetric](evaluation/metric.md#evalmetric) values injected through `WithEvalMetrics(...)`, which can be either static rule evaluators or LLM Judge evaluators.
+
+The example below uses [llm_rubric_response](evaluation/evaluator.md#llm-rubric-response-evaluator) as the candidate selection metric. This metric evaluates each candidate final answer independently against rubrics.
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion"
+	criterionllm "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/llm"
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+	"trpc.group/trpc-go/trpc-agent-go/runner/bestofn"
+)
+
+qualityMetric := &metric.EvalMetric{
+	MetricName: "llm_rubric_response",
+	Threshold:  1.0,
+	Criterion: &criterion.Criterion{
+		LLMJudge: &criterionllm.LLMCriterion{
+			Rubrics: []*criterionllm.Rubric{
+				{
+					ID: "quality",
+					Content: &criterionllm.RubricContent{
+						Text: "The final answer directly satisfies the user's request and does not introduce unsupported claims.",
+					},
+				},
+			},
+		},
+	},
+}
+
+judgeRunner := runner.NewRunner("my-app-judge", judgeAgent)
+defer judgeRunner.Close()
+
+bestOfNOpt, err := bestofn.NewRunnerOption(
+	// WithAttempts sets the number of candidates generated by each Runner.Run.
+	bestofn.WithAttempts(3),
+	// WithEvalMetrics sets the evaluation metrics used to select candidate results.
+	bestofn.WithEvalMetrics(qualityMetric),
+	// WithJudgeRunner sets the judge Runner used by LLM Judge metrics.
+	bestofn.WithJudgeRunner(judgeRunner),
+)
+if err != nil {
+	return err
+}
+
+r := runner.NewRunner("my-app", candidateAgent, bestOfNOpt)
+defer r.Close()
+```
+
+`WithAttempts(attempts)` sets how many candidates each `Runner.Run` generates. The default value is 2, and the value must be greater than or equal to 1. When set to 1, only one candidate is generated, and the underlying Runner follows the normal single-run flow without triggering candidate selection.
+
+`WithEvalMetrics(metrics...)` sets the [EvalMetric](evaluation/metric.md#evalmetric) values used for candidate selection. At least one evaluation metric is required. Each metric produces a score and evaluation status, and Runner aggregates these results according to the candidate selection mode specified by `WithSelectionMode`. The default mode evaluates candidates independently, and it can also be switched to pairwise comparison.
+
+`WithContextMessages(messages...)` attaches [ContextMessages](evaluation/evalset.md#context-injection) to each candidate [EvalCase](evaluation/evalset.md#evalset). These messages enter the eval case and provide additional background for evaluators.
+
+`WithJudgeRunner(r)` sets the judge Runner used by LLM Judge metrics. After it is configured, judge model calls for LLM Judge metrics go through this Runner.
+
+`WithJudgeRunnerNumSamples(n)` sets how many times an LLM Judge metric calls the judge Runner for the same evaluation input. The value must be greater than 0, `WithJudgeRunner` must be configured, and the metric must contain an LLM Judge criterion.
+
+`WithSelectionMode(mode)` sets how candidate results are passed to [EvalMetric](evaluation/metric.md#evalmetric), and how metric results are aggregated into the final selected candidate. The default value is `SelectionModePointwise`.
+
+- `SelectionModePointwise` evaluates candidates independently. Each candidate generates an independent [EvalCase](evaluation/evalset.md#evalset), and metrics score that candidate. The candidate with the highest average score is selected. If scores are tied, candidates with passed evaluation status are preferred. If status is also tied, the candidate with the smaller index is preferred. This mode is suitable for [EvalMetric](evaluation/metric.md#evalmetric) values that can directly evaluate the quality of a single response.
+- `SelectionModePairwise` compares candidates pairwise. Each two candidates form one comparison. The earlier candidate is used as actual, and the later candidate is used as expected. They are passed to [Evaluation](evaluation/index.md), where the corresponding [Evaluator](evaluation/evaluator.md#evaluator) compares them according to the [EvalMetric](evaluation/metric.md#evalmetric) configuration and outputs a comparison score. A score greater than 0.5 means the earlier candidate has higher quality, a score less than 0.5 means the later candidate has higher quality, and a score equal to 0.5 means their quality is comparable. After all comparisons finish, candidates with more wins are preferred. If win counts are tied, candidates whose comparison scores deviate more from 0.5 are preferred. If still tied, the candidate with the smaller index is preferred. This mode only requires the evaluator to output a comparison score and is not tied to a specific evaluator.
+
+`WithRequirePassingCandidate(enabled)` requires the selected candidate in `SelectionModePointwise` to pass the metric threshold. When enabled, candidates that do not reach passed status are not selected. If all candidates fail, the event stream emits a selection error. This option only supports `SelectionModePointwise`; using it together with `SelectionModePairwise` makes `NewRunnerOption` return a configuration error.
+
+Candidate generation is serial by default. Use `WithAttemptParallelEnabled(enabled)` to enable concurrent candidate runs. The default value is `false`. `WithAttemptParallelism(parallelism)` sets the maximum concurrency for candidate runs. When concurrency is enabled and `parallelism <= 0`, `runtime.GOMAXPROCS(0)` is used.
+
+Example configuration for enabling concurrency:
+
+```go
+bestOfNOpt, err := bestofn.NewRunnerOption(
+	// WithAttempts sets the number of candidate generations.
+	bestofn.WithAttempts(6),
+	// WithAttemptParallelEnabled enables concurrent candidate generation.
+	bestofn.WithAttemptParallelEnabled(true),
+	// WithAttemptParallelism sets the maximum candidate generation concurrency.
+	bestofn.WithAttemptParallelism(3),
+	// WithEvalMetrics sets the evaluation metrics used to select candidate results.
+	bestofn.WithEvalMetrics(qualityMetric),
+	// WithJudgeRunner sets the judge Runner used by LLM Judge metrics.
+	bestofn.WithJudgeRunner(judgeRunner),
+)
+```
+
+`WithEvalSetManager(manager)` sets the [EvalSet Manager](evaluation/evalset.md#evalset-manager) used during candidate evaluation. It manages [EvalSet](evaluation/evalset.md#evalset) and [EvalCase](evaluation/evalset.md#evalset), and defaults to an in-memory manager implementation.
+
+`WithRegistry(registry)` sets the [Evaluator Registry](evaluation/evaluator.md#evaluator-registry) used by [Evaluation Service](evaluation/service.md#evaluation-service) to resolve [Evaluator](evaluation/evaluator.md#evaluator) names. It is usually configured only when integrating custom evaluators.
+
+`WithMetricRegistry(registry)` sets the [MetricRegistry](evaluation/metric.md#metricregistry-extensions) used by [Evaluation Service](evaluation/service.md#evaluation-service) to resolve [EvalMetric](evaluation/metric.md#evalmetric) extensions. It is usually configured only when integrating custom metric extensions.
+
+If you need to use [llm_verifier_pairwise](evaluation/evaluator.md#llm-pairwise-comparison-evaluator) to compare candidate final responses pairwise, switch the selection mode to `SelectionModePairwise`. This mode forms pairwise comparison cases from candidates and aggregates selection results based on comparison scores. The judge Agent must enable `logprobs` and `top_logprobs`; see [LLM Verifier](evaluation/methods.md#llm-verifier) for the full configuration.
+
+```go
+verifierMetric := &metric.EvalMetric{
+	MetricName: "llm_verifier_pairwise",
+	Threshold:  0.5,
+	Criterion: &criterion.Criterion{
+		LLMJudge: &criterionllm.LLMCriterion{
+			Rubrics: []*criterionllm.Rubric{
+				{
+					ID: "quality",
+					Content: &criterionllm.RubricContent{
+						Text: "The final answer directly satisfies the user's request and does not introduce unsupported claims.",
+					},
+				},
+			},
+		},
+	},
+}
+
+bestOfNOpt, err := bestofn.NewRunnerOption(
+	bestofn.WithAttempts(3),
+	bestofn.WithSelectionMode(bestofn.SelectionModePairwise),
+	bestofn.WithEvalMetrics(verifierMetric),
+	bestofn.WithJudgeRunner(judgeRunner),
+)
+```
+
+For a complete example that uses [llm_verifier_pairwise](evaluation/evaluator.md#llm-pairwise-comparison-evaluator) as the candidate selection metric, see [examples/evaluation/llmverifier](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/evaluation/llmverifier).
+
+At runtime, Runner creates multiple candidate runs based on the current user message and Session. Each candidate run calls the same Agent, and candidate traces are then converted into [EvalCase](evaluation/evalset.md#evalset) for evaluation. After selection completes, the outer Session commits only the selected candidate's run events. The caller receives the selected candidate events and the normal completion event. If the Agent enables streaming output, candidate events first enter an internal buffer, and the caller receives the selected candidate's streaming chunks after selection completes.
+
+Tools, plugins, Skills, MCP ToolSets, and callbacks execute during candidate runs. The framework isolates Session commits and intercepts writes to framework-managed Memory and Artifact through read-only services. External requests actively initiated by business code remain under business control.
+
+When execution trace or Graph checkpoint resume is enabled, this turn bypasses Best-of-N candidate selection and follows the original Runner flow.
+
+## Remote tRPC-Agent Runner
+
+`runner/trpcagent` turns a `Runner.Run` call into an HTTP request to the [tRPC-Agent API](trpcagent.md). It is useful when the platform and business Agent service are deployed separately: the business service exposes the real Agent through `server/trpcagent`, and the platform side uses `runner/trpcagent` like a regular Runner.
+
+Expose the [tRPC-Agent API](trpcagent.md) on the user service side first:
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/runner"
+	"trpc.group/trpc-go/trpc-agent-go/server/trpcagent"
+)
+
+agentRunner := runner.NewRunner(appName, agent)
+defer agentRunner.Close()
+
+server, err := trpcagent.New(
+	trpcagent.WithAppName(appName),
+	trpcagent.WithAgent(agent),
+	trpcagent.WithRunner(agentRunner),
+)
+if err != nil {
+	return err
+}
+http.ListenAndServe(":8080", server.Handler())
+```
+
+Create the remote Runner on the platform side:
+
+```go
+import (
+	"trpc.group/trpc-go/trpc-agent-go/model"
+	trpcagentrunner "trpc.group/trpc-go/trpc-agent-go/runner/trpcagent"
+)
+
+remoteRunner, err := trpcagentrunner.New(
+	"calculator",
+	trpcagentrunner.WithTarget("http://127.0.0.1:8080"),
+)
+if err != nil {
+	return err
+}
+defer remoteRunner.Close()
+
+snapshot, err := remoteRunner.Describe(ctx)
+if err != nil {
+	return err
+}
+_ = snapshot
+
+events, err := remoteRunner.Run(
+	ctx,
+	"user1",
+	"session1",
+	model.NewUserMessage("Use the calculator to compute 12 * 7."),
+)
+if err != nil {
+	return err
+}
+```
+
+The default path is `/trpc-agent/v1/apps/{appName}`. `Describe` requests the remote structure, and `Run` requests the remote runs endpoint and restores the response into the framework-standard `event.Event` stream. For complete code, see `examples/trpcagent`.
+
+## Execution Trace Default (opt-in)
+
+Execution trace recording is disabled by default. A service that wants every
+run on a specific Runner to produce an execution trace can enable it once when
+constructing that Runner:
+
+```go
+r := runner.NewRunner("my-app", myAgent,
+    runner.WithExecutionTraceEnabled(true),
+)
+```
+
+This is a Runner-local default; it does not affect other Runners or telemetry
+integrations in the process. A single run can override the default:
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    message,
+    agent.WithExecutionTraceEnabled(false),
+)
 ```
 
 ## 📝 Summary

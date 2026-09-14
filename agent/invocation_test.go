@@ -10,13 +10,19 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"math/big"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	agentlog "trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -36,9 +42,41 @@ func TestNewInvocation(t *testing.T) {
 	require.Equal(t, "Hello", inv.Message.Content)
 }
 
+func TestNewInvocation_WarnsOnMessageWithEmptyRole(t *testing.T) {
+	original := agentlog.Default
+	logger := &testWarnLogger{}
+	agentlog.Default = logger
+	defer func() {
+		agentlog.Default = original
+	}()
+
+	inv := NewInvocation(
+		WithInvocationMessage(model.Message{Content: "Hello"}),
+	)
+
+	require.NotNil(t, inv)
+	require.Equal(t, 1, logger.warnfCalls)
+	require.Equal(t, model.RoleUser, inv.Message.Role)
+}
+
 type mockAgent struct {
 	name string
 }
+
+type testWarnLogger struct {
+	warnfCalls int
+}
+
+func (l *testWarnLogger) Debug(args ...any)                 {}
+func (l *testWarnLogger) Debugf(format string, args ...any) {}
+func (l *testWarnLogger) Info(args ...any)                  {}
+func (l *testWarnLogger) Infof(format string, args ...any)  {}
+func (l *testWarnLogger) Warn(args ...any)                  {}
+func (l *testWarnLogger) Warnf(format string, args ...any)  { l.warnfCalls++ }
+func (l *testWarnLogger) Error(args ...any)                 {}
+func (l *testWarnLogger) Errorf(format string, args ...any) {}
+func (l *testWarnLogger) Fatal(args ...any)                 {}
+func (l *testWarnLogger) Fatalf(format string, args ...any) {}
 
 func (a *mockAgent) Run(ctx context.Context, invocation *Invocation) (<-chan *event.Event, error) {
 	return nil, nil
@@ -62,6 +100,23 @@ func (m *mockAgent) FindSubAgent(name string) Agent {
 	return nil
 }
 
+type invocationSyncTestModel struct {
+	name string
+}
+
+func (m *invocationSyncTestModel) GenerateContent(
+	_ context.Context,
+	_ *model.Request,
+) (<-chan *model.Response, error) {
+	ch := make(chan *model.Response)
+	close(ch)
+	return ch, nil
+}
+
+func (m *invocationSyncTestModel) Info() model.Info {
+	return model.Info{Name: m.name}
+}
+
 func TestInvocation_Clone(t *testing.T) {
 	inv := NewInvocation(
 		WithInvocationID("test-invocation"),
@@ -76,6 +131,194 @@ func TestInvocation_Clone(t *testing.T) {
 	require.Equal(t, "Hello", subInv.Message.Content)
 	require.Equal(t, inv.noticeChannels, subInv.noticeChannels)
 	require.Equal(t, inv.noticeMu, subInv.noticeMu)
+}
+
+func TestInvocation_Clone_PropagatesParentMetadata(t *testing.T) {
+	parentMeta := &ParentInvocationMetadata{
+		TriggerType: TriggerTypeToolCall,
+		TriggerID:   "call-abc",
+		TriggerName: "tool-x",
+	}
+	inv := NewInvocation(
+		WithInvocationID("test-invocation"),
+		WithInvocationParentMetadata(parentMeta),
+	)
+
+	// Clone without explicit ParentMetadata option should inherit from parent.
+	cloned := inv.Clone(WithInvocationAgent(&mockAgent{name: "child-agent"}))
+	require.NotNil(t, cloned.ParentMetadata)
+	require.Equal(t, "call-abc", cloned.ParentMetadata.TriggerID,
+		"Clone should propagate ParentMetadata so events from derived invocations preserve correlation")
+
+	// Clone with explicit ParentMetadata option should override the parent value.
+	overrideMeta := &ParentInvocationMetadata{
+		TriggerType: TriggerTypeToolCall,
+		TriggerID:   "call-xyz",
+		TriggerName: "tool-y",
+	}
+	overridden := inv.Clone(
+		WithInvocationAgent(&mockAgent{name: "child-agent"}),
+		WithInvocationParentMetadata(overrideMeta),
+	)
+	require.Equal(t, "call-xyz", overridden.ParentMetadata.TriggerID,
+		"explicit WithInvocationParentMetadata should override the inherited value")
+}
+
+func TestInvocation_View_PropagatesParentMetadata(t *testing.T) {
+	parentMeta := &ParentInvocationMetadata{
+		TriggerType: TriggerTypeToolCall,
+		TriggerID:   "call-abc",
+		TriggerName: "tool-x",
+	}
+	inv := NewInvocation(
+		WithInvocationID("test-invocation"),
+		WithInvocationAgent(&mockAgent{name: "root-agent"}),
+		WithInvocationParentMetadata(parentMeta),
+	)
+
+	view := inv.View()
+	require.NotNil(t, view.ParentMetadata)
+	require.Equal(t, "call-abc", view.ParentMetadata.TriggerID,
+		"View should preserve ParentMetadata since it is part of invocation identity")
+}
+
+func TestInvocation_SyncView_PropagatesParentMetadata(t *testing.T) {
+	originalMeta := &ParentInvocationMetadata{
+		TriggerType: TriggerTypeToolCall,
+		TriggerID:   "call-original",
+		TriggerName: "tool-x",
+	}
+	source := NewInvocation(
+		WithInvocationID("test-invocation"),
+		WithInvocationAgent(&mockAgent{name: "root-agent"}),
+		WithInvocationParentMetadata(originalMeta),
+	)
+
+	view := source.View()
+	view.ParentMetadata = &ParentInvocationMetadata{
+		TriggerType: TriggerTypeToolCall,
+		TriggerID:   "call-updated",
+		TriggerName: "tool-x",
+	}
+
+	source.SyncView(view)
+	require.NotNil(t, source.ParentMetadata)
+	require.Equal(t, "call-updated", source.ParentMetadata.TriggerID,
+		"SyncView should sync ParentMetadata back to the source invocation")
+}
+
+func TestInvocation_View_PreservesIdentityWithoutMutatingSource(t *testing.T) {
+	sourceConfigs := map[string]any{"source": "config"}
+	inv := NewInvocation(
+		WithInvocationID("test-invocation"),
+		WithInvocationAgent(&mockAgent{name: "root-agent"}),
+		WithInvocationRunOptions(RunOptions{
+			RequestID:          "request-id",
+			CustomAgentConfigs: sourceConfigs,
+		}),
+		WithInvocationTraceNodeID("root/node"),
+		WithInvocationMessage(model.Message{Role: model.RoleUser, Content: "Hello"}),
+	)
+	viewConfigs := map[string]any{"view": "config"}
+	view := inv.View(
+		WithInvocationAgent(&mockAgent{name: "view-agent"}),
+		WithInvocationRunOptions(RunOptions{
+			RequestID:          "request-id",
+			CustomAgentConfigs: viewConfigs,
+		}),
+	)
+	require.NotNil(t, view)
+	require.Equal(t, inv.InvocationID, view.InvocationID)
+	require.Equal(t, inv.GetParentInvocation(), view.GetParentInvocation())
+	require.Equal(t, inv.noticeChannels, view.noticeChannels)
+	require.Equal(t, inv.noticeMu, view.noticeMu)
+	require.Equal(t, "view-agent", view.AgentName)
+	require.Equal(t, "root-agent", inv.AgentName)
+	require.Equal(t, viewConfigs, view.RunOptions.CustomAgentConfigs)
+	require.Equal(t, sourceConfigs, inv.RunOptions.CustomAgentConfigs)
+	require.Equal(t, "root/node", InvocationTraceNodeID(view))
+	require.Equal(t, "root/node", InvocationTraceNodeID(inv))
+}
+
+func TestInvocation_SyncView_CopiesExecutionVisibleState(t *testing.T) {
+	sourceConfigs := map[string]any{"source": "config"}
+	source := NewInvocation(
+		WithInvocationID("source-invocation"),
+		WithInvocationAgent(&mockAgent{name: "source-agent"}),
+		WithInvocationRunOptions(RunOptions{
+			RequestID:          "request-id",
+			CustomAgentConfigs: sourceConfigs,
+		}),
+		WithInvocationMessage(model.Message{Role: model.RoleUser, Content: "Hello"}),
+	)
+	source.state = map[string]any{flusherStateKey: "source-holder"}
+	viewAgent := &mockAgent{name: "view-agent"}
+	viewModel := &invocationSyncTestModel{name: "view-model"}
+	view := source.View()
+	view.Agent = viewAgent
+	view.AgentName = viewAgent.name
+	view.InvocationID = "view-invocation"
+	view.Branch = "view-branch"
+	view.EndInvocation = true
+	view.Model = viewModel
+	view.Message = model.Message{Role: model.RoleAssistant, Content: "View"}
+	view.TransferInfo = &TransferInfo{
+		TargetAgentName: "target-agent",
+		Message:         "transfer-message",
+	}
+	view.StructuredOutput = &model.StructuredOutput{}
+	view.StructuredOutputType = reflect.TypeOf(struct{}{})
+	view.eventFilterKey = "view-filter-key"
+	view.parent = NewInvocation(WithInvocationID("parent-invocation"))
+	view.entryPredecessorStepIDs = []string{"step-1", "step-2"}
+	view.traceNodeID = "view/node"
+	view.MaxLLMCalls = 3
+	view.MaxToolIterations = 4
+	view.timingInfo = &model.TimingInfo{FirstTokenDuration: time.Second}
+	view.llmCallCount = 1
+	view.toolIterationCount = 2
+	view.state = map[string]any{flusherStateKey: "view-holder"}
+
+	source.SyncView(view)
+
+	require.Same(t, viewAgent, source.Agent)
+	require.Equal(t, "view-agent", source.AgentName)
+	require.Equal(t, "view-invocation", source.InvocationID)
+	require.Equal(t, "view-branch", source.Branch)
+	require.True(t, source.EndInvocation)
+	require.Same(t, viewModel, source.Model)
+	require.Equal(t, "View", source.Message.Content)
+	require.Equal(t, "target-agent", source.TransferInfo.TargetAgentName)
+	require.NotNil(t, source.StructuredOutput)
+	require.Equal(t, reflect.TypeOf(struct{}{}), source.StructuredOutputType)
+	require.Equal(t, "view-filter-key", source.GetEventFilterKey())
+	require.Equal(t, "parent-invocation", source.GetParentInvocation().InvocationID)
+	require.Equal(t, []string{"step-1", "step-2"}, source.entryPredecessorStepIDs)
+	require.Equal(t, "view/node", InvocationTraceNodeID(source))
+	require.Equal(t, 3, source.MaxLLMCalls)
+	require.Equal(t, 4, source.MaxToolIterations)
+	require.Equal(t, time.Second, source.timingInfo.FirstTokenDuration)
+	require.Equal(t, 1, source.llmCallCount)
+	require.Equal(t, 2, source.toolIterationCount)
+	require.Equal(t, sourceConfigs, source.RunOptions.CustomAgentConfigs)
+	require.Equal(t, "view-holder", source.state[flusherStateKey])
+}
+
+func TestInvocation_SyncView_Guards(t *testing.T) {
+	var nilInvocation *Invocation
+	nilInvocation.SyncView(NewInvocation())
+
+	source := NewInvocation(
+		WithInvocationID("source-invocation"),
+		WithInvocationAgent(&mockAgent{name: "source-agent"}),
+	)
+	source.SyncView(nil)
+	require.Equal(t, "source-invocation", source.InvocationID)
+	require.Equal(t, "source-agent", source.AgentName)
+
+	source.SyncView(source)
+	require.Equal(t, "source-invocation", source.InvocationID)
+	require.Equal(t, "source-agent", source.AgentName)
 }
 
 func TestInvocation_AddNoticeChannel(t *testing.T) {
@@ -393,18 +636,393 @@ func TestInvocation_cloneState(t *testing.T) {
 	t.Run("copies allowed keys only", func(t *testing.T) {
 		inv := &Invocation{
 			state: map[string]any{
-				flusherStateKey: "flush-holder",
-				barrierStateKey: "barrier-holder",
-				"other":         "skip",
+				flusherStateKey:             "flush-holder",
+				barrierStateKey:             "barrier-holder",
+				surfaceRootNodeIDStateKey:   "workflow/root",
+				teamMemberTraceRootStateKey: "workflow/team",
+				streamHubStateKey: &StreamHub{
+					streams: make(map[string]*stream),
+				},
+				"other": "skip",
 			},
 		}
 		cloned := inv.cloneState()
 		require.NotNil(t, cloned)
-		require.Len(t, cloned, 2)
+		require.Len(t, cloned, 5)
 		require.Equal(t, "flush-holder", cloned[flusherStateKey])
 		require.Equal(t, "barrier-holder", cloned[barrierStateKey])
+		require.Equal(t, "workflow/root", cloned[surfaceRootNodeIDStateKey])
+		require.Equal(t, "workflow/team", cloned[teamMemberTraceRootStateKey])
+		require.NotNil(t, cloned[streamHubStateKey])
 		assert.NotContains(t, cloned, "other")
 	})
+}
+
+func TestInvocation_ViewCopiesCustomState(t *testing.T) {
+	const (
+		customStateKey   = "custom:payload"
+		customStateValue = "business-data"
+		updatedValue     = "updated-data"
+	)
+	inv := NewInvocation()
+	inv.SetState(customStateKey, customStateValue)
+
+	view := inv.View()
+	value, ok := view.GetState(customStateKey)
+	require.True(t, ok)
+	require.Equal(t, customStateValue, value)
+
+	view.SetState(customStateKey, updatedValue)
+	value, ok = inv.GetState(customStateKey)
+	require.True(t, ok)
+	require.Equal(t, customStateValue, value)
+}
+
+func TestInvocation_ViewCopiesMutableCustomState(t *testing.T) {
+	const customStateKey = "custom:payload"
+	inv := NewInvocation()
+	inv.SetState(customStateKey, []byte("abc"))
+
+	view := inv.View()
+	value, ok := view.GetState(customStateKey)
+	require.True(t, ok)
+	viewValue, ok := value.([]byte)
+	require.True(t, ok)
+	viewValue[0] = 'z'
+
+	sourceValue, ok := inv.GetState(customStateKey)
+	require.True(t, ok)
+	require.Equal(t, []byte("abc"), sourceValue)
+}
+
+func TestInvocation_ViewCopiesNestedMutableCustomState(t *testing.T) {
+	const (
+		customMapStateKey   = "custom:map_payload"
+		customPtrStateKey   = "custom:ptr_payload"
+		customCycleStateKey = "custom:cycle_payload"
+	)
+	type customPayload struct {
+		Data []byte
+	}
+	type customNode struct {
+		Data []byte
+		Next *customNode
+	}
+	node := &customNode{Data: []byte("ghi")}
+	node.Next = node
+	inv := NewInvocation()
+	inv.SetState(customMapStateKey, map[string][]byte{
+		"nested": []byte("abc"),
+	})
+	inv.SetState(customPtrStateKey, &customPayload{
+		Data: []byte("def"),
+	})
+	inv.SetState(customCycleStateKey, node)
+
+	view := inv.View()
+	value, ok := view.GetState(customMapStateKey)
+	require.True(t, ok)
+	viewValue, ok := value.(map[string][]byte)
+	require.True(t, ok)
+	viewValue["nested"][0] = 'z'
+	ptrValue, ok := view.GetState(customPtrStateKey)
+	require.True(t, ok)
+	viewPtr, ok := ptrValue.(*customPayload)
+	require.True(t, ok)
+	viewPtr.Data[0] = 'z'
+	cycleValue, ok := view.GetState(customCycleStateKey)
+	require.True(t, ok)
+	viewNode, ok := cycleValue.(*customNode)
+	require.True(t, ok)
+	require.Same(t, viewNode, viewNode.Next)
+	viewNode.Data[0] = 'z'
+
+	sourceValue, ok := inv.GetState(customMapStateKey)
+	require.True(t, ok)
+	sourceMap, ok := sourceValue.(map[string][]byte)
+	require.True(t, ok)
+	require.Equal(t, []byte("abc"), sourceMap["nested"])
+	sourceValue, ok = inv.GetState(customPtrStateKey)
+	require.True(t, ok)
+	sourcePtr, ok := sourceValue.(*customPayload)
+	require.True(t, ok)
+	require.Equal(t, []byte("def"), sourcePtr.Data)
+	sourceValue, ok = inv.GetState(customCycleStateKey)
+	require.True(t, ok)
+	sourceNode, ok := sourceValue.(*customNode)
+	require.True(t, ok)
+	require.Equal(t, []byte("ghi"), sourceNode.Data)
+}
+
+func TestInvocation_ViewClonesKnownMutableState(t *testing.T) {
+	const (
+		bufferPtrStateKey   = "custom:buffer_ptr"
+		bufferValueStateKey = "custom:buffer_value"
+		builderStateKey     = "custom:builder"
+		bigPtrStateKey      = "custom:big_ptr"
+		bigValueStateKey    = "custom:big_value"
+	)
+	bufferPtr := bytes.NewBufferString("abc")
+	bufferValue := *bytes.NewBufferString("def")
+	var builder strings.Builder
+	builder.WriteString("ghi")
+	bigPtr := big.NewInt(10)
+	bigValue := *big.NewInt(20)
+
+	inv := NewInvocation()
+	inv.SetState(bufferPtrStateKey, bufferPtr)
+	inv.SetState(bufferValueStateKey, bufferValue)
+	inv.SetState(builderStateKey, &builder)
+	inv.SetState(bigPtrStateKey, bigPtr)
+	inv.SetState(bigValueStateKey, bigValue)
+
+	view := inv.View()
+	viewBufferPtr, ok := GetStateValue[*bytes.Buffer](view, bufferPtrStateKey)
+	require.True(t, ok)
+	require.NotSame(t, bufferPtr, viewBufferPtr)
+	viewBufferPtr.WriteString("-view")
+	require.Equal(t, "abc", bufferPtr.String())
+
+	viewBufferValue, ok := GetStateValue[bytes.Buffer](view, bufferValueStateKey)
+	require.True(t, ok)
+	viewBufferValue.WriteString("-view")
+	sourceBufferValue, ok := GetStateValue[bytes.Buffer](inv, bufferValueStateKey)
+	require.True(t, ok)
+	require.Equal(t, "def", sourceBufferValue.String())
+
+	viewBuilder, ok := GetStateValue[*strings.Builder](view, builderStateKey)
+	require.True(t, ok)
+	require.NotSame(t, &builder, viewBuilder)
+	viewBuilder.WriteString("-view")
+	require.Equal(t, "ghi", builder.String())
+
+	viewBigPtr, ok := GetStateValue[*big.Int](view, bigPtrStateKey)
+	require.True(t, ok)
+	require.NotSame(t, bigPtr, viewBigPtr)
+	viewBigPtr.Add(viewBigPtr, big.NewInt(1))
+	require.Equal(t, int64(10), bigPtr.Int64())
+
+	viewBigValue, ok := GetStateValue[big.Int](view, bigValueStateKey)
+	require.True(t, ok)
+	viewBigValue.Add(&viewBigValue, big.NewInt(1))
+	sourceBigValue, ok := GetStateValue[big.Int](inv, bigValueStateKey)
+	require.True(t, ok)
+	require.Equal(t, int64(20), sourceBigValue.Int64())
+}
+
+func TestInvocation_ViewKeepsNilKnownMutablePointers(t *testing.T) {
+	const (
+		nilBufferStateKey  = "custom:nil_buffer"
+		nilBuilderStateKey = "custom:nil_builder"
+		nilBigStateKey     = "custom:nil_big"
+	)
+	var (
+		nilBuffer  *bytes.Buffer
+		nilBuilder *strings.Builder
+		nilBig     *big.Int
+	)
+	inv := NewInvocation()
+	inv.SetState(nilBufferStateKey, nilBuffer)
+	inv.SetState(nilBuilderStateKey, nilBuilder)
+	inv.SetState(nilBigStateKey, nilBig)
+
+	view := inv.View()
+	viewBuffer, ok := GetStateValue[*bytes.Buffer](view, nilBufferStateKey)
+	require.True(t, ok)
+	require.Nil(t, viewBuffer)
+	viewBuilder, ok := GetStateValue[*strings.Builder](view, nilBuilderStateKey)
+	require.True(t, ok)
+	require.Nil(t, viewBuilder)
+	viewBig, ok := GetStateValue[*big.Int](view, nilBigStateKey)
+	require.True(t, ok)
+	require.Nil(t, viewBig)
+}
+
+func TestInvocation_ViewKeepsOpaqueStateByReference(t *testing.T) {
+	const opaqueStateKey = "custom:opaque"
+	type opaqueState struct {
+		mu    sync.Mutex
+		value int
+	}
+	source := &opaqueState{value: 1}
+	inv := NewInvocation()
+	inv.SetState(opaqueStateKey, source)
+
+	view := inv.View()
+	viewState, ok := GetStateValue[*opaqueState](view, opaqueStateKey)
+	require.True(t, ok)
+	require.Same(t, source, viewState)
+}
+
+func TestInvocationViewDoesNotRaceWithOpaqueStateMutation(t *testing.T) {
+	const opaqueStateKey = "custom:opaque"
+	type opaqueState struct {
+		mu    sync.Mutex
+		value int
+	}
+	source := &opaqueState{}
+	inv := NewInvocation()
+	inv.SetState(opaqueStateKey, source)
+
+	const iterations = 10000
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			_ = inv.View()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			source.mu.Lock()
+			source.value++
+			source.mu.Unlock()
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+}
+
+func TestCloneKnownStateReflectValueRejectsUnsafeReflectValues(t *testing.T) {
+	cloned, ok := cloneKnownStateReflectValue(reflect.Value{})
+	require.False(t, ok)
+	require.False(t, cloned.IsValid())
+
+	type opaqueState struct {
+		hidden int
+	}
+	hiddenField := reflect.ValueOf(opaqueState{hidden: 1}).Field(0)
+	cloned, ok = cloneKnownStateReflectValue(hiddenField)
+	require.False(t, ok)
+	require.False(t, cloned.IsValid())
+}
+
+func TestCloneStateValueHandlesEdgeCases(t *testing.T) {
+	type namedString string
+	type customPayload struct {
+		Data []byte
+	}
+	type opaquePayload struct {
+		Data   []byte
+		hidden int
+	}
+	type sharedSlices struct {
+		Short []byte
+		Long  []byte
+	}
+
+	require.Nil(t, cloneStateValue(nil))
+	var nilSlice []byte
+	require.Nil(t, cloneStateValue(nilSlice).([]byte))
+	var nilMap map[string][]byte
+	require.Nil(t, cloneStateValue(nilMap).(map[string][]byte))
+	var nilPtr *customPayload
+	require.Nil(t, cloneStateValue(nilPtr).(*customPayload))
+
+	arr := [1][]byte{[]byte("abc")}
+	clonedArr := cloneStateValue(arr).([1][]byte)
+	clonedArr[0][0] = 'z'
+	require.Equal(t, []byte("abc"), arr[0])
+
+	const (
+		sharedShortData = "ab"
+		sharedLongData  = "abcd"
+	)
+	base := []byte(sharedLongData)
+	shared := sharedSlices{
+		Short: base[:len(sharedShortData)],
+		Long:  base,
+	}
+	clonedShared := cloneStateValue(shared).(sharedSlices)
+	require.Equal(t, []byte(sharedShortData), clonedShared.Short)
+	require.Equal(t, []byte(sharedLongData), clonedShared.Long)
+	clonedShared.Long[0] = 'z'
+	require.Equal(t, []byte(sharedLongData), base)
+	require.Equal(t, []byte(sharedShortData), clonedShared.Short)
+
+	var iface any = []byte("abc")
+	clonedValue, ok := cloneStateReflectValue(
+		reflect.ValueOf(&iface).Elem(),
+		map[reflectVisit]reflect.Value{},
+	)
+	require.True(t, ok)
+	clonedBytes := clonedValue.Interface().([]byte)
+	clonedBytes[0] = 'z'
+	require.Equal(t, []byte("abc"), iface)
+
+	var nilIface any
+	clonedValue, ok = cloneStateReflectValue(
+		reflect.ValueOf(&nilIface).Elem(),
+		map[reflectVisit]reflect.Value{},
+	)
+	require.True(t, ok)
+	require.True(t, clonedValue.IsNil())
+
+	opaque := &opaquePayload{Data: []byte("abc"), hidden: 1}
+	require.Same(t, opaque, cloneStateValue(opaque))
+	opaqueMap := map[string]*opaquePayload{"opaque": opaque}
+	clonedMap := cloneStateValue(opaqueMap).(map[string]*opaquePayload)
+	require.Same(t, opaque, clonedMap["opaque"])
+
+	buffer := bytes.NewBufferString("abc")
+	clonedBuffer := cloneStateValue(buffer).(*bytes.Buffer)
+	clonedBuffer.WriteString("d")
+	require.Equal(t, "abc", buffer.String())
+	bufferValue := *bytes.NewBufferString("efg")
+	clonedBufferValue := cloneStateValue(bufferValue).(bytes.Buffer)
+	clonedBufferValue.WriteString("h")
+	require.Equal(t, "efg", bufferValue.String())
+
+	var builder strings.Builder
+	builder.WriteString("abc")
+	clonedBuilder := cloneStateValue(&builder).(*strings.Builder)
+	clonedBuilder.WriteString("d")
+	require.Equal(t, "abc", builder.String())
+
+	bigValue := big.NewInt(10)
+	clonedBig := cloneStateValue(bigValue).(*big.Int)
+	clonedBig.Add(clonedBig, big.NewInt(1))
+	require.Equal(t, int64(10), bigValue.Int64())
+
+	clonedValue, ok = cloneStateAsType(
+		reflect.ValueOf("named"),
+		reflect.TypeOf(namedString("")),
+	)
+	require.True(t, ok)
+	require.Equal(t, namedString("named"), clonedValue.Interface())
+	_, ok = cloneStateAsType(
+		reflect.ValueOf(struct{}{}),
+		reflect.TypeOf([]byte{}),
+	)
+	require.False(t, ok)
+	element := cloneStateElement(
+		reflect.ValueOf("named"),
+		reflect.TypeOf(namedString("")),
+		map[reflectVisit]reflect.Value{},
+	)
+	require.Equal(t, namedString("named"), element.Interface())
+}
+
+func TestInvocation_SyncViewCopiesCustomState(t *testing.T) {
+	const (
+		customStateKey   = "custom:payload"
+		customStateValue = "business-data"
+	)
+	inv := NewInvocation()
+	view := inv.View()
+	view.SetState(customStateKey, customStateValue)
+
+	inv.SyncView(view)
+
+	value, ok := inv.GetState(customStateKey)
+	require.True(t, ok)
+	require.Equal(t, customStateValue, value)
 }
 
 func TestInvocation_GetEventFilterKey(t *testing.T) {
@@ -528,6 +1146,31 @@ func TestInjectIntoEvent(t *testing.T) {
 			validate: func(t *testing.T, e *event.Event) {
 				require.Equal(t, "child-id", e.InvocationID)
 				require.Equal(t, "parent-id", e.ParentInvocationID)
+			},
+		},
+		{
+			name: "inject parent metadata",
+			inv: NewInvocation(WithInvocationID("inv-id"), WithInvocationParentMetadata(
+				&ParentInvocationMetadata{TriggerType: TriggerTypeToolCall, TriggerID: "call-123", TriggerName: "tool-x"},
+			)),
+			event: &event.Event{},
+			validate: func(t *testing.T, e *event.Event) {
+				require.Equal(t, "inv-id", e.InvocationID)
+				require.NotNil(t, e.ParentMetadata)
+				require.Equal(t, "call-123", e.ParentMetadata.TriggerID)
+				require.Equal(t, TriggerTypeToolCall, e.ParentMetadata.TriggerType)
+			},
+		},
+		{
+			name: "does not overwrite existing parent metadata",
+			inv: NewInvocation(WithInvocationID("inv-id"), WithInvocationParentMetadata(
+				&ParentInvocationMetadata{TriggerType: TriggerTypeToolCall, TriggerID: "call-new", TriggerName: "tool-x"},
+			)),
+			event: &event.Event{ParentMetadata: &event.ParentInvocationMetadata{
+				TriggerType: TriggerTypeToolCall, TriggerID: "call-existing", TriggerName: "tool-x",
+			}},
+			validate: func(t *testing.T, e *event.Event) {
+				require.Equal(t, "call-existing", e.ParentMetadata.TriggerID)
 			},
 		},
 	}
@@ -676,6 +1319,77 @@ func TestWithModelName(t *testing.T) {
 	require.Equal(t, "gpt-4", opts.ModelName)
 }
 
+func TestWithToolResultEventPerCallEnabled(t *testing.T) {
+	opts := NewRunOptions()
+	require.False(t, opts.ToolResultEventPerCallEnabled)
+
+	WithToolResultEventPerCallEnabled(true)(&opts)
+	require.True(t, opts.ToolResultEventPerCallEnabled)
+
+	WithToolResultEventPerCallEnabled(false)(&opts)
+	require.False(t, opts.ToolResultEventPerCallEnabled)
+}
+
+func TestWithModelContextWindow(t *testing.T) {
+	window, ok := ModelContextWindowFromRunOptions(nil)
+	require.False(t, ok)
+	require.Zero(t, window)
+
+	window, ok = ModelContextWindowFromRunOptions(&RunOptions{})
+	require.False(t, ok)
+	require.Zero(t, window)
+
+	opts := &RunOptions{}
+	WithModelContextWindow(204800)(opts)
+	window, ok = ModelContextWindowFromRunOptions(opts)
+	require.True(t, ok)
+	require.Equal(t, 204800, window)
+
+	WithModelContextWindow(0)(opts)
+	window, ok = ModelContextWindowFromRunOptions(opts)
+	require.True(t, ok)
+	require.Equal(t, 204800, window)
+
+	opts.ModelContextWindow = -1
+	window, ok = ModelContextWindowFromRunOptions(opts)
+	require.False(t, ok)
+	require.Zero(t, window)
+}
+
+func TestWithModelSelector(t *testing.T) {
+	selector := func(ctx context.Context, inv *Invocation) (model.Model, error) {
+		return inv.Model, nil
+	}
+	opts := &RunOptions{}
+	WithModelSelector(selector)(opts)
+	require.NotNil(t, opts.ModelSelector)
+	got, err := opts.ModelSelector(context.Background(), &Invocation{Model: &mockModel{name: "selector-model"}})
+	require.NoError(t, err)
+	require.Equal(t, "selector-model", got.Info().Name)
+}
+
+func TestWithToolPermissionPolicy(t *testing.T) {
+	const (
+		toolName    = "dangerous_tool"
+		blockReason = "blocked"
+	)
+	opts := &RunOptions{}
+	WithToolPermissionPolicyFunc(
+		func(_ context.Context, req *tool.PermissionRequest) (tool.PermissionDecision, error) {
+			require.Equal(t, toolName, req.ToolName)
+			return tool.DenyPermission(blockReason), nil
+		},
+	)(opts)
+
+	require.NotNil(t, opts.ToolPermissionPolicy)
+	decision, err := opts.ToolPermissionPolicy.CheckToolPermission(
+		context.Background(),
+		&tool.PermissionRequest{ToolName: toolName},
+	)
+	require.NoError(t, err)
+	require.Equal(t, tool.PermissionActionDeny, decision.Action)
+}
+
 func TestWithInstruction(t *testing.T) {
 	opts := &RunOptions{}
 	WithInstruction(testRunInstruction)(opts)
@@ -688,6 +1402,65 @@ func TestWithGlobalInstruction(t *testing.T) {
 	WithGlobalInstruction(testRunGlobalInstruction)(opts)
 
 	require.Equal(t, testRunGlobalInstruction, opts.GlobalInstruction)
+}
+
+func TestWithStructuredOutputJSON(t *testing.T) {
+	type MyStruct struct {
+		Field string `json:"field"`
+	}
+
+	opts := &RunOptions{}
+	WithStructuredOutputJSON(new(MyStruct), true, "test description")(opts)
+
+	require.NotNil(t, opts.StructuredOutput)
+	require.Equal(t, model.StructuredOutputJSONSchema, opts.StructuredOutput.Type)
+	require.NotNil(t, opts.StructuredOutput.JSONSchema)
+	require.Equal(t, "MyStruct", opts.StructuredOutput.JSONSchema.Name)
+	require.True(t, opts.StructuredOutput.JSONSchema.Strict)
+	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
+	require.Equal(t, reflect.TypeOf((*MyStruct)(nil)), opts.StructuredOutputType)
+}
+
+func TestWithStructuredOutputJSON_StrictFlagControlsGeneratedSchema(t *testing.T) {
+	type MyStruct struct {
+		Field    string   `json:"field"`
+		Optional []string `json:"optional"`
+	}
+
+	strictOpts := &RunOptions{}
+	WithStructuredOutputJSON(new(MyStruct), true, "strict")(strictOpts)
+	require.NotNil(t, strictOpts.StructuredOutput)
+	strictSchema := strictOpts.StructuredOutput.JSONSchema.Schema
+	strictRequired := strictSchema["required"].([]string)
+	require.Len(t, strictRequired, 2)
+	strictProps := strictSchema["properties"].(map[string]any)
+	_, hasAnyOf := strictProps["optional"].(map[string]any)["anyOf"]
+	require.True(t, hasAnyOf)
+
+	nonStrictOpts := &RunOptions{}
+	WithStructuredOutputJSON(new(MyStruct), false, "non-strict")(nonStrictOpts)
+	require.NotNil(t, nonStrictOpts.StructuredOutput)
+	nonStrictSchema := nonStrictOpts.StructuredOutput.JSONSchema.Schema
+	nonStrictRequired := nonStrictSchema["required"].([]string)
+	require.Equal(t, []string{"field"}, nonStrictRequired)
+	nonStrictProps := nonStrictSchema["properties"].(map[string]any)
+	_, hasAnyOf = nonStrictProps["optional"].(map[string]any)["anyOf"]
+	require.False(t, hasAnyOf)
+}
+
+func TestWithStructuredOutputJSONSchema(t *testing.T) {
+	schema := map[string]any{"type": "object"}
+
+	opts := &RunOptions{}
+	WithStructuredOutputJSONSchema("", schema, true, "test description")(opts)
+
+	require.NotNil(t, opts.StructuredOutput)
+	require.Equal(t, model.StructuredOutputJSONSchema, opts.StructuredOutput.Type)
+	require.NotNil(t, opts.StructuredOutput.JSONSchema)
+	require.Equal(t, "output", opts.StructuredOutput.JSONSchema.Name)
+	require.True(t, opts.StructuredOutput.JSONSchema.Strict)
+	require.Equal(t, "test description", opts.StructuredOutput.JSONSchema.Description)
+	require.Nil(t, opts.StructuredOutputType)
 }
 
 func TestWithModel_Integration(t *testing.T) {
@@ -739,6 +1512,36 @@ func TestWithGlobalInstruction_Integration(t *testing.T) {
 	)
 }
 
+func TestInvocationClonePreservesRunStructuredOutputButDropsInvocationStructuredOutput(t *testing.T) {
+	type MyStruct struct {
+		Field string `json:"field"`
+	}
+
+	structuredOutput := &model.StructuredOutput{
+		Type: model.StructuredOutputJSONSchema,
+		JSONSchema: &model.JSONSchemaConfig{
+			Name:   "MyStruct",
+			Schema: map[string]any{"type": "object"},
+		},
+	}
+	inv := &Invocation{
+		RunOptions: RunOptions{
+			StructuredOutput:     structuredOutput,
+			StructuredOutputType: reflect.TypeOf((*MyStruct)(nil)),
+		},
+		StructuredOutput:     structuredOutput,
+		StructuredOutputType: reflect.TypeOf((*MyStruct)(nil)),
+	}
+
+	cloned := inv.Clone()
+
+	require.NotNil(t, cloned)
+	require.Equal(t, structuredOutput, cloned.RunOptions.StructuredOutput)
+	require.Equal(t, reflect.TypeOf((*MyStruct)(nil)), cloned.RunOptions.StructuredOutputType)
+	require.Nil(t, cloned.StructuredOutput)
+	require.Nil(t, cloned.StructuredOutputType)
+}
+
 func TestInvocation_IncLLMCallCount_NoLimitOrNil(t *testing.T) {
 	// nil invocation should be a no-op
 	var nilInv *Invocation
@@ -779,12 +1582,13 @@ func TestInvocation_IncToolIteration_NoLimitOrNil(t *testing.T) {
 	// nil invocation should be a no-op and report not exceeded.
 	var nilInv *Invocation
 	require.False(t, nilInv.IncToolIteration())
+	require.Zero(t, nilInv.ToolIterationCount())
 
 	// MaxToolIterations <= 0 should be treated as "no limit".
 	inv := &Invocation{}
 	exceeded := inv.IncToolIteration()
 	require.False(t, exceeded)
-	require.Equal(t, 0, inv.toolIterationCount, "counter should not increment when no limit is configured")
+	require.Zero(t, inv.ToolIterationCount(), "counter should not increment when no limit is configured")
 }
 
 func TestInvocation_IncToolIteration_WithLimitAndOverflow(t *testing.T) {
@@ -795,17 +1599,26 @@ func TestInvocation_IncToolIteration_WithLimitAndOverflow(t *testing.T) {
 	// First iteration within limit.
 	exceeded := inv.IncToolIteration()
 	require.False(t, exceeded)
-	require.Equal(t, 1, inv.toolIterationCount)
+	require.Equal(t, 1, inv.ToolIterationCount())
 
 	// Second iteration still within limit.
 	exceeded = inv.IncToolIteration()
 	require.False(t, exceeded)
-	require.Equal(t, 2, inv.toolIterationCount)
+	require.Equal(t, 2, inv.ToolIterationCount())
 
 	// Third iteration exceeds limit and should report true.
 	exceeded = inv.IncToolIteration()
 	require.True(t, exceeded, "expected true when tool iteration limit is exceeded")
-	require.Equal(t, 3, inv.toolIterationCount)
+	require.Equal(t, 3, inv.ToolIterationCount())
+}
+
+func TestInvocation_ToolIterationCount_CloneAndView(t *testing.T) {
+	inv := NewInvocation()
+	inv.MaxToolIterations = 2
+	require.False(t, inv.IncToolIteration())
+
+	require.Equal(t, 1, inv.View().ToolIterationCount())
+	require.Zero(t, inv.Clone().ToolIterationCount())
 }
 
 func TestWithInjectedContextMessages(t *testing.T) {
@@ -819,4 +1632,44 @@ func TestWithInjectedContextMessages(t *testing.T) {
 		{Role: model.RoleUser, Content: "Hello"},
 		{Role: model.RoleAssistant, Content: "Hello"},
 	}, opts.InjectedContextMessages)
+}
+
+func TestWithLateContextMessages(t *testing.T) {
+	opts := &RunOptions{}
+	WithLateContextMessages([]model.Message{
+		{Role: model.RoleUser, Content: "Rules A"},
+	})(opts)
+	WithLateContextMessages([]model.Message{
+		{Role: model.RoleUser, Content: "Rules B"},
+	})(opts)
+
+	require.Equal(t, []model.Message{
+		{Role: model.RoleUser, Content: "Rules A"},
+		{Role: model.RoleUser, Content: "Rules B"},
+	}, opts.LateContextMessages)
+}
+
+func TestWithUserMessageRewriter(t *testing.T) {
+	opts := &RunOptions{}
+	rewriter := func(
+		ctx context.Context,
+		args *UserMessageRewriteArgs,
+	) ([]model.Message, error) {
+		require.Equal(t, "raw", args.OriginalMessage.Content)
+		return []model.Message{
+			model.NewUserMessage("ctx"),
+			model.NewUserMessage("rewritten"),
+		}, nil
+	}
+	WithUserMessageRewriter(rewriter)(opts)
+	require.NotNil(t, opts.UserMessageRewriter)
+	msgs, err := opts.UserMessageRewriter(
+		context.Background(),
+		&UserMessageRewriteArgs{OriginalMessage: model.NewUserMessage("raw")},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []model.Message{
+		model.NewUserMessage("ctx"),
+		model.NewUserMessage("rewritten"),
+	}, msgs)
 }

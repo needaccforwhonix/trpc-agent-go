@@ -36,11 +36,13 @@ const (
 
 var (
 	defaultOptions = ServiceOpts{
-		tableName:      "memories",
-		memoryLimit:    imemory.DefaultMemoryLimit,
-		toolCreators:   imemory.AllToolCreators,
-		enabledTools:   imemory.DefaultEnabledTools,
-		asyncMemoryNum: imemory.DefaultAsyncMemoryNum,
+		tableName:        "memories",
+		memoryLimit:      imemory.DefaultMemoryLimit,
+		searchMinScore:   imemory.DefaultSearchMinScore,
+		maxSearchResults: imemory.DefaultMaxSearchResults,
+		toolCreators:     imemory.AllToolCreators,
+		enabledTools:     imemory.DefaultEnabledTools,
+		asyncMemoryNum:   imemory.DefaultAsyncMemoryNum,
 	}
 )
 
@@ -61,11 +63,16 @@ type ServiceOpts struct {
 	tableName   string
 	memoryLimit int
 	softDelete  bool
+	// keyword-search settings.
+	searchMinScore   float64
+	maxSearchResults int
 
 	// Tool related settings.
 	toolCreators      map[string]memory.ToolCreator
 	enabledTools      map[string]struct{}
-	userExplicitlySet map[string]bool
+	toolExposed       map[string]struct{}
+	toolHidden        map[string]struct{}
+	userExplicitlySet map[string]struct{}
 
 	// skipDBInit skips database initialization (table and index creation).
 	// Useful when user doesn't have DDL permissions or when tables are managed externally.
@@ -82,6 +89,8 @@ type ServiceOpts struct {
 	asyncMemoryNum   int
 	memoryQueueSize  int
 	memoryJobTimeout time.Duration
+	// disableAutoMemoryOnExternalContext skips auto extraction for polluted sessions.
+	disableAutoMemoryOnExternalContext bool
 }
 
 func (o ServiceOpts) clone() ServiceOpts {
@@ -93,9 +102,11 @@ func (o ServiceOpts) clone() ServiceOpts {
 	}
 
 	opts.enabledTools = maps.Clone(o.enabledTools)
+	opts.toolExposed = maps.Clone(o.toolExposed)
+	opts.toolHidden = maps.Clone(o.toolHidden)
 
 	// Initialize userExplicitlySet map (empty for new clone).
-	opts.userExplicitlySet = make(map[string]bool)
+	opts.userExplicitlySet = make(map[string]struct{})
 
 	return opts
 }
@@ -195,6 +206,28 @@ func WithMemoryLimit(limit int) ServiceOpt {
 	}
 }
 
+// WithMinSearchScore sets the minimum keyword-search score. Scores below
+// this value are filtered out. Default is 0.3.
+func WithMinSearchScore(score float64) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		if score < 0 {
+			return
+		}
+		opts.searchMinScore = score
+	}
+}
+
+// WithMaxResults sets the maximum number of keyword-search results.
+// Default is 10. Use 0 to disable truncation.
+func WithMaxResults(maxResults int) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		if maxResults < 0 {
+			return
+		}
+		opts.maxSearchResults = maxResults
+	}
+}
+
 // WithCustomTool sets a custom memory tool implementation.
 // The tool will be enabled by default.
 // If the tool name is invalid or creator is nil, this option will do nothing.
@@ -203,8 +236,18 @@ func WithCustomTool(toolName string, creator memory.ToolCreator) ServiceOpt {
 		if !imemory.IsValidToolName(toolName) || creator == nil {
 			return
 		}
+		if opts.toolCreators == nil {
+			opts.toolCreators = make(map[string]memory.ToolCreator)
+		}
+		if opts.enabledTools == nil {
+			opts.enabledTools = make(map[string]struct{})
+		}
+		if opts.userExplicitlySet == nil {
+			opts.userExplicitlySet = make(map[string]struct{})
+		}
 		opts.toolCreators[toolName] = creator
 		opts.enabledTools[toolName] = struct{}{}
+		opts.userExplicitlySet[toolName] = struct{}{}
 	}
 }
 
@@ -221,14 +264,47 @@ func WithToolEnabled(toolName string, enabled bool) ServiceOpt {
 			opts.enabledTools = make(map[string]struct{})
 		}
 		if opts.userExplicitlySet == nil {
-			opts.userExplicitlySet = make(map[string]bool)
+			opts.userExplicitlySet = make(map[string]struct{})
 		}
 		if enabled {
 			opts.enabledTools[toolName] = struct{}{}
 		} else {
 			delete(opts.enabledTools, toolName)
 		}
-		opts.userExplicitlySet[toolName] = true
+		opts.userExplicitlySet[toolName] = struct{}{}
+	}
+}
+
+// WithAutoMemoryExposedTools exposes enabled tools via Tools() in auto memory
+// mode so the agent can call them directly. Invalid tool names are ignored.
+func WithAutoMemoryExposedTools(toolNames ...string) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		for _, toolName := range toolNames {
+			WithToolExposed(toolName, true)(opts)
+		}
+	}
+}
+
+// WithToolExposed controls whether an enabled memory tool is exposed via
+// Tools(). Use WithAutoMemoryExposedTools for the common auto memory case.
+func WithToolExposed(toolName string, exposed bool) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		if !imemory.IsValidToolName(toolName) {
+			return
+		}
+		if exposed {
+			if opts.toolExposed == nil {
+				opts.toolExposed = make(map[string]struct{})
+			}
+			opts.toolExposed[toolName] = struct{}{}
+			delete(opts.toolHidden, toolName)
+			return
+		}
+		if opts.toolHidden == nil {
+			opts.toolHidden = make(map[string]struct{})
+		}
+		opts.toolHidden[toolName] = struct{}{}
+		delete(opts.toolExposed, toolName)
 	}
 }
 
@@ -301,6 +377,14 @@ func WithMemoryQueueSize(size int) ServiceOpt {
 func WithMemoryJobTimeout(timeout time.Duration) ServiceOpt {
 	return func(opts *ServiceOpts) {
 		opts.memoryJobTimeout = timeout
+	}
+}
+
+// WithDisableAutoMemoryOnExternalContext stops future automatic memory
+// extraction for sessions that consumed framework-owned external context.
+func WithDisableAutoMemoryOnExternalContext(disable bool) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		opts.disableAutoMemoryOnExternalContext = disable
 	}
 }
 

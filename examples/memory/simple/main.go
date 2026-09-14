@@ -13,12 +13,23 @@
 // Usage:
 //
 //	go run main.go -memory=inmemory
+//	go run main.go -memory=sqlite
+//	go run main.go -memory=sqlitevec
 //	go run main.go -memory=redis
 //	go run main.go -memory=mysql
+//	go run main.go -memory=mysqlvec
 //	go run main.go -memory=postgres
 //	go run main.go -memory=pgvector
+//	go run main.go -memory=chromadb
 //
 // Environment variables by memory type (example usage):
+//
+//	sqlite:
+//		export SQLITE_MEMORY_DSN="file:memories.db?_busy_timeout=5000"
+//
+//	sqlitevec:
+//		export SQLITEVEC_MEMORY_DSN="file:memories_vec.db?_busy_timeout=5000"
+//		export SQLITEVEC_EMBEDDER_MODEL="text-embedding-3-small"
 //
 //	redis:
 //		export REDIS_ADDR="localhost:6379"
@@ -29,6 +40,14 @@
 //		export MYSQL_USER="root"
 //		export MYSQL_PASSWORD=""
 //		export MYSQL_DATABASE="trpc_agent_go"
+//
+//	mysqlvec:
+//		export MYSQLVEC_HOST="localhost"
+//		export MYSQLVEC_PORT="3306"
+//		export MYSQLVEC_USER="root"
+//		export MYSQLVEC_PASSWORD=""
+//		export MYSQLVEC_DATABASE="trpc_agent_go"
+//		export MYSQLVEC_EMBEDDER_MODEL="text-embedding-3-small"
 //
 //	postgres:
 //		export PG_HOST="localhost"
@@ -44,6 +63,11 @@
 //		export PGVECTOR_PASSWORD=""
 //		export PGVECTOR_DATABASE="trpc_agent_go"
 //		export PGVECTOR_EMBEDDER_MODEL="text-embedding-3-small"
+//
+//	chromadb:
+//		export CHROMA_BASE_URL="http://localhost:8000"
+//		export CHROMA_COLLECTION="memories"
+//		export CHROMA_EMBEDDER_MODEL="text-embedding-3-small"
 package main
 
 import (
@@ -58,6 +82,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -67,10 +92,29 @@ import (
 )
 
 var (
-	modelName      = flag.String("model", "deepseek-chat", "Name of the model to use")
-	memServiceName = flag.String("memory", "inmemory", "Name of the memory service to use, inmemory / redis / mysql / postgres / pgvector")
-	streaming      = flag.Bool("streaming", true, "Enable streaming mode for responses")
-	softDelete     = flag.Bool("soft-delete", false, "Enable soft delete for MySQL/PostgreSQL memory service")
+	modelName = flag.String(
+		"model",
+		"deepseek-v4-flash",
+		"Name of the model to use",
+	)
+	memServiceName = flag.String(
+		"memory",
+		"inmemory",
+		"Name of the memory service to use, "+
+			"inmemory / sqlite / sqlitevec / redis / "+
+			"mysql / mysqlvec / postgres / pgvector / chromadb",
+	)
+	streaming = flag.Bool(
+		"streaming",
+		true,
+		"Enable streaming mode for responses",
+	)
+	softDelete = flag.Bool(
+		"soft-delete",
+		false,
+		"Enable soft delete for SQLite/SQLiteVec/"+
+			"MySQL/PostgreSQL/pgvector/ChromaDB memory service",
+	)
 )
 
 func main() {
@@ -103,6 +147,7 @@ type memoryChat struct {
 	memServiceName string
 	streaming      bool
 	runner         runner.Runner
+	memoryService  memory.Service
 	userID         string
 	sessionID      string
 }
@@ -114,6 +159,7 @@ func (c *memoryChat) run() error {
 		return fmt.Errorf("setup failed: %w", err)
 	}
 
+	defer c.memoryService.Close()
 	defer c.runner.Close()
 
 	return c.startChat(ctx)
@@ -128,14 +174,14 @@ func (c *memoryChat) setup(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create memory service: %w", err)
 	}
+	c.memoryService = memoryService
 
 	c.userID = "user"
 	c.sessionID = fmt.Sprintf("memory-session-%d", time.Now().Unix())
 
 	genConfig := model.GenerationConfig{
-		MaxTokens:   util.IntPtr(2000),
-		Temperature: util.FloatPtr(0.7),
-		Stream:      c.streaming,
+		MaxTokens: util.IntPtr(2000),
+		Stream:    c.streaming,
 	}
 
 	appName := "memory-chat"
@@ -227,11 +273,16 @@ func (c *memoryChat) processResponse(eventChan <-chan *event.Event) error {
 		fullContent       string
 		toolCallsDetected bool
 		assistantStarted  bool
+		finalSeen         bool
 	)
 
 	for event := range eventChan {
 		if event.Error != nil {
 			fmt.Printf("\n❌ Error: %s\n", event.Error.Message)
+			continue
+		}
+
+		if finalSeen {
 			continue
 		}
 
@@ -260,7 +311,7 @@ func (c *memoryChat) processResponse(eventChan <-chan *event.Event) error {
 
 		if event.IsFinalResponse() {
 			fmt.Printf("\n")
-			break
+			finalSeen = true
 		}
 	}
 

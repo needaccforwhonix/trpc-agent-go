@@ -20,8 +20,13 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator"
 	finalresponse "trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/finalresponse"
 	llmfinalresponse "trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/finalresponse"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/hallucination"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/rubriccritic"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/rubricknowledgerecall"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/rubricreferencecritic"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/rubricresponse"
+	llmtemplate "trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/template"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/llm/verifierpairwise"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/tooltrajectory"
 )
 
@@ -41,8 +46,12 @@ type registry struct {
 	evaluators map[string]evaluator.Evaluator
 }
 
-// New creates a evaluator registry
-func New() Registry {
+// New creates an evaluator registry.
+func New(opt ...Option) Registry {
+	opts := &options{}
+	for _, o := range opt {
+		o(opts)
+	}
 	r := &registry{
 		evaluators: make(map[string]evaluator.Evaluator),
 	}
@@ -52,10 +61,24 @@ func New() Registry {
 	r.Register(finalResponse.Name(), finalResponse)
 	llmfinalResponse := llmfinalresponse.New()
 	r.Register(llmfinalResponse.Name(), llmfinalResponse)
+	rubricCritic := rubriccritic.New()
+	r.Register(rubricCritic.Name(), rubricCritic)
 	rubricResponse := rubricresponse.New()
 	r.Register(rubricResponse.Name(), rubricResponse)
+	rubricReferenceCritic := rubricreferencecritic.New()
+	r.Register(rubricReferenceCritic.Name(), rubricReferenceCritic)
 	rubricKnowledgeRecall := rubricknowledgerecall.New()
 	r.Register(rubricKnowledgeRecall.Name(), rubricKnowledgeRecall)
+	hallucinationEvaluator := hallucination.New()
+	r.Register(hallucinationEvaluator.Name(), hallucinationEvaluator)
+	templateOptions := []llmtemplate.Option(nil)
+	if opts.llmOperatorRegistry != nil {
+		templateOptions = append(templateOptions, llmtemplate.WithOperatorRegistry(opts.llmOperatorRegistry))
+	}
+	templateEvaluator := llmtemplate.New(templateOptions...)
+	r.Register(templateEvaluator.Name(), templateEvaluator)
+	verifierPairwiseEvaluator := verifierpairwise.New()
+	r.Register(verifierPairwiseEvaluator.Name(), verifierPairwiseEvaluator)
 	return r
 }
 

@@ -11,7 +11,9 @@ Graph 将可控的工作流编排与可扩展的 Agent 能力结合，适用于�
 特点：
 
 - Schema 驱动的 State 与 Reducer，避免并发分支写入同一字段时的数据竞争；
-- BSP 风格（计划/执行/合并）的确定性并行；
+- 两种执行引擎：
+  - BSP（默认）：超步（计划/执行/合并）的确定性并行
+  - DAG（可选）：去掉全局超步屏障的即时调度（eager）
 - 内置节点类型封装 LLM、工具与 Agent，减少重复代码；
 - 流式事件、检查点与中断，便于观测与恢复。
 - 节点级重试/退避（指数退避与抖动），支持执行器默认重试策略与带重试元数据的事件观测。
@@ -66,6 +68,30 @@ GraphAgent 实现了 `agent.Agent` 接口，可以：
 - **挂载 SubAgent**：通过 `graphagent.WithSubAgents` 配置子 Agent，并在图中使用 `AddAgentNode` 委托执行
 
 这种设计使得 GraphAgent 既能接入其他 Agent，也能在自身工作流中灵活调度子 Agent。
+
+<a id="synthetic-error-content-in-session-history"></a>
+
+### Session 历史中的合成错误文案
+
+GraphAgent 会在执行图之前，从 Session 事件初始化 `graph.StateKeyMessages`。
+在这个投影过程中，Runner 或 ErrorMessage 插件合成的 assistant 文案默认会被
+省略，避免仅用于展示的失败提示被当成模型输出再次传给 LLM 节点。assistant content
+与结构化错误仍保留在对外发送及持久化的事件中。如果省略后出现相邻 user 消息，
+模型侧状态会合并这些消息，以维持模型服务可接受的消息序列。
+
+如果应用明确需要把这类文案继续作为模型上下文，可以在创建 GraphAgent 时显式
+恢复旧行为：
+
+```go
+graphAgent, err := graphagent.New(
+    "simple-workflow",
+    compiledGraph,
+    graphagent.WithIncludeSyntheticErrorMessages(true),
+)
+```
+
+该选项只影响 GraphAgent 从 Session 历史进行的消息投影，不会删除错误事件，也不
+会改写图节点直接写入 `graph.StateKeyMessages` 的消息。
 
 ### 主要特性
 
@@ -739,6 +765,12 @@ Model，LLM）消息（例如用于用户界面（User Interface，UI）的流�
 `agent.WithStreamMode(...)` 作为统一开关（见下文“事件监控”）。当选择
 `agent.StreamModeMessages` 时，Runner 会为本次运行自动开启 Graph 的最终响应事件输出。
 
+如果你的图里有多个 LLM 节点或子 Agent 节点，而对调用方可见的消息流只应该保留
+terminal 节点的消息，可以在本次运行开启
+`agent.WithGraphTerminalMessagesOnly(true)`。该选项关闭时保持默认行为完全兼容；开启后
+会保留并行分支上的所有 terminal 节点消息，不会影响图内部的 state 传递、tracing 或
+token 统计。可参考 `examples/graph/terminal_messages_only`。
+
 小贴士：解析 JSON/结构化文本（流式）
 
 - 流式分片（`choice.Delta.Content`）是增量输出，在模型调用结束前不保证能组成合法
@@ -752,6 +784,169 @@ Model，LLM）消息（例如用于用户界面（User Interface，UI）的流�
   `last_response`）读取完整输出后再解析，因为这些值只会在节点完成后才写入状态。
 - **图外解析**（事件消费端）：累计 `Delta.Content`，在看到非 partial 的最终消息
   （`choice.Message.Content`）或流程结束后再解析。
+
+小贴士：图内节点间的流式消费
+
+为什么需要它
+
+- 图的 state（例如 `last_response`、`node_responses[nodeID]`）只会在节点完成
+  后提交。
+- 图上的边也只会在节点完成后触发。也就是说，如果你写的是严格串行的
+  `llm -> parse`，那么 `parse` 节点天然只能拿到“全量输出”。
+
+如果你希望下游节点在上游 LLM（或 Agent 节点）仍在 streaming 时就开始处理，可以使
+用 StreamHub。
+
+推荐写法（fan-out + join）
+
+1) 选一个 stream name（在一次 invocation 里唯一即可）。
+
+2) 让 producer 把 streaming 输出写入该 stream：
+
+- LLM / Agent 节点：`graph.WithStreamOutput(streamName)`
+- Function 节点：`w, _ := graph.OpenStreamWriter(ctx, streamName)`
+
+3) 让 consumer 节点与 producer 节点并行执行（同一步调度），并在后续 join 汇合：
+
+- 用同一个上游节点同时触发 `producer` 与 `consumer`。
+- 使用 `AddJoinEdge([]string{producer, consumer}, finish)` 收敛流程。
+
+示例 A：LLM 节点发，普通节点收
+
+```go
+const streamName = "llm:deltas"
+
+sg.AddLLMNode(
+	"llm",
+	llm,
+	instruction,
+	nil,
+	graph.WithStreamOutput(streamName),
+)
+
+sg.AddNode("consume", func(ctx context.Context, state graph.State) (any, error) {
+	r, err := graph.OpenStreamReader(ctx, streamName)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	const maxLineBytes = 1024 * 1024
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(nil, maxLineBytes)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// 逐行解析/处理。
+	}
+	return graph.State{}, scanner.Err()
+})
+
+sg.AddEdge("setup", "llm")
+sg.AddEdge("setup", "consume")
+sg.AddJoinEdge([]string{"llm", "consume"}, "finish")
+```
+
+示例 B：Agent 节点发，普通节点收
+
+Agent 节点会按名称调用一个子 agent。`StateGraph` 里 `AddAgentNode(id)` 的 `id`
+需要与父 `GraphAgent` 上注册的子 agent 名称一致。
+
+```go
+const streamName = "writer:deltas"
+
+// Producer: 把子 agent 的 deltas 写到 StreamHub。
+sg.AddAgentNode(
+	"writer",
+	graph.WithStreamOutput(streamName),
+)
+
+// Consumer: 流式读取 bytes。
+sg.AddNode("consume", func(ctx context.Context, state graph.State) (any, error) {
+	r, err := graph.OpenStreamReader(ctx, streamName)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	_, err = io.Copy(io.Discard, r)
+	return graph.State{}, err
+})
+
+sg.AddEdge("setup", "writer")
+sg.AddEdge("setup", "consume")
+sg.AddJoinEdge([]string{"writer", "consume"}, "finish")
+```
+
+构造 `GraphAgent` 时需要把子 agent 注册进去：
+
+```go
+sub := llmagent.New(
+	"writer",
+	llmagent.WithModel(llm),
+)
+
+ga, _ := graphagent.New(
+	"workflow",
+	g,
+	graphagent.WithSubAgents([]agent.Agent{sub}),
+)
+```
+
+注意：如果你希望 consumer 真正做到“边收边处理”，上游子 agent 需要开启 streaming
+（例如在 run 时传 `agent.WithStream(true)`）。否则 StreamHub 通道只会在最后写入一次
+最终消息。
+
+示例 C：普通节点发，普通节点收
+
+```go
+const streamName = "produce:lines"
+
+sg.AddNode("produce", func(ctx context.Context, state graph.State) (any, error) {
+	w, err := graph.OpenStreamWriter(ctx, streamName)
+	if err != nil {
+		return nil, err
+	}
+	defer w.Close()
+
+	lines := []string{"a\n", "b\n"}
+	for _, line := range lines {
+		if _, err := io.WriteString(w, line); err != nil {
+			return nil, err
+		}
+	}
+	return graph.State{}, nil
+})
+
+sg.AddNode("consume", func(ctx context.Context, state graph.State) (any, error) {
+	r, err := graph.OpenStreamReader(ctx, streamName)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	_ = string(b) // 自行解析
+	return graph.State{}, nil
+})
+
+sg.AddEdge("setup", "produce")
+sg.AddEdge("setup", "consume")
+sg.AddJoinEdge([]string{"produce", "consume"}, "finish")
+```
+
+注意事项
+
+- StreamHub 是内存态临时通道，不参与 checkpoint。
+- 每个 stream name 只允许打开一个 reader 和一个 writer。
+- StreamHub 传输的是 bytes；如果你要处理文本，请自行选择 framing（按行、NDJSON
+  等）。
+- 参考完整示例：`examples/graph/streaming_node_consumer`。
 
 #### 三种输入范式
 
@@ -943,25 +1138,31 @@ graphAgent, err := graphagent.New(
 	}),
 	graphagent.WithChannelBufferSize(1024),            // 调整事件通道缓冲区
 	graphagent.WithMaxConcurrency(8),                  // 限制并行任务数
+	// 执行引擎：BSP（默认）或 DAG（eager）。
+	graphagent.WithExecutionEngine(graph.ExecutionEngineBSP),
 	graphagent.WithCheckpointSaver(memorySaver),       // 使用持久化检查点
 	graphagent.WithSubAgents([]agent.Agent{subAgent}), // 配置子 Agent
 	graphagent.WithAddSessionSummary(true),            // 将会话摘要注入 system 消息
 	graphagent.WithMaxHistoryRuns(5),                  // 未开启摘要时截断历史轮次
-	// 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
+	// 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足
+	// WithMessageTimelineFilterMode 与 WithMessageBranchFilterMode 条件
 	// 时间维度过滤条件
 	// 默认值: graphagent.TimelineFilterAll
 	// 可选值:
 	//  - graphagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
 	//  - graphagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
-	//  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
-	graphagent.WithMessageTimelineFilterMode(graphagent.BranchFilterModeAll),
-	// 分支维度过滤条件
+	//  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前 invocation
+	//    上下文中生成的消息
+	graphagent.WithMessageTimelineFilterMode(graphagent.TimelineFilterAll),
+	// FilterKey 层级过滤条件
 	// 默认值: graphagent.BranchFilterModePrefix
 	// 可选值:
-	//  - graphagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
-	//  - graphagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
-	//  - graphagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
-	graphagent.WithMessageBranchFilterMode(graphagent.TimelineFilterAll),
+	//  - graphagent.BranchFilterModePrefix: 层级匹配（祖先/自己/子孙都算匹配）
+	//  - graphagent.BranchFilterModeSubtree: 仅包含当前 key 及其子孙（不含父级）
+	//  - graphagent.BranchFilterModeExact: 仅包含
+	//    Event.FilterKey == Invocation.eventFilterKey
+	//  - graphagent.BranchFilterModeAll: 忽略 FilterKey，包含全部消息
+	graphagent.WithMessageBranchFilterMode(graphagent.BranchFilterModePrefix),
 	// 推理内容模式（DeepSeek 思考模式）
 	// 默认值: graphagent.ReasoningContentModeDiscardPreviousTurns
 	// 可选值:
@@ -1212,15 +1413,33 @@ sg.AddEdge(nodeCompose, nodeB)
 - 返回一个**增量**更新（一个小 `graph.State`），不要返回或原地修改“完整 state”。
   否则可能会覆盖内部 key（执行上下文、回调、session 等）导致工作流异常。
 
-#### Agent 节点：输入/输出映射（进阶）
+#### Agent 节点：RunOption 与输入/输出映射（进阶）
 
-Agent 节点支持两个映射器，用于控制父图/子代理之间到底传什么：
+Agent 节点支持节点级 RunOption 与多个映射器，用于控制父图与子代理之间的运行选项、
+输入和输出：
 
-- `WithSubgraphInputMapper`：父 State → 子 RuntimeState（`Invocation.RunOptions.RuntimeState`）
-- `WithSubgraphOutputMapper`：子执行结果 → 父 State 更新
+- `WithAgentNodeRunOptions`：只作用于当前 AgentNode 的子调用 `agent.RunOption`。
+  适合为单个 Agent 节点配置外部工具、模型覆盖、过滤器等单次运行选项。
+  多个 AgentNode 可以分别配置不同的 RunOption。
+- `WithSubgraphInputMapper`：父 State → 子 RuntimeState（`Invocation.RunOptions.RuntimeState`）。
+- `WithAgentNodeInputMapper`：父 State → 子 Agent 的输入消息。返回的 state 中如果包含
+  `graph.StateKeyAgentInputMessage`，且值是 `model.Message` 或 `*model.Message`，
+  Agent 节点会用它作为子 Agent 的输入消息。这适合传递 `role=tool` 这类工具消息，
+  而不是普通 user 文本。
+- `WithSubgraphOutputMapper`：子执行结果 → 父 State 更新。对于 `AddAgentNode`，
+  无论子 Agent 是 GraphAgent 还是 LLMAgent，这里都会通过 `SubgraphResult`
+  接收子 Agent 的执行结果。
 
 常见用途：
 
+- **只给某个 AgentNode 暴露调用方执行的工具**：使用
+  `graph.WithAgentNodeRunOptions(agent.WithExternalTools(...))`。这些工具只对
+  该子调用可见，不会注册到兄弟 AgentNode 上。
+- **在调用方执行工具后恢复 AgentNode**：把调用方返回的工具结果先保存到父图
+  自定义 state key，再用 `WithAgentNodeInputMapper` 投影成
+  `StateKeyAgentInputMessage`，让 AgentNode 再次运行时收到工具消息。
+  注意清理你自己的源 state key；mapper 返回的 `StateKeyAgentInputMessage`
+  只是本次子调用的临时输入。
 - **让子代理读取结构化状态**（避免把结构化数据硬塞进 prompt）：通过
   `WithSubgraphInputMapper` 只传递必要键。可运行示例：
   `examples/graph/subagent_runtime_state`。
@@ -1228,6 +1447,10 @@ Agent 节点支持两个映射器，用于控制父图/子代理之间到底传�
   `SubgraphResult.FinalState` 会携带子图最终状态快照，可通过
   `WithSubgraphOutputMapper` 拷贝到父 State。可运行示例：
   `examples/graph/agent_state_handoff`。
+- **单独处理子代理失败兜底状态**：如果子图在 `graph.execution`
+  之前失败，可读取 `SubgraphResult.FallbackState` /
+  `SubgraphResult.FallbackStateDelta`；如果你希望一套逻辑兼容两种情况，
+  可以使用 `SubgraphResult.EffectiveState()`。
 - **把子代理最终文本写入自定义键**：`SubgraphResult` 总会包含 `LastResponse`，
   因此输出映射对 GraphAgent 与非图 Agent 都可用。
 
@@ -1377,8 +1600,9 @@ sg.AddMultiConditionalEdges(
 
 说明：
 
-- 与其他路由一样，扇出的目标节点会在 **下一步** BSP 超步（superstep）才变为可运行
-  （router 节点完成之后）。这会影响端到端延迟，见下文“BSP 超步屏障”。
+- 在默认 BSP 引擎中，扇出的目标节点会在 **下一步** 超步（superstep）才变为可运行
+  （router 节点完成之后）。在 DAG 引擎中，目标节点可能会在 router 完成后立刻变为可运行
+  （没有全局屏障）。这会影响端到端延迟，见下文“BSP 超步屏障”。
 - 返回结果会先去重，同一分支键在同一步内只触发一次；
 - 每个分支键的解析优先级与单条件路由一致：
   1. 条件边 `pathMap`；2) 节点 Ends；3) 直接当作节点 ID；
@@ -1409,8 +1633,44 @@ stateGraph.AddToolsNode(
     "tools",
     tools,
     graph.WithEnableParallelTools(true), // 可选；默认串行
+    graph.WithToolConcurrencyConfig(tool.ConcurrencyConfig{
+        MaxConcurrency: 2,
+        Groups: []tool.ConcurrencyGroup{
+            {ToolNames: []string{"search"}, Limit: 1},
+        },
+    }),
 )
 ```
+
+每次 Tools 节点调用都有独立额度，因此并发的 Graph execution 不会相互占用
+容量。同一组中的多个工具名在一次调用内共同消耗该组的容量。每个工具名只能
+出现在一个正数上限的组中；重复配置会导致 `WithToolConcurrencyConfig`
+panic。
+
+为 ToolsNode 配置 Tool 调用重试：
+
+```go
+policy := &tool.RetryPolicy{
+    MaxAttempts:     2,
+    InitialInterval: 200 * time.Millisecond,
+    BackoffFactor:   2.0,
+    MaxInterval:     time.Second,
+}
+
+stateGraph.AddToolsNode(
+    "tools",
+    tools,
+    graph.WithToolCallRetryPolicy(policy),
+)
+```
+
+说明：
+
+- 默认关闭；未配置时 ToolsNode 行为不变。
+- 当前仅对 `CallableTool` 生效；`StreamableTool` 暂不支持。
+- 重试只作用于当前这次工具调用，不会重跑整个 ToolsNode。
+- 默认判定只重试常见瞬时 raw error；如果需要覆盖结果级失败，可通过 `tool.RetryPolicy.RetryOn` 自定义。
+- 可运行示例见 [examples/graph/tool_call_retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/graph/tool_call_retry)。
 
 **工具调用配对机制与二次进入 LLM：**
 
@@ -1773,7 +2033,7 @@ ctx, interrupt := graph.WithGraphInterrupt(context.Background())
 events, _ := app.Run(ctx, userID, sessionID, model.NewUserMessage("hi"))
 
 // 在另一个 goroutine / handler 中触发：
-interrupt() // 优雅中断：等待当前 step 的任务结束后暂停
+interrupt() // 优雅中断：等待 in-flight 任务结束后暂停
 
 // 或者设置最大等待时间，超时后强制中断：
 interrupt(graph.WithGraphInterruptTimeout(2 * time.Second))
@@ -1781,10 +2041,11 @@ interrupt(graph.WithGraphInterruptTimeout(2 * time.Second))
 
 行为说明：
 
-- 默认情况下，执行器会等待当前 step 的任务执行完成，然后在开始下一步
-  之前中断。
+- 默认情况下，执行器会在“安全边界”暂停：
+  - BSP：等待当前超步结束（在下一超步开始之前暂停）
+  - DAG：停止调度新任务，并等待 in-flight 任务结束后暂停
 - 使用 `WithGraphInterruptTimeout` 时，执行器会在超时后取消正在运行的任务，
-  并尽快中断；被取消的节点会在恢复时重新执行。
+  并尽快中断；被取消的节点会在恢复时进行确定性 rerun（使用输入快照）。
 
 恢复方式：
 
@@ -1833,21 +2094,25 @@ ga, err := graphagent.New(
     graphagent.WithCheckpointSaver(saver),
     graphagent.WithSubAgents([]agent.Agent{subAgent}), // 配置子 Agent
     graphagent.WithAgentCallbacks(agent.NewCallbacks()), // 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
-    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
+    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足
+    // WithMessageTimelineFilterMode 与 WithMessageBranchFilterMode 条件
     // 时间维度过滤条件
     // 默认值: graphagent.TimelineFilterAll
     // 可选值:
     //  - graphagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
     //  - graphagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
-    //  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
-    graphagent.WithMessageTimelineFilterMode(graphagent.BranchFilterModeAll),
-    // 分支维度过滤条件
+    //  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前 invocation
+    //    上下文中生成的消息
+    graphagent.WithMessageTimelineFilterMode(graphagent.TimelineFilterAll),
+    // FilterKey 层级过滤条件
     // 默认值: graphagent.BranchFilterModePrefix
     // 可选值:
-    //  - graphagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
-    //  - graphagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
-    //  - graphagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
-    graphagent.WithMessageBranchFilterMode(graphagent.TimelineFilterAll),
+    //  - graphagent.BranchFilterModePrefix: 层级匹配（祖先/自己/子孙都算匹配）
+    //  - graphagent.BranchFilterModeSubtree: 仅包含当前 key 及其子孙（不含父级）
+    //  - graphagent.BranchFilterModeExact: 仅包含
+    //    Event.FilterKey == Invocation.eventFilterKey
+    //  - graphagent.BranchFilterModeAll: 忽略 FilterKey，包含全部消息
+    graphagent.WithMessageBranchFilterMode(graphagent.BranchFilterModePrefix),
 )
 ```
 
@@ -2487,6 +2752,64 @@ flowchart LR
   - `AddEdge(from, to)` 适合增量触发（`to` 可能执行多次）；
   - `AddJoinEdge([...], to)` 适合“等待全部，再执行一次”。
 
+#### DAG（eager）引擎（去掉超步屏障）
+
+如果你的编排基本是 DAG（无环/少环），并且更关注端到端延迟，那么 BSP 的“超步屏障”
+可能会显得过于保守：深层节点无法在自己依赖满足后立刻执行，而要等待同一超步里的其他
+并行分支全部结束。
+
+DAG 引擎去掉了全局屏障，采用 **即时调度（eager scheduling）**：
+
+- **BSP（默认）**：每个超步只做一次规划；下游只能在下一超步变为可运行。
+- **DAG（可选）**：节点一旦完成并写入路由信号（channel update），执行器会立刻规划并
+  启动新变为可运行的节点（受 `WithMaxConcurrency` 限制）。
+
+开启方式（GraphAgent）：
+
+```go
+ga, err := graphagent.New(
+    "my-agent",
+    g,
+    graphagent.WithExecutionEngine(graph.ExecutionEngineDAG),
+)
+```
+
+开启方式（直接使用 Executor）：
+
+```go
+exec, err := graph.NewExecutor(
+    g,
+    graph.WithExecutionEngine(graph.ExecutionEngineDAG),
+)
+```
+
+兼容性原则：如果你不设置引擎选项，默认的 BSP 语义与此前 **完全一致**。
+
+当前差异与限制（DAG 引擎）：
+
+- **检查点（支持，但频率不同）**：DAG 模式支持 `WithCheckpointSaver`，会在以下时机写入
+  checkpoint：
+  - 启动时（`source=input`，`step=-1`，配置了 saver 才会写）
+  - 发生中断时（`source=interrupt`，覆盖内部/静态/外部中断）
+  - 正常完成时（`source=loop`，best effort）
+  但 DAG 模式**不会**像 BSP 那样“每个超步写一次 loop checkpoint”，因此时间旅行的粒度
+  也会不同（详见上文 BSP/Checkpoint 章节）。
+- **中断（支持）**：
+  - 内部中断：节点内调用 `graph.Interrupt`
+  - 静态中断：`WithInterruptBefore` / `WithInterruptAfter`
+  - 外部中断：`graph.WithGraphInterrupt`（planned pause 与 timeout forced）
+  对于 forced timeout，执行器会取消 in-flight 任务，并记录每个任务的输入快照，用于
+  resume 时的确定性 rerun。
+- **不支持 StepTimeout**：`WithStepTimeout` 是 BSP 超步的概念；DAG 模式下建议使用整体
+  `context` deadline 和/或 `WithNodeTimeout`。
+- **MaxSteps 含义不同**：DAG 模式下 `WithMaxSteps` 限制的是“节点执行次数”（而不是超步）。
+- **同一节点单并发**：DAG 调度器同一时刻最多只运行一个相同 nodeID 的任务；若被重复触发，
+  会排队等待当前执行结束后再运行。
+
+如果需要“等待所有分支再汇聚”，请继续使用 `AddJoinEdge`（两种引擎都支持）。
+
+参考示例：`examples/graph/dag_engine`、`examples/graph/dag_interrupt`。
+
 ### 消息可见性选项
 当前Agent可在需要时根据不同场景控制其对其他Agent生成的消息以及历史会话消息的可见性进行管理，可通过相关选项配置进行管理。
 在与model交互时仅将可见的内容输入给模型。 
@@ -2623,18 +2946,22 @@ sg.AddNode("taskB", func(ctx context.Context, state graph.State) (any, error){
 ```
 
 高阶用法示例：
-可以单独通过 `WithMessageTimelineFilterMode`、`WithMessageBranchFilterMode`控制当前agent对历史消息与其他agent生成的消息可见性。
-当前agent在与模型交互时，最终将同时满足两个条件的消息输入给模型。
+可以单独通过 `WithMessageTimelineFilterMode`、`WithMessageBranchFilterMode`
+控制当前 agent 对历史消息与其他 agent 生成消息的可见性。
+当前 agent 在与模型交互时，最终将同时满足两个条件的消息输入给模型。
 
 `配置:`
 - `WithMessageTimelineFilterMode`: 时间维度可见性控制
   - `TimelineFilterAll`: 包含历史消息以及当前请求中所生成的消息
-  - `TimelineFilterCurrentRequest`: 仅包含当前请求(一次runner.Run为一次请求)中所生成的消息
-  - `TimelineFilterCurrentInvocation`: 仅包含当前invocation上下文中生成的消息
-- `WithMessageBranchFilterMode`: 分支维度可见性控制（用于控制对其他agent生成消息的可见性）
-  - `BranchFilterModePrefix`: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配
-  - `BranchFilterModeAll`: 所有agent的均消息
-  - `BranchFilterModeExact`: 仅自己生成的消息可见
+  - `TimelineFilterCurrentRequest`: 仅包含当前请求（一次 runner.Run 为一次请求）
+    中所生成的消息
+  - `TimelineFilterCurrentInvocation`: 仅包含当前 invocation 上下文中生成的消息
+- `WithMessageBranchFilterMode`: 按 FilterKey 层级控制可见性
+  - `BranchFilterModePrefix`（默认）：层级匹配（祖先/自己/子孙都算匹配）
+  - `BranchFilterModeSubtree`：仅包含当前 key 及其子孙（不含父级，更适合严格隔离）
+  - `BranchFilterModeExact`：仅包含
+    `Event.FilterKey == Invocation.eventFilterKey`
+  - `BranchFilterModeAll`：忽略 FilterKey，包含全部消息
   
 ```go
 llmAgent := llmagent.New(
@@ -2644,21 +2971,25 @@ llmAgent := llmagent.New(
     llmagent.WithInstruction("Be helpful, concise, and informative in your responses"), // 设置指令
     llmagent.WithGenerationConfig(genConfig),                                           // 设置生成参数
 
-    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
+    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足
+    // WithMessageTimelineFilterMode 与 WithMessageBranchFilterMode 条件
     // 时间维度过滤条件
     // 默认值: llmagent.TimelineFilterAll
     // 可选值:
     //  - llmagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
     //  - llmagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
-    //  - llmagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
-    llmagent.WithMessageTimelineFilterMode(llmagent.BranchFilterModeAll),
-    // 分支维度过滤条件
+    //  - llmagent.TimelineFilterCurrentInvocation: 仅包含当前 invocation
+    //    上下文中生成的消息
+    llmagent.WithMessageTimelineFilterMode(llmagent.TimelineFilterAll),
+    // FilterKey 层级过滤条件
     // 默认值: llmagent.BranchFilterModePrefix
     // 可选值:
-    //  - llmagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
-    //  - llmagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
-    //  - llmagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
-    llmagent.WithMessageBranchFilterMode(llmagent.TimelineFilterAll),
+    //  - llmagent.BranchFilterModePrefix: 层级匹配（祖先/自己/子孙都算匹配）
+    //  - llmagent.BranchFilterModeSubtree: 仅包含当前 key 及其子孙（不含父级）
+    //  - llmagent.BranchFilterModeExact: 仅包含
+    //    Event.FilterKey == Invocation.eventFilterKey
+    //  - llmagent.BranchFilterModeAll: 忽略 FilterKey，包含全部消息
+    llmagent.WithMessageBranchFilterMode(llmagent.BranchFilterModePrefix),
 )
 ```
 
@@ -2766,6 +3097,9 @@ flowchart TB
 **`graph/executor.go`** - BSP 执行器  
 这是系统心脏，借鉴了 [Google Pregel](https://research.google/pubs/pub37252/) 论文。实现 BSP（Bulk Synchronous Parallel）风格的三阶段循环：Planning → Execution → Update。
 
+**`graph/executor_dag.go`** - DAG（eager）执行器（可选）  
+提供去掉 BSP 全局屏障的即时调度：当触发通道变为可用时，尽快启动可运行节点以降低端到端延迟。该模式更适合 DAG‑like 编排，强调“降低端到端延迟”而不是“超步对齐”。
+
 **`graph/checkpoint/*`** - 检查点和恢复机制  
 提供可选的检查点持久化（如 sqlite），原子保存状态与待写入动作，支持按谱系/检查点恢复。
 
@@ -2774,7 +3108,14 @@ flowchart TB
 
 ### 执行模型
 
-GraphAgent 借鉴了 Google Pregel 的 BSP（Bulk Synchronous Parallel）模型，但适配到了单进程环境；在此基础上还支持检查点、HITL 中断/恢复与时间旅行：
+GraphAgent 支持两种执行引擎：
+
+- **BSP 引擎（默认）**：Pregel 风格的 BSP（Bulk Synchronous Parallel）超步，并带有全局屏障。
+  该引擎支持检查点、HITL 中断/恢复与时间旅行。
+- **DAG 引擎（可选）**：去掉全局超步屏障的即时调度，更适合 DAG‑like 的低延迟编排。
+  该引擎支持检查点与中断，但语义与 BSP 有差异（见上文 DAG 引擎说明）。
+
+下图展示 BSP 引擎的执行过程：
 
 ```mermaid
 sequenceDiagram
@@ -2888,6 +3229,8 @@ flowchart TB
 
 ```go
 exec, err := graph.NewExecutor(g,
+    // 默认：BSP 超步（支持 checkpoint / interrupt / time travel）。
+    graph.WithExecutionEngine(graph.ExecutionEngineBSP),
     graph.WithChannelBufferSize(1024),              // 事件通道缓冲
     graph.WithMaxSteps(50),                          // 最大步数
     graph.WithMaxConcurrency(8),                     // 并行任务数
@@ -2897,6 +3240,19 @@ exec, err := graph.NewExecutor(g,
     graph.WithCheckpointSaveTimeout(30*time.Second), // 检查点保存超时
 )
 ```
+
+开启 DAG（eager）引擎：
+
+```go
+exec, err := graph.NewExecutor(g,
+    graph.WithExecutionEngine(graph.ExecutionEngineDAG),
+    graph.WithMaxConcurrency(8),
+    graph.WithNodeTimeout(2*time.Minute),
+)
+```
+
+注意：DAG 模式下 `WithStepTimeout` 不生效；建议使用整体 `context` deadline 和/或
+`WithNodeTimeout`。
 
 ## 与多 Agent 系统集成
 
@@ -3158,11 +3514,80 @@ Graph 的状态底层是 `map[string]any`，通过 `StateSchema` 提供运行时
 
 #### 节点级回调、工具与生成参数
 
-节点可通过可选项注册回调或参数（见 `graph/state_graph.go`）：
+Graph 支持 **节点回调（node callbacks）**，用于在节点执行前/后做“横切逻辑”（例如
+统一日志、打点、校验、策略拦截等）。
+
+节点回调分两层：
+
+- **全局（图级）回调**：构图时通过 `(*graph.StateGraph).WithNodeCallbacks(...)`
+  一次性注册，对该图里每一个节点生效。
+- **单节点回调**：通过 `graph.WithPreNodeCallback` /
+  `graph.WithPostNodeCallback` / `graph.WithNodeErrorCallback`
+  （或 `graph.WithNodeCallbacks(...)`）只挂到某一个节点上。
+
+注意：这里有两个不同的 `WithNodeCallbacks`：
+
+- `graph.NewStateGraph(schema).WithNodeCallbacks(...)` 是**图级全局**。
+- `graph.WithNodeCallbacks(...)` 是**单节点 option**（作为 `AddNode` 参数传入）。
+
+回调执行顺序：
+
+- `BeforeNode`：全局 → 单节点
+- `AfterNode`：单节点 → 全局
+- `OnNodeError`：全局 → 单节点
+
+示例：注册一个“全局切面”，只对 function 节点生效：
+
+```go
+global := graph.NewNodeCallbacks().
+	RegisterBeforeNode(func(
+		ctx context.Context,
+		cb *graph.NodeCallbackContext,
+		st graph.State,
+	) (any, error) {
+		if cb == nil || cb.NodeType != graph.NodeTypeFunction {
+			return nil, nil
+		}
+		// 这里写你的 function 节点横切逻辑。
+		return nil, nil
+	})
+
+g, err := graph.NewStateGraph(schema).
+	WithNodeCallbacks(global). // 图级全局
+	AddNode("step1", step1).
+	AddNode("step2", step2,
+		graph.WithPreNodeCallback(func(
+			ctx context.Context,
+			cb *graph.NodeCallbackContext,
+			st graph.State,
+		) (any, error) {
+			// 这里只对 "step2" 生效。
+			return nil, nil
+		}),
+	).
+	SetEntryPoint("step1").
+	AddEdge("step1", "step2").
+	SetFinishPoint("step2").
+	Compile()
+_ = g
+_ = err
+```
+
+进阶：你也可以在**每次 run** 的维度提供全局节点回调：往
+`Invocation.RunOptions.RuntimeState` 写入 `graph.StateKeyNodeCallbacks`。
+这在“希望 Runner 作用域的逻辑影响 Graph（例如通过 Runner 插件注入节点回调）”时很
+有用。示例可参考 `plugin.md`。
+
+可运行示例参考：
+
+- `examples/graph/per_node_callbacks`（图级全局 + 单节点回调）
+- `examples/graph/runner_plugin_node_callbacks`（通过 Runner 插件注入）
+
+其它节点可选项（见 `graph/state_graph.go`）：
 
 - `graph.WithPreNodeCallback` / `graph.WithPostNodeCallback` / `graph.WithNodeErrorCallback`
 - LLM 节点可用 `graph.WithGenerationConfig`、`graph.WithModelCallbacks`
-- 工具相关：`graph.WithToolCallbacks`、`graph.WithToolSets`（除 `tools []tool.Tool` 外，再额外提供 ToolSet`）、
+- 工具相关：`graph.WithToolCallbacks`、`graph.WithToolSets`（除 `tools []tool.Tool` 外，再额外提供 `tool.ToolSet` 列表）、
   `graph.WithRefreshToolSetsOnRun`（在每次运行时从 ToolSet 重新构造工具列表，适合 MCP 等动态工具源）
 - Agent 节点可用 `graph.WithAgentNodeEventCallback`
 
@@ -3187,6 +3612,8 @@ API：
 - `graph.WithCallOptions(...)`：把 call options 绑定到本次运行。
 - `graph.WithCallGenerationConfigPatch(...)`：在当前图作用域内，对 LLM 节点的
   `model.GenerationConfig` 做“按字段覆盖”。
+- `graph.WithCallResumeStateOverrideKeys(keys...)`：为恢复阶段指定
+  `RuntimeState` 覆盖 key 集合；这些 key 在当前图作用域恢复时可覆盖 checkpoint 中的同名字段。
 - `graph.DesignateNode(nodeID, ...)`：把覆盖精确打到当前图中的某个节点。
   - 对 LLM 节点：影响该节点的模型调用。
   - 对 Agent 节点（子图）：影响子 Invocation，因此会成为子图的默认覆盖。
@@ -3230,6 +3657,32 @@ ch, err := r.Run(ctx, userID, sessionID, msg, runOpts)
 ```
 
 可直接运行示例：`examples/graph/call_options_generation_config`。
+
+恢复覆盖 key 示例：
+
+```go
+runOpts := graph.WithCallOptions(
+    graph.WithCallResumeStateOverrideKeys("request_id", "tenant_config"),
+    graph.DesignateNode("child_agent",
+        // child_agent 会继承父图的覆盖 key，再追加自己的 key。
+        graph.WithCallResumeStateOverrideKeys("child_only_key"),
+    ),
+)
+
+eventCh, err := r.Run(ctx, userID, sessionID,
+    model.NewUserMessage("resume"),
+    agent.WithRuntimeState(map[string]any{
+        graph.CfgKeyLineageID:    lineageID,
+        graph.CfgKeyCheckpointID: checkpointID,
+        "request_id":            requestID,
+        "tenant_config":         tenantConfig,
+        "child_only_key":        childValue,
+    }),
+    runOpts,
+)
+```
+
+`child_agent` 会看到 `request_id`、`tenant_config` 和 `child_only_key`；如果不配置覆盖 key，恢复时仍然是 checkpoint 优先。这个能力适合那些“每次恢复都应以本次请求值为准”的请求级参数，同时不影响其他 checkpoint state。
 
 #### Graph 中的 ToolSet 与 Agent 的区别
 
@@ -3537,7 +3990,7 @@ _ = cm.DeleteLineage(ctx, lineageID)
 
 从检查点恢复可以做“时间旅行”（回到任意 checkpoint 继续跑）。在 HITL 和调试场景里，你通常还需要：在某个 checkpoint 上把 state 改掉，然后从这个点继续跑。
 
-关键点：恢复时，执行器会先用 checkpoint 的 state 还原；`runtime_state` 不会覆盖 checkpoint 里已有的 key，只会补齐缺失且非内部的 key。要改“已有 key”，需要写一个新的 checkpoint。
+关键点：恢复时，执行器会先用 checkpoint 的 state 还原。默认情况下，`runtime_state` 不会覆盖 checkpoint 里已有的 key，只会补齐缺失且非内部的 key。若只是想在某次恢复时覆盖少量已有 key，可以使用 `graph.WithCallOptions(graph.WithCallResumeStateOverrideKeys(...))`；如果要真正修改 checkpoint 里的 state，仍然应该写一个新的 checkpoint。
 
 使用 `graph.TimeTravel`：
 
@@ -3750,6 +4203,40 @@ events, err := r.Run(ctx, userID, sessionID,
     }),
 )
 ```
+
+#### AgentNode 子 LLMAgent 外部工具
+
+如果父图通过 AgentNode 调用子 `LLMAgent`，且外部工具由调用方执行，通常由子
+`LLMAgent` 产出工具调用，再由父图的普通节点调用 `graph.Interrupt`。恢复后，
+普通节点把工具结果写入父 State，AgentNode 再通过输入映射把工具结果传回子
+`LLMAgent`。
+
+代码示例片段如下：
+
+```go
+sg.AddAgentNode(
+    nodeResearch,
+    graph.WithAgentNodeRunOptions(agent.WithExternalTools([]tool.Tool{
+        externalSearchTool(),
+    })),
+    graph.WithSubgraphOutputMapper(storeExternalToolRequest),
+    graph.WithAgentNodeInputMapper(mapExternalToolMessage),
+)
+sg.AddNode(nodeExternalGate, interruptForExternalTool)
+sg.AddEdge(nodeResearch, nodeExternalGate)
+sg.AddConditionalEdges(nodeExternalGate, routeAfterExternalGate, map[string]string{
+    nodeResearch: nodeResearch,
+    graph.End:    graph.End,
+})
+```
+
+其中 `WithAgentNodeRunOptions` 只给当前 AgentNode 配置外部工具，
+`storeExternalToolRequest` 负责保存子 `LLMAgent` 产出的工具调用，
+`interruptForExternalTool` 负责等待调用方回传工具结果，
+`mapExternalToolMessage` 负责把恢复后的工具结果转换为
+`graph.StateKeyAgentInputMessage`。
+
+完整示例见 `examples/graph/agentnode_llmagent_externaltool`。
 
 ### 事件监控
 
@@ -3966,6 +4453,156 @@ func buildGraph() (*graph.Graph, error) {
 - 内部/易变键不会被序列化到最终快照，亦不建议外发（参考 [graph/internal_keys.go:16](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/internal_keys.go#L16)）；
 - 文本类中间结果优先复用模型流式事件（`choice.Delta.Content`）。
 
+#### 将节点错误视为“非致命”并继续执行
+
+如果你想看框架推荐的标准化方案，包括 fatal fallback state、subgraph 回传和
+A2A 对齐，见 [Error Handling](error-handling.md)。
+
+默认情况下，如果某个节点返回了非空 `error`，图会停止执行，Executor 会发出错误事件。
+
+有些业务场景希望把部分错误当作**非致命错误**：
+
+- 记录错误信息（便于排查/监控，或供后续节点/最终输出使用）
+- 不中断图执行，继续跑后续节点
+
+可以用 After 节点回调（`WithPostNodeCallback` 或图级 `WithNodeCallbacks`）来实现：
+
+- 回调会收到 `nodeErr error`：
+  - `nodeErr == nil`：节点成功
+  - `nodeErr != nil`：节点失败（可能经历过重试）
+- 如果你判定这是**非致命错误**，回调需要返回一个**非 nil** 的“替代结果”以及 `nil` error：
+  - 替代结果会按“正常节点返回值”处理：可以是 `graph.State`、`*graph.Command` 或 `[]*graph.Command`。
+  - 常见做法是返回 `graph.State{...}`：既完成“恢复”，又把错误写入 state。
+- 如果在失败时返回 `nil, nil`，原始错误会保留，图依旧会失败。
+
+示例：把非致命错误收集到 `stateKeyNodeErrors` 并继续执行：
+
+```go
+import (
+    "context"
+    "errors"
+    "reflect"
+
+    "trpc.group/trpc-go/trpc-agent-go/graph"
+)
+
+const (
+    stateKeyNodeErrors = "node_errors"
+)
+
+var errNonFatal = errors.New("non-fatal error")
+
+func failingNode(ctx context.Context, st graph.State) (any, error) {
+    return nil, errNonFatal
+}
+
+func buildGraph() (*graph.Graph, error) {
+    schema := graph.MessagesStateSchema()
+    schema.AddField(stateKeyNodeErrors, graph.StateField{
+        Type:    reflect.TypeOf([]string{}),
+        Reducer: graph.StringSliceReducer,
+        Default: func() any { return []string{} },
+    })
+
+    sg := graph.NewStateGraph(schema)
+    sg.AddNode("N", failingNode)
+
+    cbs := graph.NewNodeCallbacks().RegisterAfterNode(func(
+        ctx context.Context,
+        cb *graph.NodeCallbackContext,
+        st graph.State,
+        result any,
+        nodeErr error,
+    ) (any, error) {
+        if nodeErr == nil {
+            return nil, nil
+        }
+        // Decide whether it's fatal.
+        if !errors.Is(nodeErr, errNonFatal) {
+            return nil, nil // keep it fatal
+        }
+        // Non-fatal: record it and keep running.
+        return graph.State{
+            stateKeyNodeErrors: []string{
+                cb.NodeID + ": " + nodeErr.Error(),
+            },
+        }, nil
+    })
+    sg.WithNodeCallbacks(cbs)
+
+    sg.SetEntryPoint("N")
+    sg.SetFinishPoint("N")
+    return sg.Compile()
+}
+```
+
+#### 致命错误：如何获取原始错误与错误码
+
+当节点错误没有被 After 回调恢复（或执行器自身发生错误 / panic）时，图会失败并停止执行。
+这类**致命错误不会通过 `Runner.Run(...)` 的返回值传出**，而是通过事件流输出。
+
+你通常会看到两类与错误相关的事件（都满足 `Response.Error != nil`）：
+
+- **图级致命错误（推荐作为“最终失败原因”）**：
+  `Author = graph.AuthorGraphPregel` 且 `Object = graph.ObjectTypeGraphPregelStep`。
+  该事件的 `_pregel_metadata.stepNumber` 通常为 `-1`，表示执行器在图外层汇总后的最终失
+  败原因。
+- **节点级错误（便于定位问题节点）**：
+  `Author = <nodeID>` 且 `Response.Error != nil`。
+  同时 `_node_metadata` 会带上节点 ID、step、attempt/重试等信息。
+
+注意：
+
+- Runner 最终还会补发一条 `runner.completion` 事件作为真正的结束标记；建议一直消费到
+  completion 再关闭上游连接。
+- 当你让错误保持“致命”（After 回调返回 `nil, nil` 或返回非 nil error）时，框架不会产
+  生 `graph.execution` 的最终状态快照事件。因此“收集致命错误”的推荐方式是消费事件流
+  或在回调里主动发射自定义事件（见上文“在节点回调中携带业务值”）。
+
+**根据错误码分流**
+
+`Response.Error` 支持 `Code` 字段，你可以在消费事件时根据 `Code` 做不同逻辑处理：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/graph"
+
+for ev := range eventCh {
+    if ev.Response == nil || ev.Response.Error == nil {
+        continue
+    }
+
+    // Graph-level fatal error for the whole run.
+    if ev.Author != graph.AuthorGraphPregel ||
+        ev.Object != graph.ObjectTypeGraphPregelStep {
+        continue
+    }
+
+    if ev.Response.Error.Code == nil {
+        // No code provided.
+        continue
+    }
+
+    switch *ev.Response.Error.Code {
+    case "-1":
+        // Handle your business error code here.
+    default:
+        // Fallback.
+    }
+}
+```
+
+**如何让致命错误带上 code**
+
+框架会在发出 error 事件时尽量把 code 填到 `Response.Error.Code`。
+当你的节点返回的 `error`（包括 wrap/Join 的错误链）满足下列任意一种形式时：
+
+- `ErrorCode() string`
+- `Code() string`
+- `Code() int` / `Code() int32` / `Code() int64`
+- 或者直接返回 `*model.ResponseError`（它实现了 `error` 接口）
+
+对应的 code 会出现在事件的 `Response.Error.Code` 中。
+
 也可以在 Agent 级别配置回调：
 
 ```go
@@ -3990,6 +4627,16 @@ graphAgent, _ := graphagent.New("workflow", g,
     graphagent.WithAgentCallbacks(cb),
 )
 ```
+
+> **Runner 级插件与 Graph Agent 节点**
+>
+> 通过 `graphagent.WithAgentCallbacks` 注册的回调，只作用在 **GraphAgent 自身**
+> 这一层。如果你在 Runner 上注册了 `PluginManager`（即 Runner 插件的
+> `BeforeAgent` / `AfterAgent`），Graph Agent 节点中用
+> `AddAgentNode(name, ...)` 挂进来的**子 Agent** 也会触发这些插件回调——
+> 每个子 invocation 各触发一次。完整语义（短路影响 `SubgraphResult.FinalState`、
+> AfterAgent `CustomResponse` 会覆盖下游 `StateKeyLastResponse` 等）见
+> [Plugin 文档](./plugin.md) "执行顺序与短路" 小节中的多 Agent 容器注意事项。
 
 ## 常见问题排查
 
@@ -4201,5 +4848,5 @@ func buildApprovalWorkflow() (*graph.Graph, error) {
   - I/O 约定：`io_conventions`、`io_conventions_tools`
   - 并行 / 扇出：`parallel`、`fanout`、`diamond`
   - 占位符：`placeholder`
-  - 检查点 / 中断：`checkpoint`、`interrupt`、`nested_interrupt`、`static_interrupt`
+  - 检查点 / 中断：`checkpoint`、`interrupt`、`nested_interrupt`、`agentnode_llmagent_externaltool`、`static_interrupt`
 - 进一步阅读：`graph/state_graph.go`、`graph/executor.go`、`agent/graphagent`

@@ -10,6 +10,7 @@
 package gemini
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,28 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
 )
+
+func TestWithContextWindow(t *testing.T) {
+	m, err := New(context.Background(), "gemini-test",
+		WithContextWindow(204800),
+		WithGeminiClientConfig(&genai.ClientConfig{
+			APIKey:  "test-key",
+			Backend: 2,
+		}),
+	)
+	require.NoError(t, err)
+	require.Equal(t, 204800, m.Info().ContextWindow)
+
+	m, err = New(context.Background(), "gemini-test",
+		WithContextWindow(0),
+		WithGeminiClientConfig(&genai.ClientConfig{
+			APIKey:  "test-key",
+			Backend: 2,
+		}),
+	)
+	require.NoError(t, err)
+	require.Zero(t, m.Info().ContextWindow)
+}
 
 func TestOptions(t *testing.T) {
 	var (
@@ -116,7 +139,6 @@ func TestWithTokenTailoringConfig(t *testing.T) {
 				ReserveOutputTokens:    imodel.DefaultReserveOutputTokens,
 				SafetyMarginRatio:      imodel.DefaultSafetyMarginRatio,
 				InputTokensFloor:       imodel.DefaultInputTokensFloor,
-				OutputTokensFloor:      imodel.DefaultOutputTokensFloor,
 				MaxInputTokensRatio:    imodel.DefaultMaxInputTokensRatio,
 			},
 		},
@@ -177,7 +199,6 @@ func TestWithTokenTailoringConfig(t *testing.T) {
 				ReserveOutputTokens:    imodel.DefaultReserveOutputTokens,
 				SafetyMarginRatio:      imodel.DefaultSafetyMarginRatio,
 				InputTokensFloor:       imodel.DefaultInputTokensFloor,
-				OutputTokensFloor:      imodel.DefaultOutputTokensFloor,
 				MaxInputTokensRatio:    imodel.DefaultMaxInputTokensRatio,
 			},
 		},

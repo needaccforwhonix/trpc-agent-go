@@ -1,5 +1,6 @@
 //
-// Tencent is pleased to support the open source community by making trpc-agent-go available.
+// Tencent is pleased to support the open source community by making
+// trpc-agent-go available.
 //
 // Copyright (C) 2025 Tencent.  All rights reserved.
 //
@@ -12,6 +13,7 @@ package util
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strconv"
@@ -19,18 +21,24 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	openaiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/clickhouse"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+	sessionmongodb "trpc.group/trpc-go/trpc-agent-go/session/mongodb"
 	"trpc.group/trpc-go/trpc-agent-go/session/mysql"
+	sessionnoop "trpc.group/trpc-go/trpc-agent-go/session/noop"
+	sessionpgvector "trpc.group/trpc-go/trpc-agent-go/session/pgvector"
 	"trpc.group/trpc-go/trpc-agent-go/session/postgres"
 	"trpc.group/trpc-go/trpc-agent-go/session/redis"
+	sessionsqlite "trpc.group/trpc-go/trpc-agent-go/session/sqlite"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -40,10 +48,15 @@ type SessionType string
 // Session type constants.
 const (
 	SessionInMemory   SessionType = "inmemory"
+	SessionNoop       SessionType = "noop"
+	SessionSQLite     SessionType = "sqlite"
 	SessionRedis      SessionType = "redis"
 	SessionPostgres   SessionType = "postgres"
+	SessionPGVector   SessionType = "pgvector"
 	SessionMySQL      SessionType = "mysql"
+	SessionTDSQL      SessionType = "tdsql"
 	SessionClickHouse SessionType = "clickhouse"
+	SessionMongoDB    SessionType = "mongodb"
 )
 
 // SessionServiceConfig holds configuration for creating a session service.
@@ -52,35 +65,97 @@ type SessionServiceConfig struct {
 	TTL              time.Duration
 	AppendEventHooks []session.AppendEventHook
 	GetSessionHooks  []session.GetSessionHook
+	EnableTracing    bool // enable OpenTelemetry tracing (redis only)
 }
 
-// NewSessionServiceByType creates a session service based on the specified type.
+// NewSessionServiceByType creates a session service based on the specified
+// type.
 //
 // Parameters:
-//   - sessionType: one of inmemory, redis, postgres, mysql, clickhouse
+//   - sessionType: one of inmemory, noop, sqlite, redis, postgres, pgvector,
+//     mysql, tdsql, clickhouse, mongodb
 //   - cfg: session service configuration (eventLimit, ttl, hooks)
 //
 // Environment variables by session type:
 //
+//	sqlite:     SQLITE_SESSION_DSN (default:
+//	  file:sessions.db?_busy_timeout=5000)
 //	redis:      REDIS_ADDR (default: localhost:6379)
 //	postgres:   PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DATABASE
-//	mysql:      MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
-//	clickhouse: CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE
-func NewSessionServiceByType(sessionType SessionType, cfg SessionServiceConfig) (session.Service, error) {
+//	pgvector:   PGVECTOR_HOST, PGVECTOR_PORT, PGVECTOR_USER,
+//	  PGVECTOR_PASSWORD, PGVECTOR_DATABASE, PGVECTOR_EMBEDDER_MODEL
+//	mysql:      MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD,
+//	  MYSQL_DATABASE
+//	tdsql:      TDSQL_HOST, TDSQL_PORT, TDSQL_USER, TDSQL_PASSWORD,
+//	  TDSQL_DATABASE
+//	clickhouse: CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER,
+//	  CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE
+//	mongodb:    MONGODB_URI, MONGODB_DATABASE
+func NewSessionServiceByType(
+	sessionType SessionType,
+	cfg SessionServiceConfig,
+) (session.Service, error) {
 	switch sessionType {
+	case SessionSQLite:
+		return newSQLiteSessionService(cfg)
 	case SessionRedis:
 		return newRedisSessionService(cfg)
 	case SessionPostgres:
 		return newPostgresSessionService(cfg)
+	case SessionPGVector:
+		return newPGVectorSessionService(cfg)
 	case SessionMySQL:
 		return newMySQLSessionService(cfg)
+	case SessionTDSQL:
+		return newTDSQLSessionService(cfg)
 	case SessionClickHouse:
 		return newClickHouseSessionService(cfg)
+	case SessionMongoDB:
+		return newMongoDBSessionService(cfg)
+	case SessionNoop:
+		return sessionnoop.NewService(), nil
 	case SessionInMemory:
 		fallthrough
 	default:
 		return newInMemorySessionService(cfg), nil
 	}
+}
+
+const (
+	sqliteSessionDSNEnvKey    = "SQLITE_SESSION_DSN"
+	defaultSQLiteSessionDBDSN = "file:sessions.db?_busy_timeout=5000"
+	sqliteDriverName          = "sqlite3"
+	defaultSQLiteMaxOpenConns = 1
+	defaultSQLiteMaxIdleConns = 1
+
+	openAIEmbeddingAPIKeyEnvKey  = "OPENAI_EMBEDDING_API_KEY"
+	openAIEmbeddingBaseURLEnvKey = "OPENAI_EMBEDDING_BASE_URL"
+	openAIEmbeddingModelEnvKey   = "OPENAI_EMBEDDING_MODEL"
+)
+
+func newSQLiteSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
+	dsn := GetEnvOrDefault(sqliteSessionDSNEnvKey, defaultSQLiteSessionDBDSN)
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(defaultSQLiteMaxOpenConns)
+	db.SetMaxIdleConns(defaultSQLiteMaxIdleConns)
+
+	svc, err := sessionsqlite.NewService(
+		db,
+		sessionsqlite.WithSessionEventLimit(cfg.EventLimit),
+		sessionsqlite.WithSessionTTL(cfg.TTL),
+		sessionsqlite.WithAppendEventHook(cfg.AppendEventHooks...),
+		sessionsqlite.WithGetSessionHook(cfg.GetSessionHooks...),
+	)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return svc, nil
 }
 
 func newInMemorySessionService(cfg SessionServiceConfig) session.Service {
@@ -95,7 +170,9 @@ func newInMemorySessionService(cfg SessionServiceConfig) session.Service {
 // newRedisSessionService creates a Redis session service.
 // Environment variables:
 //   - REDIS_ADDR: Redis server address (default: localhost:6379)
-func newRedisSessionService(cfg SessionServiceConfig) (session.Service, error) {
+func newRedisSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
 	addr := GetEnvOrDefault("REDIS_ADDR", "localhost:6379")
 	redisURL := fmt.Sprintf("redis://%s", addr)
 
@@ -105,6 +182,8 @@ func newRedisSessionService(cfg SessionServiceConfig) (session.Service, error) {
 		redis.WithSessionTTL(cfg.TTL),
 		redis.WithAppendEventHook(cfg.AppendEventHooks...),
 		redis.WithGetSessionHook(cfg.GetSessionHooks...),
+		redis.WithCompatMode(redis.CompatModeLegacy),
+		redis.WithEnableTracing(cfg.EnableTracing),
 	)
 }
 
@@ -115,7 +194,9 @@ func newRedisSessionService(cfg SessionServiceConfig) (session.Service, error) {
 //   - PG_USER: PostgreSQL user (default: root)
 //   - PG_PASSWORD: PostgreSQL password (default: empty)
 //   - PG_DATABASE: PostgreSQL database (default: trpc_agent_go)
-func newPostgresSessionService(cfg SessionServiceConfig) (session.Service, error) {
+func newPostgresSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
 	host := GetEnvOrDefault("PG_HOST", "localhost")
 	portStr := GetEnvOrDefault("PG_PORT", "5432")
 	port, _ := strconv.Atoi(portStr)
@@ -137,6 +218,81 @@ func newPostgresSessionService(cfg SessionServiceConfig) (session.Service, error
 	)
 }
 
+func getEmbeddingModel(defaultModel string) string {
+	if env := os.Getenv(openAIEmbeddingModelEnvKey); env != "" {
+		return env
+	}
+	return defaultModel
+}
+
+func newOpenAIEmbedder(defaultModel string) *openaiembedder.Embedder {
+	modelName := getEmbeddingModel(defaultModel)
+	opts := []openaiembedder.Option{
+		openaiembedder.WithModel(modelName),
+	}
+
+	if apiKey := os.Getenv(openAIEmbeddingAPIKeyEnvKey); apiKey != "" {
+		opts = append(opts, openaiembedder.WithAPIKey(apiKey))
+	}
+
+	baseURL := os.Getenv(openAIEmbeddingBaseURLEnvKey)
+	if baseURL == "" {
+		baseURL = os.Getenv("OPENAI_BASE_URL")
+	}
+	if baseURL != "" {
+		opts = append(opts, openaiembedder.WithBaseURL(baseURL))
+	}
+
+	return openaiembedder.New(opts...)
+}
+
+// newPGVectorSessionService creates a PostgreSQL + pgvector
+// backed session service.
+// Environment variables:
+//   - PGVECTOR_HOST: PostgreSQL host (default: localhost)
+//   - PGVECTOR_PORT: PostgreSQL port (default: 5432)
+//   - PGVECTOR_USER: PostgreSQL user (default: postgres)
+//   - PGVECTOR_PASSWORD: PostgreSQL password (default: empty)
+//   - PGVECTOR_DATABASE: PostgreSQL database (default:
+//     trpc-agent-go-pgsession)
+//   - PGVECTOR_EMBEDDER_MODEL: Embedder model name (default:
+//     text-embedding-3-small)
+func newPGVectorSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
+	host := GetEnvOrDefault("PGVECTOR_HOST", "localhost")
+	portStr := GetEnvOrDefault("PGVECTOR_PORT", "5432")
+	port := 5432
+	if parsed, err := strconv.Atoi(portStr); err == nil {
+		port = parsed
+	}
+	user := GetEnvOrDefault("PGVECTOR_USER", "postgres")
+	password := GetEnvOrDefault("PGVECTOR_PASSWORD", "")
+	database := GetEnvOrDefault(
+		"PGVECTOR_DATABASE", "trpc-agent-go-pgsession",
+	)
+	embedderModel := GetEnvOrDefault(
+		"PGVECTOR_EMBEDDER_MODEL",
+		openaiembedder.DefaultModel,
+	)
+	embedder := newOpenAIEmbedder(embedderModel)
+
+	return sessionpgvector.NewService(
+		sessionpgvector.WithHost(host),
+		sessionpgvector.WithPort(port),
+		sessionpgvector.WithUser(user),
+		sessionpgvector.WithPassword(password),
+		sessionpgvector.WithDatabase(database),
+		sessionpgvector.WithIndexDimension(embedder.GetDimensions()),
+		sessionpgvector.WithEmbedder(embedder),
+		sessionpgvector.WithTablePrefix("trpc_"),
+		sessionpgvector.WithSessionEventLimit(cfg.EventLimit),
+		sessionpgvector.WithSessionTTL(cfg.TTL),
+		sessionpgvector.WithAppendEventHook(cfg.AppendEventHooks...),
+		sessionpgvector.WithGetSessionHook(cfg.GetSessionHooks...),
+	)
+}
+
 // newMySQLSessionService creates a MySQL session service.
 // Environment variables:
 //   - MYSQL_HOST: MySQL host (default: localhost)
@@ -144,7 +300,9 @@ func newPostgresSessionService(cfg SessionServiceConfig) (session.Service, error
 //   - MYSQL_USER: MySQL user (default: root)
 //   - MYSQL_PASSWORD: MySQL password (default: empty)
 //   - MYSQL_DATABASE: MySQL database (default: trpc_agent_go)
-func newMySQLSessionService(cfg SessionServiceConfig) (session.Service, error) {
+func newMySQLSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
 	host := GetEnvOrDefault("MYSQL_HOST", "localhost")
 	port := GetEnvOrDefault("MYSQL_PORT", "3306")
 	user := GetEnvOrDefault("MYSQL_USER", "root")
@@ -164,6 +322,38 @@ func newMySQLSessionService(cfg SessionServiceConfig) (session.Service, error) {
 	)
 }
 
+// newTDSQLSessionService creates a TDSQL (distributed MySQL) session service.
+// TDSQL requires shardkey-aware DDL/DML; WithTDSQLSharding enables the
+// necessary table definitions and query routing.
+// Environment variables:
+//   - TDSQL_HOST: TDSQL proxy host (default: localhost)
+//   - TDSQL_PORT: TDSQL proxy port (default: 3306)
+//   - TDSQL_USER: TDSQL user (default: root)
+//   - TDSQL_PASSWORD: TDSQL password (default: empty)
+//   - TDSQL_DATABASE: TDSQL database (default: trpc_agent_go)
+func newTDSQLSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
+	host := GetEnvOrDefault("TDSQL_HOST", "localhost")
+	port := GetEnvOrDefault("TDSQL_PORT", "3306")
+	user := GetEnvOrDefault("TDSQL_USER", "root")
+	password := GetEnvOrDefault("TDSQL_PASSWORD", "")
+	database := GetEnvOrDefault("TDSQL_DATABASE", "trpc_agent_go")
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
+		user, password, host, port, database)
+
+	return mysql.NewService(
+		mysql.WithMySQLClientDSN(dsn),
+		mysql.WithTablePrefix("trpc_"),
+		mysql.WithTDSQLSharding(true),
+		mysql.WithSessionEventLimit(cfg.EventLimit),
+		mysql.WithSessionTTL(cfg.TTL),
+		mysql.WithAppendEventHook(cfg.AppendEventHooks...),
+		mysql.WithGetSessionHook(cfg.GetSessionHooks...),
+	)
+}
+
 // newClickHouseSessionService creates a ClickHouse session service.
 // Environment variables:
 //   - CLICKHOUSE_HOST: ClickHouse host (default: localhost)
@@ -171,7 +361,9 @@ func newMySQLSessionService(cfg SessionServiceConfig) (session.Service, error) {
 //   - CLICKHOUSE_USER: ClickHouse user (default: default)
 //   - CLICKHOUSE_PASSWORD: ClickHouse password (default: empty)
 //   - CLICKHOUSE_DATABASE: ClickHouse database (default: trpc_agent_go)
-func newClickHouseSessionService(cfg SessionServiceConfig) (session.Service, error) {
+func newClickHouseSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
 	host := GetEnvOrDefault("CLICKHOUSE_HOST", "localhost")
 	port := GetEnvOrDefault("CLICKHOUSE_PORT", "9000")
 	user := GetEnvOrDefault("CLICKHOUSE_USER", "default")
@@ -191,6 +383,30 @@ func newClickHouseSessionService(cfg SessionServiceConfig) (session.Service, err
 	)
 }
 
+// newMongoDBSessionService creates a MongoDB session service.
+// Environment variables:
+//   - MONGODB_URI: MongoDB URI. Use a replica set or sharded cluster because
+//     session events and tracks use MongoDB transactions.
+//     (default: mongodb://localhost:27017)
+//   - MONGODB_DATABASE: MongoDB database name (default:
+//     trpc-agent-go-mongo-session)
+func newMongoDBSessionService(
+	cfg SessionServiceConfig,
+) (session.Service, error) {
+	uri := GetEnvOrDefault("MONGODB_URI", "mongodb://localhost:27017")
+	database := GetEnvOrDefault("MONGODB_DATABASE", "trpc-agent-go-mongo-session")
+
+	return sessionmongodb.NewService(
+		sessionmongodb.WithMongoClientURI(uri),
+		sessionmongodb.WithDatabase(database),
+		sessionmongodb.WithCollectionPrefix("trpc_"),
+		sessionmongodb.WithSessionEventLimit(cfg.EventLimit),
+		sessionmongodb.WithSessionTTL(cfg.TTL),
+		sessionmongodb.WithAppendEventHook(cfg.AppendEventHooks...),
+		sessionmongodb.WithGetSessionHook(cfg.GetSessionHooks...),
+	)
+}
+
 // RunnerConfig holds configuration for creating a runner.
 type RunnerConfig struct {
 	AppName     string
@@ -199,7 +415,7 @@ type RunnerConfig struct {
 	Instruction string
 	Tools       []tool.Tool
 	MaxTokens   int
-	Temperature float64
+	Temperature *float64
 	Streaming   bool
 }
 
@@ -208,22 +424,31 @@ func DefaultRunnerConfig() RunnerConfig {
 	return RunnerConfig{
 		AppName:     "session-demo",
 		AgentName:   "demo-assistant",
-		ModelName:   GetEnvOrDefault("MODEL_NAME", "deepseek-chat"),
+		ModelName:   GetEnvOrDefault("MODEL_NAME", "deepseek-v4-flash"),
 		Instruction: "You are a helpful assistant.",
-		MaxTokens:   100,
-		Temperature: 0.1,
+		MaxTokens:   0,
+		Temperature: nil,
 		Streaming:   false,
 	}
 }
 
-// NewRunner creates a runner with the given session service and configuration.
-func NewRunner(sessionService session.Service, cfg RunnerConfig) runner.Runner {
-	modelInstance := openai.New(cfg.ModelName, openai.WithVariant(openai.VariantOpenAI))
+// NewRunner creates a runner with the given session service and
+// configuration.
+func NewRunner(
+	sessionService session.Service,
+	cfg RunnerConfig,
+) runner.Runner {
+	modelInstance := openai.New(
+		cfg.ModelName,
+		openai.WithVariant(openai.VariantOpenAI),
+	)
 
 	genConfig := model.GenerationConfig{
-		MaxTokens:   IntPtr(cfg.MaxTokens),
-		Temperature: FloatPtr(cfg.Temperature),
+		Temperature: cfg.Temperature,
 		Stream:      cfg.Streaming,
+	}
+	if cfg.MaxTokens > 0 {
+		genConfig.MaxTokens = IntPtr(cfg.MaxTokens)
 	}
 
 	agentOpts := []llmagent.Option{
@@ -244,12 +469,26 @@ func NewRunner(sessionService session.Service, cfg RunnerConfig) runner.Runner {
 	)
 }
 
-// RunAgent runs the agent with the given message and optionally prints the conversation.
-func RunAgent(ctx context.Context, r runner.Runner, userID, sessionID, message string, printConversation bool) (string, error) {
+// RunAgent runs the agent with the given message and optionally prints
+// the conversation.
+func RunAgent(
+	ctx context.Context,
+	r runner.Runner,
+	userID string,
+	sessionID string,
+	message string,
+	printConversation bool,
+) (string, error) {
 	msg := model.NewUserMessage(message)
 	requestID := uuid.New().String()
 
-	eventChan, err := r.Run(ctx, userID, sessionID, msg, agent.WithRequestID(requestID))
+	eventChan, err := r.Run(
+		ctx,
+		userID,
+		sessionID,
+		msg,
+		agent.WithRequestID(requestID),
+	)
 	if err != nil {
 		return "", fmt.Errorf("run agent failed: %w", err)
 	}
@@ -258,15 +497,24 @@ func RunAgent(ctx context.Context, r runner.Runner, userID, sessionID, message s
 		fmt.Printf("│  User: %s\n", Truncate(message, 55))
 	}
 
-	var response string
+	var (
+		response string
+		runErr   error
+	)
 	for evt := range eventChan {
-		if evt.Error != nil {
-			return "", fmt.Errorf("event error: %s", evt.Error.Message)
+		if evt.Error != nil && runErr == nil {
+			runErr = fmt.Errorf("event error: %s", evt.Error.Message)
+			continue
 		}
-		response = ExtractResponse(evt)
-		if evt.IsFinalResponse() {
-			break
+
+		content := ExtractResponse(evt)
+		if content != "" {
+			response = content
 		}
+	}
+
+	if runErr != nil {
+		return "", runErr
 	}
 
 	if printConversation {
@@ -284,7 +532,8 @@ func ExtractResponse(evt *event.Event) string {
 	return evt.Response.Choices[0].Message.Content
 }
 
-// GetEnvOrDefault retrieves the value of an environment variable or returns a default value if not set.
+// GetEnvOrDefault retrieves the value of an environment variable or returns a
+// default value if not set.
 func GetEnvOrDefault(key, defaultValue string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
@@ -311,8 +560,15 @@ func FloatPtr(v float64) *float64 {
 }
 
 // PrintSessionEvents prints all events for a session in debug mode.
-// It retrieves the session from the service and prints each event's role and content.
-func PrintSessionEvents(ctx context.Context, svc session.Service, appName, userID, sessionID string) error {
+// It retrieves the session from the service and prints each event's
+// role and content.
+func PrintSessionEvents(
+	ctx context.Context,
+	svc session.Service,
+	appName string,
+	userID string,
+	sessionID string,
+) error {
 	key := session.Key{
 		AppName:   appName,
 		UserID:    userID,
@@ -322,6 +578,9 @@ func PrintSessionEvents(ctx context.Context, svc session.Service, appName, userI
 	sess, err := svc.GetSession(ctx, key)
 	if err != nil {
 		return fmt.Errorf("get session failed: %w", err)
+	}
+	if sess == nil {
+		return fmt.Errorf("session not found")
 	}
 
 	events := sess.GetEvents()

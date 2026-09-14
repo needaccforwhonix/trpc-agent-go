@@ -10,6 +10,15 @@ Make sure you have Go installed and the project dependencies are available.
 
 The example shows how to use the OpenAI-like model implementation with automatic environment variable reading and flexible command line configuration.
 
+See also the focused sub-examples in this directory:
+
+- `retry/` for SDK-level retry configuration.
+- `requesty/` for using the OpenAI-compatible Requesty router (`https://router.requesty.ai/v1`).
+- `switch/` for runtime model switching.
+- `selector/` for per-LLM-call model selection with `runner.Run`.
+- `failover/` for primary/backup model failover before the first non-error chunk.
+- `hedge/` for delayed or failure-triggered hedge requests across multiple candidates.
+
 ## Key Features
 
 1. **Environment Variable Support**: Automatically reads `OPENAI_API_KEY` and `OPENAI_BASE_URL`

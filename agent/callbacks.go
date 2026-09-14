@@ -25,7 +25,7 @@ const ErrorTypeAgentCallbackError = "agent_callback_error"
 
 const (
 	callbackPanicErrFmt = "%s: %v"
-	callbackPanicLogFmt = "%s (invocation: %s, agent: %s): " +
+	callbackPanicLogFmt = log.PanicPrefix + " %s (invocation: %s, agent: %s): " +
 		"%v\n%s"
 
 	beforeAgentCallbackPanic = "before agent callback panic"
@@ -143,6 +143,21 @@ func NewCallbacks(opts ...CallbacksOption) *Callbacks {
 	return c
 }
 
+// Clone returns an independent copy of c, including callback lists
+// and execution options.
+func (c *Callbacks) Clone() *Callbacks {
+	if c == nil {
+		return nil
+	}
+	out := &Callbacks{
+		BeforeAgent:        append([]BeforeAgentCallbackStructured(nil), c.BeforeAgent...),
+		AfterAgent:         append([]AfterAgentCallbackStructured(nil), c.AfterAgent...),
+		continueOnError:    c.continueOnError,
+		continueOnResponse: c.continueOnResponse,
+	}
+	return out
+}
+
 // RegisterBeforeAgent registers a before agent callback.
 // Supports both old and new callback function signatures.
 // Old signatures are automatically wrapped into new signatures.
@@ -220,6 +235,7 @@ func (c *Callbacks) processCallbackResult(
 		return false
 	}
 	if result.Context != nil {
+		result.Context = PreserveGraphCompletionCapture(*ctx, result.Context)
 		*ctx = result.Context
 	}
 	if result.CustomResponse != nil {
@@ -329,6 +345,7 @@ func (c *Callbacks) processAfterCallbackResult(
 		return false
 	}
 	if result.Context != nil {
+		result.Context = PreserveGraphCompletionCapture(*ctx, result.Context)
 		*ctx = result.Context
 	}
 	if result.CustomResponse != nil {

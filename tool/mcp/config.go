@@ -39,8 +39,6 @@ const (
 
 // Default configurations.
 const (
-	// defaultMaxReconnectAttempts is the default maximum number of session reconnection attempts.
-	defaultMaxReconnectAttempts = 3
 	// minReconnectAttempts is the minimum allowed reconnection attempts.
 	minReconnectAttempts = 1
 	// maxReconnectAttemptsLimit is the maximum allowed reconnection attempts.
@@ -69,6 +67,11 @@ type ConnectionConfig struct {
 
 	// Common configuration.
 	Timeout time.Duration `json:"timeout,omitempty"`
+
+	// Description provides a capability summary of this MCP server.
+	// When set, mcpbroker exposes it in mcp_list_servers so the model can
+	// decide which server to explore without listing every tool first.
+	Description string `json:"description,omitempty"`
 
 	// Advanced configuration.
 	ClientInfo mcp.Implementation `json:"client_info,omitempty"`
@@ -159,14 +162,42 @@ func WithSessionReconnectConfig(config SessionReconnectConfig) ToolSetOption {
 	}
 }
 
-// WithName sets the name of the MCP toolset for identification and conflict resolution.
-// This name will be used when implementing tool name prefixing to avoid conflicts
-// between tools from different toolsets.
+// WithName sets the ToolSet name used for model-visible tool name prefixing.
+// When an MCP ToolSet is attached to an LLMAgent, the framework wraps it with
+// NamedToolSet and exposes each tool as {name}_{remoteToolName} (for example,
+// WithName("github") + remote tool "search" becomes "github_search"). Use a
+// distinct name for each MCP ToolSet to avoid collisions; the default is "mcp".
 func WithName(name string) ToolSetOption {
 	return func(c *toolSetConfig) {
 		c.name = name
 	}
 }
+
+// Per-request dynamic HTTP headers (e.g. user-specific Authorization tokens)
+// are supported directly through the upstream MCP client. Pass an
+// mcp.WithHTTPBeforeRequest hook to WithMCPOptions and read whatever
+// request-scoped values you need from the context:
+//
+//	import (
+//	    tmcp "trpc.group/trpc-go/trpc-mcp-go"
+//	    toolmcp "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
+//	)
+//
+//	ts := toolmcp.NewMCPToolSet(cfg,
+//	    toolmcp.WithMCPOptions(tmcp.WithHTTPBeforeRequest(
+//	        func(ctx context.Context, req *http.Request) error {
+//	            for k, v := range headersFromContext(ctx) {
+//	                req.Header.Set(k, v)
+//	            }
+//	            return nil
+//	        },
+//	    )),
+//	)
+//
+// When this ToolSet is wired into llmagent via WithToolSets, enable
+// llmagent.WithRefreshToolSetsOnRun(true) if initialize/listTools must also
+// observe request-scoped headers. Otherwise only tools/call is guaranteed to
+// use the current run context.
 
 // validateTransport validates the transport string and returns the internal transport type.
 func validateTransport(t string) (transport, error) {

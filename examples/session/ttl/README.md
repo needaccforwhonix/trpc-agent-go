@@ -15,21 +15,25 @@ When building LLM-powered applications, you may want sessions to expire after a 
 ```bash
 # Run with different backends
 go run main.go -session=inmemory
+go run main.go -session=sqlite
 go run main.go -session=redis
 go run main.go -session=mysql
 go run main.go -session=postgres
+go run main.go -session=pgvector
 go run main.go -session=clickhouse
 
 # Customize TTL (default: 10 seconds)
-go run main.go -session=clickhouse -ttl=30
+go run main.go -session=pgvector -ttl=30
 ```
 
 ## Environment Variables
 
 | Backend    | Variables                                                      |
 |------------|----------------------------------------------------------------|
+| sqlite     | `SQLITE_SESSION_DSN` (default: file:sessions.db?_busy_timeout=5000) |
 | redis      | `REDIS_ADDR` (default: localhost:6379)                         |
 | postgres   | `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DATABASE`  |
+| pgvector   | `PGVECTOR_HOST`, `PGVECTOR_PORT`, `PGVECTOR_USER`, `PGVECTOR_PASSWORD`, `PGVECTOR_DATABASE`, `PGVECTOR_EMBEDDER_MODEL` |
 | mysql      | `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` |
 | clickhouse | `CLICKHOUSE_HOST`, `CLICKHOUSE_PORT`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE` |
 

@@ -66,6 +66,8 @@ go run .
 
 你可以在 Langfuse 控制台查看链路追踪数据。
 
+消息 payload 的兼容策略以及推荐使用的 OTel `role + parts` 字段，见 [多模态遥测消息](telemetry-multimodal.md)。
+
 ##### 接入代码说明
 Langfuse 支持通过 `/api/public/otel` (OTLP) 接口接收 Trace 数据，仅支持 HTTP/protobuf，不支持 gRPC。
 上述代码通过设置 `OTEL_EXPORTER_OTLP_HEADERS` 和 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` 来接入 langfuse。
@@ -259,6 +261,85 @@ Agent Request
 - **错误定位**：快速找到失败的具体环节
 - **依赖关系**：了解组件间的调用关系
 - **并发分析**：观察并发执行的效果
+
+## Span Attribute 策略（生产侧）
+
+`telemetry/trace` 提供 opt-in 的 `SpanAttributePolicy`，在 span 创建阶段控制大 payload **span attribute** 的采集与写入大小。
+
+默认不配置时行为不变。
+
+### 能力
+
+- `Drop()` 与无条件 `Omit()`（未配 `MaxBytes`）可避免 `json.Marshal`。
+- `MaxBytes()` + `Omit()`：`[]byte` 路径（如 `execute_tool` 的 tool arguments）按长度判断，无需额外 marshal；JSON 路径（chat / workflow / invoke_agent）仍需完整 marshal，**不能**降低堆峰值。
+- `Truncate()` 始终完整 marshal，仅限制写入 span 的值大小。
+
+| 规则 | 能否降低 marshal 堆峰值 | 说明 |
+|------|-------------------------|------|
+| `Drop()` | 是 | 跳过序列化，不写 attribute |
+| `Omit()`（无 `MaxBytes`） | 是 | 跳过 payload 序列化 |
+| `MaxBytes(n)` + `Omit()` | JSON：否；`[]byte`：是 | JSON 路径需完整 marshal 后再比阈值；`[]byte` 路径仅 `len` 判断 |
+| `Truncate(n)` | 否 | 完整序列化后截断导出 |
+
+想降内存，优先 `Drop()` 当前后端**不会读取**的 attribute。不要把某一套示例当成通用配置：Langfuse 与 Jaeger / 通用 OTLP 读的 key 不同。
+
+### 覆盖范围
+
+已接入 `chat`、`invoke_agent`、`workflow`、`execute_tool` 的大 payload attribute（messages、llm request/response、workflow request/response、tool arguments/result 等）。
+
+### 配置入口
+
+```go
+import atrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
+
+// Langfuse：保留 *.otel（含 multimodal parts）。可 Drop 废弃的 legacy messages。
+// chat/generation span 上不要把 .otel、legacy messages 和 llm_request/llm_response 全部 Drop，否则 Input/Output 可能为空。
+clean, err := atrace.Start(ctx,
+    atrace.WithSpanAttributePolicy(
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrInputMessages, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrOutputMessages, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrInputMessages, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrOutputMessages, atrace.Drop()),
+    ),
+)
+```
+
+Jaeger / Galileo / 通用 OTLP 消费的是原始 span attribute。若 UI 只认 `gen_ai.input.messages` / `gen_ai.output.messages`，可以 Drop `*.otel` 以降低 marshal 成本：
+
+```go
+clean, err := atrace.Start(ctx,
+    atrace.WithSpanAttributePolicy(
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrInputMessagesOTel, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationChat, atrace.AttrOutputMessagesOTel, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrInputMessagesOTel, atrace.Drop()),
+        atrace.WithAttributeRule(atrace.OperationInvokeAgent, atrace.AttrOutputMessagesOTel, atrace.Drop()),
+    ),
+)
+```
+
+未调用 `trace.Start` 时，可在首次 LLM 调用前使用 `atrace.SetSpanAttributePolicy(...)`。`trace.Start` 在 tracer 初始化**成功**后安装 policy，`clean()` 会恢复之前的 policy。
+
+`MaxBytes` + `Omit()` 示例（限制 attribute 体积；JSON 路径仍会 marshal）：
+
+```go
+atrace.WithAttributeRule(atrace.OperationWorkflow, atrace.AttributeKey("gen_ai.workflow.request"),
+    atrace.MaxBytes(16<<10), atrace.Omit(),
+)
+```
+
+`Truncate` 示例（接受完整 marshal，仅限制导出体积）：
+
+```go
+atrace.WithAttributeRule(atrace.OperationWorkflow, atrace.AttributeKey("gen_ai.workflow.response"), atrace.Truncate(64<<10))
+```
+
+### 兼容性说明
+
+启用 Drop/Omit/Truncate 后，部分监控后端可能无法从 attribute 还原结构化全文；请按**当前后端实际读取的 key** 与内存预算 opt-in 评估。
+
+- chat/generation span 上，Langfuse exporter 读取顺序：`*.otel` → legacy `gen_ai.*.messages` → `trpc.go.agent.llm_request` / `llm_response`。InvokeAgent 只从 `*.otel` 回退到 legacy messages。适用来源都缺失时 Input/Output 可能为空。
+- Jaeger / 通用 OTLP 通常展示原始 key。官方 GenAI 字段是 `gen_ai.input.messages`；`*.otel` 是框架扩展。
+- 同时 fan-out 到 Langfuse 和 Jaeger 时，任何一端还要用的字段都不能 Drop。
 
 ## 进阶功能
 

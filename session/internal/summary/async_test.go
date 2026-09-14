@@ -19,7 +19,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/summarytrigger"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
@@ -50,6 +52,24 @@ func (m *mockSummarizer) SetPrompt(prompt string) {}
 func (m *mockSummarizer) SetModel(mdl model.Model) {}
 
 func (m *mockSummarizer) Metadata() map[string]any { return nil }
+
+func TestDetachContext_PreservesRequestStart(t *testing.T) {
+	startedAt := time.Now().UTC()
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = summarytrigger.ContextWithRequestStart(ctx, summarytrigger.RequestStart{
+		RequestID: "request-1",
+		StartedAt: startedAt,
+	})
+
+	detached := DetachContext(ctx)
+	cancel()
+
+	assert.NoError(t, detached.Err())
+	requestStart, ok := summarytrigger.RequestStartFromContext(detached)
+	require.True(t, ok)
+	assert.Equal(t, "request-1", requestStart.RequestID)
+	assert.Equal(t, startedAt, requestStart.StartedAt)
+}
 
 func TestNewAsyncSummaryWorker(t *testing.T) {
 	summarizer := &mockSummarizer{shouldSummarize: true, summaryText: "test"}
@@ -437,16 +457,152 @@ func TestAsyncSummaryWorker_EnqueueJob(t *testing.T) {
 		require.NoError(t, err) // Should fallback to sync, not error
 	})
 
+	t.Run("fallback detaches parent cancel and applies job timeout", func(t *testing.T) {
+		type traceKey string
+		const key traceKey = "trace-marker"
+
+		summarizer := &mockSummarizer{shouldSummarize: true, summaryText: "test"}
+		var captured any
+		var deadlineSet bool
+		var doneNil bool
+		var ctxErr error
+		config := AsyncSummaryConfig{
+			Summarizer:        summarizer,
+			AsyncSummaryNum:   1,
+			SummaryQueueSize:  1,
+			SummaryJobTimeout: time.Second,
+			CreateSummaryFunc: func(ctx context.Context, _ *session.Session, _ string, _ bool) error {
+				captured = ctx.Value(key)
+				_, deadlineSet = ctx.Deadline()
+				doneNil = ctx.Done() == nil
+				ctxErr = ctx.Err()
+				return nil
+			},
+		}
+
+		worker := NewAsyncSummaryWorker(config)
+		worker.Start()
+		defer worker.Stop()
+
+		sess := &session.Session{
+			ID:      "test-session",
+			AppName: "test-app",
+			UserID:  "test-user",
+		}
+
+		parentCtx, cancel := context.WithTimeout(
+			context.WithValue(context.Background(), key, "trace-value"),
+			time.Second,
+		)
+		cancel()
+
+		err := worker.EnqueueJob(parentCtx, sess, "", false)
+		require.NoError(t, err)
+		assert.Equal(t, "trace-value", captured)
+		assert.True(t, deadlineSet)
+		assert.False(t, doneNil)
+		assert.NoError(t, ctxErr)
+	})
+
+	t.Run("synchronous fallback honors summary job timeout", func(t *testing.T) {
+		summarizer := &mockSummarizer{shouldSummarize: true, summaryText: "test"}
+		config := AsyncSummaryConfig{
+			Summarizer:        summarizer,
+			SummaryJobTimeout: 10 * time.Millisecond,
+			CreateSummaryFunc: func(ctx context.Context, _ *session.Session, _ string, _ bool) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		worker := NewAsyncSummaryWorker(config)
+		sess := &session.Session{
+			ID:      "test-session",
+			AppName: "test-app",
+			UserID:  "test-user",
+		}
+
+		err := worker.EnqueueJob(context.Background(), sess, "", false)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	})
+
+	t.Run("cascade targets share the summary job deadline", func(t *testing.T) {
+		const filterKey = "branch1"
+		var calls []string
+		var deadlines []time.Time
+		config := AsyncSummaryConfig{
+			Summarizer:            &mockSummarizer{shouldSummarize: true, summaryText: "test"},
+			SummaryJobTimeout:     20 * time.Millisecond,
+			SummaryDispatchPolicy: NewSummaryDispatchPolicy(nil, true),
+			CreateSummaryFunc: func(
+				ctx context.Context,
+				sess *session.Session,
+				target string,
+				_ bool,
+			) error {
+				calls = append(calls, target)
+				deadline, ok := ctx.Deadline()
+				require.True(t, ok)
+				deadlines = append(deadlines, deadline)
+				if target == filterKey {
+					sess.SummariesMu.Lock()
+					sess.Summaries[target] = &session.Summary{
+						Summary:   "branch summary",
+						UpdatedAt: time.Now(),
+					}
+					sess.SummariesMu.Unlock()
+					recordSummaryMaterialized(ctx, target)
+					return nil
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		worker := NewAsyncSummaryWorker(config)
+		sess := &session.Session{
+			ID:      "deadline-session",
+			AppName: "test-app",
+			UserID:  "test-user",
+			Events: []event.Event{
+				{FilterKey: filterKey, Version: event.CurrentVersion},
+				{FilterKey: "branch2", Version: event.CurrentVersion},
+			},
+			Summaries: make(map[string]*session.Summary),
+		}
+
+		err := worker.runJob(&summaryJob{
+			ctx:       context.Background(),
+			filterKey: filterKey,
+			session:   sess,
+		})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Equal(t, []string{filterKey, ""}, calls)
+		require.Len(t, deadlines, 2)
+		require.True(t, deadlines[0].Equal(deadlines[1]))
+	})
+
 	t.Run("enqueue with filter key", func(t *testing.T) {
 		summarizer := &mockSummarizer{shouldSummarize: true, summaryText: "test"}
 		filterKeyCh := make(chan string, 10)
 		config := AsyncSummaryConfig{
-			Summarizer:        summarizer,
-			AsyncSummaryNum:   2,
-			SummaryQueueSize:  10,
-			SummaryJobTimeout: time.Second,
-			CreateSummaryFunc: func(_ context.Context, _ *session.Session, fk string, _ bool) error {
+			Summarizer:            summarizer,
+			AsyncSummaryNum:       2,
+			SummaryQueueSize:      10,
+			SummaryJobTimeout:     time.Second,
+			SummaryDispatchPolicy: NewSummaryDispatchPolicy(nil, true),
+			CreateSummaryFunc: func(ctx context.Context, sess *session.Session, fk string, _ bool) error {
 				filterKeyCh <- fk
+				if fk != session.SummaryFilterKeyAllContents {
+					sess.SummariesMu.Lock()
+					if sess.Summaries == nil {
+						sess.Summaries = make(map[string]*session.Summary)
+					}
+					sess.Summaries[fk] = &session.Summary{
+						Summary:   "branch summary",
+						UpdatedAt: time.Now(),
+					}
+					sess.SummariesMu.Unlock()
+					recordSummaryMaterialized(ctx, fk)
+				}
 				return nil
 			},
 		}
@@ -486,6 +642,52 @@ func TestAsyncSummaryWorker_EnqueueJob(t *testing.T) {
 			}
 			return seenBranch && seenFull
 		}, 2*time.Second, 10*time.Millisecond, "expected CreateSummaryFunc to be called for both branch and full-session summaries")
+	})
+
+	t.Run("enqueue clones context before detaching cancelation", func(t *testing.T) {
+		type cloneKey string
+		const key cloneKey = "clone-marker"
+
+		agent.SetGoroutineContextCloner(func(ctx context.Context) context.Context {
+			return context.WithValue(ctx, key, "cloned")
+		})
+		defer agent.SetGoroutineContextCloner(nil)
+
+		summarizer := &mockSummarizer{shouldSummarize: true, summaryText: "test"}
+		done := make(chan struct{})
+		var captured any
+		config := AsyncSummaryConfig{
+			Summarizer:        summarizer,
+			AsyncSummaryNum:   1,
+			SummaryQueueSize:  10,
+			SummaryJobTimeout: time.Second,
+			CreateSummaryFunc: func(ctx context.Context, _ *session.Session, _ string, _ bool) error {
+				captured = ctx.Value(key)
+				close(done)
+				return nil
+			},
+		}
+
+		worker := NewAsyncSummaryWorker(config)
+		worker.Start()
+		defer worker.Stop()
+
+		sess := &session.Session{
+			ID:      "test-session",
+			AppName: "test-app",
+			UserID:  "test-user",
+		}
+
+		err := worker.EnqueueJob(context.Background(), sess, "", false)
+		require.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for async summary worker to process job")
+		}
+
+		assert.Equal(t, "cloned", captured)
 	})
 }
 
@@ -629,6 +831,28 @@ func TestAsyncSummaryWorker_ProcessJob(t *testing.T) {
 		mu.Lock()
 		assert.True(t, createSummaryCalled)
 		mu.Unlock()
+	})
+
+	t.Run("process failed job with nil context", func(t *testing.T) {
+		var createSummaryCalled bool
+		worker := NewAsyncSummaryWorker(AsyncSummaryConfig{
+			Summarizer: &mockSummarizer{shouldSummarize: true},
+			CreateSummaryFunc: func(context.Context, *session.Session, string, bool) error {
+				createSummaryCalled = true
+				return errors.New("create summary failed")
+			},
+		})
+
+		worker.processJob(&summaryJob{
+			ctx: nil,
+			session: &session.Session{
+				ID:      "test-session",
+				AppName: "test-app",
+				UserID:  "test-user",
+			},
+		})
+
+		assert.True(t, createSummaryCalled)
 	})
 }
 

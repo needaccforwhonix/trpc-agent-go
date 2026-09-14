@@ -49,6 +49,11 @@ const (
 	subgraphInterruptKeyChildCheckpointNS = "child_checkpoint_ns"
 	subgraphInterruptKeyChildLineageID    = "child_lineage_id"
 	subgraphInterruptKeyChildTaskID       = "child_task_id"
+	subgraphInterruptKeyToolCallID        = "tool_call_id"
+	subgraphInterruptKeyToolCallKey       = "tool_call_key"
+	subgraphInterruptKeyChildFilterKey    = "child_filter_key"
+
+	stateKeyCompletedToolMessages = "__completed_tool_messages__"
 )
 
 // Checkpoint Metadata.Source enumeration values
@@ -93,6 +98,7 @@ func isUnsafeStateKey(key string) bool {
 		StateKeyModelCallbacks,
 		StateKeyAgentCallbacks,
 		StateKeyCurrentNodeID,
+		currentTraceStepIDStateKey,
 		StateKeySession,
 		StateKeyGraphInterruptInputs:
 		return true
@@ -113,7 +119,9 @@ func isInternalStateKey(key string) bool {
 	switch key {
 	// Graph metadata keys stored in state delta for instrumentation
 	case MetadataKeyNode, MetadataKeyPregel, MetadataKeyChannel,
-		MetadataKeyState, MetadataKeyCompletion, MetadataKeyNodeCustom:
+		MetadataKeyState, MetadataKeyCompletion, MetadataKeyNodeCustom,
+		MetadataKeyNodeEmitter,
+		stateKeyCompletedToolMessages:
 		return true
 	default:
 		return false

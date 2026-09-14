@@ -80,7 +80,7 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/team"
 )
 
-modelInstance := openai.New("deepseek-chat")
+modelInstance := openai.New("deepseek-v4-flash")
 
 coder := llmagent.New(
     "coder",
@@ -156,7 +156,7 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/team"
 )
 
-modelInstance := openai.New("deepseek-chat")
+modelInstance := openai.New("deepseek-v4-flash")
 
 backendDev := llmagent.New(
     "backend_dev",
@@ -233,8 +233,8 @@ the coordinator as a Tool (via a ToolSet). `team.MemberToolConfig` controls
 how that wrapper behaves.
 
 Under the hood, `team.MemberToolConfig` maps directly to AgentTool options:
-`agenttool.WithStreamInner`, `agenttool.WithHistoryScope`, and
-`agenttool.WithSkipSummarization`.
+`agenttool.WithStreamInner`, `agenttool.WithInnerTextMode`,
+`agenttool.WithHistoryScope`, and `agenttool.WithSkipSummarization`.
 
 ### Quickstart
 
@@ -243,6 +243,7 @@ Start from defaults, then override what you need:
 ```go
 memberCfg := team.DefaultMemberToolConfig()
 memberCfg.StreamInner = true
+memberCfg.InnerTextMode = team.InnerTextModeExclude
 memberCfg.HistoryScope = team.HistoryScopeParentBranch
 memberCfg.SkipSummarization = false
 
@@ -256,6 +257,7 @@ tm, err := team.New(
 Defaults (from `team.DefaultMemberToolConfig()`):
 
 - `StreamInner=false`
+- `InnerTextMode=team.InnerTextModeInclude`
 - `HistoryScope=team.HistoryScopeParentBranch`
 - `SkipSummarization=false`
 
@@ -270,6 +272,34 @@ Defaults (from `team.DefaultMemberToolConfig()`):
 - **How to use it**: enable streaming for the coordinator and members (for
   example, `GenerationConfig{Stream: true}`), then set
   `MemberToolConfig.StreamInner=true`.
+
+#### `InnerTextMode`
+
+- **Effective default**: `team.InnerTextModeInclude`
+- **What it does**: when `StreamInner=true`, controls whether forwarded member
+  assistant text is visible in the parent flow.
+- **What it does not do**: it does not stop the member result from being
+  aggregated into the final tool response that the coordinator uses for its
+  next turn.
+- **Use `team.InnerTextModeInclude` when**: you want the full live transcript
+  from each member, including the member's natural-language answer as it
+  streams.
+- **Use `team.InnerTextModeExclude` when**: you want users to see member
+  progress such as tool calls and tool completion markers, but you want the
+  coordinator to be the only Agent that prints the final prose answer.
+
+`InnerTextMode` is only relevant when `StreamInner=true`. When
+`StreamInner=false`, no inner events are forwarded.
+
+### Common Visibility Setups
+
+- `StreamInner=false`
+  - Hide all member internals. Users only see the coordinator's final answer.
+- `StreamInner=true` + `InnerTextMode=team.InnerTextModeInclude`
+  - Show the full member transcript and then the coordinator's final answer.
+- `StreamInner=true` + `InnerTextMode=team.InnerTextModeExclude`
+  - Show member progress, but hide member assistant text so the coordinator
+    remains the only visible final answer.
 
 #### `HistoryScope`
 
@@ -359,6 +389,110 @@ With this enabled, after a handoff, the next user message will start from the
 Agent that produced the last reply (until another `transfer_to_agent` happens).
 This feature is implemented via session state, so you must reuse the same
 session across requests.
+
+This is different from `await_user_reply` plus
+`runner.WithAwaitUserReplyRouting(true)`:
+
+- `WithCrossRequestTransfer(true)` is a Swarm-specific owner model. The active
+  member keeps owning future user turns until another transfer happens.
+- `await_user_reply` is a one-shot route. It is consumed by exactly one future
+  user turn and then cleared automatically.
+
+### Independent member history (optional)
+
+By default, Swarm member events are persisted in the root session. If members
+need private history, enable independent member sessions:
+
+```go
+tm, err := team.NewSwarm(
+    "support",
+    "main_agent",
+    []agent.Agent{mainAgent, refundAgent},
+    team.WithSwarmIndependentAgents(),
+)
+```
+
+With this enabled, the entry member continues to use the root session. Other
+members use stable sessions derived from the root session, team name, and
+member name. Member events are still emitted to the caller, but isolated member
+transcripts are persisted into their member sessions instead of the root
+session. The runner completion event remains a root-run marker; consume the
+forwarded member event for the member's final reply.
+
+This option only controls history isolation. If the last transfer target should
+receive future user messages, combine it with `team.WithCrossRequestTransfer(true)`.
+When both options are enabled, the next user message is persisted to the active
+member session before that member runs.
+
+### Rewrite handoff input (optional)
+
+By default, when a Swarm member hands off with `transfer_to_agent`, the target member receives the tool call's `message` field as its user input. If your application needs to construct the target member's first input from the original user input, a template, or other context, configure `team.WithSwarmHandoffInputBuilder`:
+
+```go
+tm, err := team.NewSwarm(
+    "support",
+    "main_agent",
+    []agent.Agent{mainAgent, refundAgent},
+    team.WithSwarmHandoffInputBuilder(func(
+        ctx context.Context,
+        args team.SwarmHandoffInputArgs,
+    ) (model.Message, error) {
+        if args.ToAgentName == "refund_agent" {
+            return model.NewUserMessage(
+                "Refund request:\n" + args.RootInput.Content,
+            ), nil
+        }
+        return model.NewUserMessage(args.TransferMessage), nil
+    }),
+)
+if err != nil {
+    panic(err)
+}
+```
+
+`SwarmHandoffInputArgs` provides:
+
+- `FromAgentName`: the member that initiated the handoff.
+- `ToAgentName`: the member that receives the handoff.
+- `RootInput`: the original user input for the current run.
+- `ParentInput`: the current input of the member that initiated the handoff.
+- `TransferMessage`: the `message` field from the `transfer_to_agent` call.
+
+This option only rewrites the target member's current input for this handoff. It does not rewrite the source member's context or prevent the target member from reading existing conversation history.
+
+### Dynamic members (runtime)
+
+In long-running services, the set of available Swarm members may change over
+time (for example, when remote Agents are registered/unregistered).
+
+You can update a Swarm Team roster at runtime:
+
+```go
+// Add one member.
+if err := tm.AddSwarmMember(newAgent); err != nil {
+    panic(err)
+}
+
+// Remove one member by name.
+if ok := tm.RemoveSwarmMember("member_name"); !ok {
+    // Not found, or refused (for example, entry member).
+}
+
+// Replace the whole roster.
+if err := tm.UpdateSwarmMembers(members); err != nil {
+    panic(err)
+}
+```
+
+Notes:
+
+- This only applies to Swarm teams (created with `team.NewSwarm`).
+- The entry member (`entryName`) cannot be removed. Create a new Team if you
+  want to change the entrypoint.
+- When a member is removed, members' SubAgents lists are rewired via
+  `SetSubAgents`, so `transfer_to_agent` can no longer target it.
+- With cross-request transfer enabled, if session state points to a removed
+  active Agent, the next run falls back to the entry member.
 
 ## Swarm Guardrails
 

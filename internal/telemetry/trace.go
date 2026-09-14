@@ -24,6 +24,7 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/toolorder"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	semconvtrace "trpc.group/trpc-go/trpc-agent-go/telemetry/semconv/trace"
@@ -59,27 +60,33 @@ func NewChatSpanName(requestModel string) string {
 
 // NewExecuteToolSpanName creates a new execute tool span name.
 func NewExecuteToolSpanName(toolName string) string {
-	return fmt.Sprintf("%s %s", OperationExecuteTool, toolName)
+	return OperationExecuteTool + " " + toolName
 }
 
+// WorkflowType is the normalized type vocabulary used by workflow spans.
+type WorkflowType string
+
+// Standard workflow type values.
 const (
-	// KeyGenAIWorkflowName is the name of the workflow.
-	KeyGenAIWorkflowName = "gen_ai.workflow.name"
-	// KeyGenAIWorkflowID is the id of the workflow.
-	KeyGenAIWorkflowID = "gen_ai.workflow.id"
+	WorkflowTypeGraph    WorkflowType = "graph"
+	WorkflowTypeFunction WorkflowType = "function"
+	WorkflowTypeLLM      WorkflowType = "llm"
+	WorkflowTypeTool     WorkflowType = "tool"
+	WorkflowTypeAgent    WorkflowType = "agent"
+	WorkflowTypeJoin     WorkflowType = "join"
+	WorkflowTypeRouter   WorkflowType = "router"
 )
 
-var (
-	// KeyGenAIWorkflowRequest is the request of the workflow.
-	KeyGenAIWorkflowRequest = semconvtrace.KeyGenAIWorkflowRequest
-	// KeyGenAIWorkflowResponse is the response of the workflow.
-	KeyGenAIWorkflowResponse = semconvtrace.KeyGenAIWorkflowResponse
-)
+// String returns the string representation of the workflow type.
+func (wt WorkflowType) String() string {
+	return string(wt)
+}
 
 // Workflow is the workflow information.
 type Workflow struct {
 	Name     string
 	ID       string
+	Type     WorkflowType
 	Request  any
 	Response any
 	Error    error
@@ -87,32 +94,175 @@ type Workflow struct {
 
 // NewWorkflowSpanName creates a new workflow span name.
 func NewWorkflowSpanName(workflowName string) string {
-	return fmt.Sprintf("%s %s", OperationWorkflow, workflowName)
+	return OperationWorkflow + " " + workflowName
+}
+
+type telemetryMessage struct {
+	Role             model.Role          `json:"role"`
+	Content          string              `json:"content,omitempty"`
+	ContentParts     []model.ContentPart `json:"content_parts,omitempty"`
+	ToolCallID       string              `json:"tool_call_id,omitempty"`
+	Name             string              `json:"name,omitempty"`
+	ToolCalls        []model.ToolCall    `json:"tool_calls,omitempty"`
+	ReasoningContent string              `json:"reasoning_content,omitempty"`
+}
+
+type telemetryChoice struct {
+	Index        int              `json:"index"`
+	Message      telemetryMessage `json:"message,omitempty"`
+	Delta        telemetryMessage `json:"delta,omitempty"`
+	FinishReason *string          `json:"finish_reason,omitempty"`
+}
+
+func telemetryMessageFromModel(msg model.Message) telemetryMessage {
+	return telemetryMessage{
+		Role:             msg.Role,
+		Content:          msg.Content,
+		ContentParts:     msg.ContentParts,
+		ToolCallID:       msg.ToolID,
+		Name:             msg.ToolName,
+		ToolCalls:        msg.ToolCalls,
+		ReasoningContent: msg.ReasoningContent,
+	}
+}
+
+func marshalTelemetryMessages(messages []model.Message) ([]byte, error) {
+	out := make([]telemetryMessage, len(messages))
+	for i, msg := range messages {
+		out[i] = telemetryMessageFromModel(msg)
+	}
+	return json.Marshal(out)
+}
+
+func marshalTelemetryChoices(choices []model.Choice) ([]byte, error) {
+	out := make([]telemetryChoice, len(choices))
+	for i, choice := range choices {
+		out[i] = telemetryChoice{
+			Index:        choice.Index,
+			Message:      telemetryMessageFromModel(choice.Message),
+			Delta:        telemetryMessageFromModel(choice.Delta),
+			FinishReason: choice.FinishReason,
+		}
+	}
+	return json.Marshal(out)
+}
+
+// ChatTraceState keeps per-chat-span trace state for repeated streaming chunks.
+//
+// Request attributes are normally committed once per chat span while the
+// installed span attribute policy pointer remains unchanged. Invocation and
+// response attributes remain chunk-scoped because they are cheap and may be
+// completed as streaming processing advances.
+//
+// ChatTraceState is not goroutine-safe and must not be shared across chat spans.
+type ChatTraceState struct {
+	requestCommitted bool
+	cachedPolicy     *SpanAttributePolicy
+}
+
+// traceChunkAttributes contains per-response chunk trace inputs.
+type traceChunkAttributes struct {
+	Invocation       *agent.Invocation
+	Response         *model.Response
+	EventID          string
+	TimeToFirstToken time.Duration
+}
+
+// commitRequest writes base chat and request attributes for a chat span.
+//
+// Request payload attributes are committed once while the global span attribute
+// policy pointer remains unchanged. If the policy pointer changes, request
+// attributes are rebuilt and written again under the new policy. Base chat
+// attributes may be rewritten on those refreshes. When req is nil, only base
+// attributes are written and request commit state is not latched.
+func (s *ChatTraceState) commitRequest(span trace.Span, req *model.Request, taskType string) {
+	if !span.IsRecording() {
+		return
+	}
+
+	policy := spanAttributePolicy.Load()
+	if s != nil && s.requestCommitted && s.cachedPolicy == policy {
+		return
+	}
+
+	attrs := baseChatAttributes()
+	if taskType != "" {
+		attrs = append(attrs, attribute.String(semconvtrace.KeyGenAITaskType, taskType))
+	}
+	if req != nil {
+		attrs = append(attrs, buildRequestAttributes(req)...)
+	}
+
+	if len(attrs) > 0 {
+		span.SetAttributes(attrs...)
+	}
+
+	if s != nil && req != nil {
+		s.requestCommitted = true
+		s.cachedPolicy = policy
+	}
+}
+
+// traceChunk writes invocation, chunk metadata, and response attributes.
+func (s *ChatTraceState) traceChunk(span trace.Span, attributes *traceChunkAttributes) {
+	if !span.IsRecording() || attributes == nil {
+		return
+	}
+
+	attrs := buildInvocationAttributes(attributes.Invocation)
+	if attributes.EventID != "" {
+		attrs = append(attrs, attribute.String(semconvtrace.KeyEventID, attributes.EventID))
+	}
+	if attributes.TimeToFirstToken > 0 {
+		attrs = append(attrs, attribute.Float64(semconvtrace.KeyTRPCAgentGoClientTimeToFirstToken, attributes.TimeToFirstToken.Seconds()))
+	}
+	attrs = append(attrs, buildResponseAttributes(attributes.Response, semconvtrace.ValueDefaultErrorType)...)
+	if len(attrs) > 0 {
+		span.SetAttributes(attrs...)
+	}
+
+	if attributes.Response != nil && attributes.Response.Error != nil {
+		span.SetStatus(codes.Error, attributes.Response.Error.Message)
+	}
+}
+
+// TraceChat is the single entry point for stateful streaming chat traces.
+func (s *ChatTraceState) TraceChat(span trace.Span, attributes *TraceChatAttributes) {
+	traceChatWithState(span, attributes, s)
+}
+
+func baseChatAttributes() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String(semconvtrace.KeyGenAISystem, semconvtrace.SystemTRPCGoAgent),
+		attribute.String(semconvtrace.KeyGenAIOperationName, OperationChat),
+	}
 }
 
 // TraceWorkflow traces the workflow.
 func TraceWorkflow(span trace.Span, workflow *Workflow) {
-	span.SetAttributes(attribute.String(KeyGenAIOperationName, OperationWorkflow))
-	span.SetAttributes(attribute.String(KeyGenAIWorkflowName, workflow.Name))
-	span.SetAttributes(attribute.String(KeyGenAIWorkflowID, workflow.ID))
+	if !span.IsRecording() {
+		return
+	}
+	span.SetAttributes(
+		attribute.String(semconvtrace.KeyGenAIOperationName, OperationWorkflow),
+		attribute.String(semconvtrace.KeyGenAIWorkflowName, workflow.Name),
+		attribute.String(semconvtrace.KeyGenAIWorkflowID, workflow.ID),
+	)
+	if workflow.Type != "" {
+		span.SetAttributes(attribute.String(semconvtrace.KeyGenAIWorkflowType, workflow.Type.String()))
+	}
 	if workflow.Request != nil {
-		request, err := json.Marshal(workflow.Request)
-		if err != nil {
-			span.SetAttributes(attribute.String(KeyGenAIWorkflowRequest, fmt.Sprintf("<not json serializable: %v>", err)))
-		} else {
-			span.SetAttributes(attribute.String(KeyGenAIWorkflowRequest, string(request)))
-		}
+		setStringAttribute(span, OperationWorkflow, semconvtrace.KeyGenAIWorkflowRequest, "<not json serializable>", func() ([]byte, error) {
+			return json.Marshal(workflow.Request)
+		})
 	}
 	if workflow.Response != nil {
-		response, err := json.Marshal(workflow.Response)
-		if err != nil {
-			span.SetAttributes(attribute.String(KeyGenAIWorkflowResponse, fmt.Sprintf("<not json serializable>: %v", err)))
-		} else {
-			span.SetAttributes(attribute.String(KeyGenAIWorkflowResponse, string(response)))
-		}
+		setStringAttribute(span, OperationWorkflow, semconvtrace.KeyGenAIWorkflowResponse, "<not json serializable>", func() ([]byte, error) {
+			return json.Marshal(workflow.Response)
+		})
 	}
 	if workflow.Error != nil {
-		span.SetAttributes(attribute.String(KeyErrorType, ToErrorType(workflow.Error, ValueDefaultErrorType)))
+		span.SetAttributes(attribute.String(semconvtrace.KeyErrorType, ToErrorType(workflow.Error, semconvtrace.ValueDefaultErrorType)))
 		span.SetStatus(codes.Error, workflow.Error.Error())
 		span.RecordError(workflow.Error)
 	}
@@ -125,7 +275,7 @@ func newInferenceSpanName(operationNames, requestModel string) string {
 	if requestModel == "" {
 		return operationNames
 	}
-	return fmt.Sprintf("%s %s", operationNames, requestModel)
+	return operationNames + " " + requestModel
 }
 
 const (
@@ -135,116 +285,48 @@ const (
 	ProtocolHTTP string = "http"
 )
 
-// Telemetry attribute keys aliases from semconv package.
-var (
-	ResourceServiceNamespace = semconvtrace.ResourceServiceNamespace
-	ResourceServiceName      = semconvtrace.ResourceServiceName
-	ResourceServiceVersion   = semconvtrace.ResourceServiceVersion
-
-	KeyEventID      = semconvtrace.KeyEventID
-	KeyInvocationID = semconvtrace.KeyInvocationID
-	KeyLLMRequest   = semconvtrace.KeyLLMRequest
-	KeyLLMResponse  = semconvtrace.KeyLLMResponse
-
-	KeyRunnerName      = semconvtrace.KeyRunnerName
-	KeyRunnerUserID    = semconvtrace.KeyRunnerUserID
-	KeyRunnerSessionID = semconvtrace.KeyRunnerSessionID
-	KeyRunnerInput     = semconvtrace.KeyRunnerInput
-	KeyRunnerOutput    = semconvtrace.KeyRunnerOutput
-
-	KeyTRPCAgentGoAppName                = semconvtrace.KeyTRPCAgentGoAppName
-	KeyTRPCAgentGoUserID                 = semconvtrace.KeyTRPCAgentGoUserID
-	KeyTRPCAgentGoClientTimeToFirstToken = semconvtrace.KeyTRPCAgentGoClientTimeToFirstToken
-
-	KeyGenAIOperationName = semconvtrace.KeyGenAIOperationName
-	KeyGenAISystem        = semconvtrace.KeyGenAISystem
-
-	KeyGenAIRequestModel                  = semconvtrace.KeyGenAIRequestModel
-	KeyGenAIRequestIsStream               = semconvtrace.KeyGenAIRequestIsStream
-	KeyGenAIRequestChoiceCount            = semconvtrace.KeyGenAIRequestChoiceCount
-	KeyGenAIInputMessages                 = semconvtrace.KeyGenAIInputMessages
-	KeyGenAIOutputMessages                = semconvtrace.KeyGenAIOutputMessages
-	KeyGenAIAgentName                     = semconvtrace.KeyGenAIAgentName
-	KeyGenAIConversationID                = semconvtrace.KeyGenAIConversationID
-	KeyGenAIUsageOutputTokens             = semconvtrace.KeyGenAIUsageOutputTokens
-	KeyGenAIUsageInputTokens              = semconvtrace.KeyGenAIUsageInputTokens
-	KeyGenAIUsageInputTokensCached        = semconvtrace.KeyGenAIUsageInputTokensCached
-	KeyGenAIUsageInputTokensCacheRead     = semconvtrace.KeyGenAIUsageInputTokensCacheRead
-	KeyGenAIUsageInputTokensCacheCreation = semconvtrace.KeyGenAIUsageInputTokensCacheCreation
-	KeyGenAIProviderName                  = semconvtrace.KeyGenAIProviderName
-	KeyGenAIAgentDescription              = semconvtrace.KeyGenAIAgentDescription
-	KeyGenAIResponseFinishReasons         = semconvtrace.KeyGenAIResponseFinishReasons
-	KeyGenAIResponseID                    = semconvtrace.KeyGenAIResponseID
-	KeyGenAIResponseModel                 = semconvtrace.KeyGenAIResponseModel
-	KeyGenAIRequestStopSequences          = semconvtrace.KeyGenAIRequestStopSequences
-	KeyGenAIRequestFrequencyPenalty       = semconvtrace.KeyGenAIRequestFrequencyPenalty
-	KeyGenAIRequestMaxTokens              = semconvtrace.KeyGenAIRequestMaxTokens
-	KeyGenAIRequestPresencePenalty        = semconvtrace.KeyGenAIRequestPresencePenalty
-	KeyGenAIRequestTemperature            = semconvtrace.KeyGenAIRequestTemperature
-	KeyGenAIRequestTopP                   = semconvtrace.KeyGenAIRequestTopP
-	KeyGenAISystemInstructions            = semconvtrace.KeyGenAISystemInstructions
-	KeyGenAITokenType                     = semconvtrace.KeyGenAITokenType
-	KeyGenAITaskType                      = semconvtrace.KeyGenAITaskType
-	KeyGenAIRequestThinkingEnabled        = semconvtrace.KeyGenAIRequestThinkingEnabled
-	KeyGenAIRequestToolDefinitions        = semconvtrace.KeyGenAIRequestToolDefinitions
-
-	KeyGenAIToolName          = semconvtrace.KeyGenAIToolName
-	KeyGenAIToolDescription   = semconvtrace.KeyGenAIToolDescription
-	KeyGenAIToolCallID        = semconvtrace.KeyGenAIToolCallID
-	KeyGenAIToolCallArguments = semconvtrace.KeyGenAIToolCallArguments
-	KeyGenAIToolCallResult    = semconvtrace.KeyGenAIToolCallResult
-
-	KeyErrorType          = semconvtrace.KeyErrorType
-	KeyErrorMessage       = semconvtrace.KeyErrorMessage
-	ValueDefaultErrorType = semconvtrace.ValueDefaultErrorType
-
-	SystemTRPCGoAgent = semconvtrace.SystemTRPCGoAgent
-)
-
 // TraceToolCall traces the invocation of a tool call.
 func TraceToolCall(span trace.Span, sess *session.Session, declaration *tool.Declaration, args []byte, rspEvent *event.Event, err error) {
 	span.SetAttributes(
-		attribute.String(KeyGenAISystem, SystemTRPCGoAgent),
-		attribute.String(KeyGenAIOperationName, OperationExecuteTool),
-		attribute.String(KeyGenAIToolName, declaration.Name),
-		attribute.String(KeyGenAIToolDescription, declaration.Description),
+		attribute.String(semconvtrace.KeyGenAISystem, semconvtrace.SystemTRPCGoAgent),
+		attribute.String(semconvtrace.KeyGenAIOperationName, OperationExecuteTool),
+		attribute.String(semconvtrace.KeyGenAIToolName, declaration.Name),
+		attribute.String(semconvtrace.KeyGenAIToolDescription, declaration.Description),
 	)
 	if rspEvent != nil {
-		span.SetAttributes(attribute.String(KeyEventID, rspEvent.ID))
+		span.SetAttributes(attribute.String(semconvtrace.KeyEventID, rspEvent.ID))
 	}
 	if sess != nil {
 		span.SetAttributes(
-			attribute.String(KeyGenAIConversationID, sess.ID),
-			attribute.String(KeyRunnerUserID, sess.UserID),
+			attribute.String(semconvtrace.KeyGenAIConversationID, sess.ID),
+			attribute.String(semconvtrace.KeyRunnerUserID, sess.UserID),
 		)
 	}
 
 	// args is json-encoded.
-	span.SetAttributes(attribute.String(KeyGenAIToolCallArguments, string(args)))
+	setBytesAttribute(span, OperationExecuteTool, semconvtrace.KeyGenAIToolCallArguments, args)
 	if rspEvent != nil && rspEvent.Response != nil {
 		if e := rspEvent.Response.Error; e != nil {
 			span.SetStatus(codes.Error, e.Message)
-			span.SetAttributes(attribute.String(KeyErrorType, e.Type), attribute.String(KeyErrorMessage, e.Message))
+			span.SetAttributes(responseErrorAttributes(e, semconvtrace.ValueDefaultErrorType)...)
 		} else if err != nil {
 			span.SetStatus(codes.Error, err.Error())
-			span.SetAttributes(attribute.String(KeyErrorType, ToErrorType(err, ValueDefaultErrorType)), attribute.String(KeyErrorMessage, err.Error()))
+			span.SetAttributes(attribute.String(semconvtrace.KeyErrorType, ToErrorType(err, semconvtrace.ValueDefaultErrorType)), attribute.String(semconvtrace.KeyErrorMessage, err.Error()))
 		}
 
 		if callIDs := rspEvent.Response.GetToolCallIDs(); len(callIDs) > 0 {
-			span.SetAttributes(attribute.String(KeyGenAIToolCallID, callIDs[0]))
+			span.SetAttributes(attribute.String(semconvtrace.KeyGenAIToolCallID, callIDs[0]))
 		}
-		if bts, err := json.Marshal(rspEvent.Response); err == nil {
-			span.SetAttributes(attribute.String(KeyGenAIToolCallResult, string(bts)))
-		} else {
-			span.SetAttributes(attribute.String(KeyGenAIToolCallResult, "<not json serializable>"))
-		}
+		setStringAttribute(span, OperationExecuteTool, semconvtrace.KeyGenAIToolCallResult, "<not json serializable>", func() ([]byte, error) {
+			return json.Marshal(rspEvent.Response)
+		})
 	}
 
 	// Setting empty llm request and response (as UI expect these) while not
 	// applicable for tool_response.
 	span.SetAttributes(
-		attribute.String(KeyLLMRequest, "{}"),
-		attribute.String(KeyLLMResponse, "{}"),
+		attribute.String(semconvtrace.KeyLLMRequest, "{}"),
+		attribute.String(semconvtrace.KeyLLMResponse, "{}"),
 	)
 }
 
@@ -256,84 +338,132 @@ const ToolNameMergedTools = "(merged tools)"
 // for preventing trace-query requests typically sent by web UIs.
 func TraceMergedToolCalls(span trace.Span, rspEvent *event.Event) {
 	span.SetAttributes(
-		attribute.String(KeyGenAISystem, SystemTRPCGoAgent),
-		attribute.String(KeyGenAIOperationName, OperationExecuteTool),
-		attribute.String(KeyGenAIToolName, ToolNameMergedTools),
-		attribute.String(KeyGenAIToolDescription, "(merged tools)"),
-		attribute.String(KeyGenAIToolCallArguments, "N/A"),
+		attribute.String(semconvtrace.KeyGenAISystem, semconvtrace.SystemTRPCGoAgent),
+		attribute.String(semconvtrace.KeyGenAIOperationName, OperationExecuteTool),
+		attribute.String(semconvtrace.KeyGenAIToolName, ToolNameMergedTools),
+		attribute.String(semconvtrace.KeyGenAIToolDescription, "(merged tools)"),
+		attribute.String(semconvtrace.KeyGenAIToolCallArguments, "N/A"),
 	)
 	if rspEvent != nil && rspEvent.Response != nil {
 		if callIDs := rspEvent.Response.GetToolCallIDs(); len(callIDs) > 0 {
-			span.SetAttributes(attribute.String(KeyGenAIToolCallID, callIDs[0]))
+			span.SetAttributes(attribute.String(semconvtrace.KeyGenAIToolCallID, callIDs[0]))
 		}
 		if e := rspEvent.Response.Error; e != nil {
 			span.SetStatus(codes.Error, e.Message)
-			span.SetAttributes(attribute.String(KeyErrorType, e.Type), attribute.String(KeyErrorMessage, e.Message))
+			span.SetAttributes(responseErrorAttributes(e, semconvtrace.ValueDefaultErrorType)...)
 		}
-		span.SetAttributes(attribute.String(KeyEventID, rspEvent.ID))
+		span.SetAttributes(attribute.String(semconvtrace.KeyEventID, rspEvent.ID))
 
-		if bts, err := json.Marshal(rspEvent.Response); err == nil {
-			span.SetAttributes(attribute.String(KeyGenAIToolCallResult, string(bts)))
-		} else {
-			span.SetAttributes(attribute.String(KeyGenAIToolCallResult, "<not json serializable>"))
-		}
+		setStringAttribute(span, OperationExecuteTool, semconvtrace.KeyGenAIToolCallResult, "<not json serializable>", func() ([]byte, error) {
+			return json.Marshal(rspEvent.Response)
+		})
 	}
 
 	// Setting empty llm request and response (as UI expect these) while not
 	// applicable for tool_response.
 	span.SetAttributes(
-		attribute.String(KeyLLMRequest, "{}"),
-		attribute.String(KeyLLMResponse, "{}"),
+		attribute.String(semconvtrace.KeyLLMRequest, "{}"),
+		attribute.String(semconvtrace.KeyLLMResponse, "{}"),
 	)
+}
+
+func resolveInvocationAgentIdentity(invoke *agent.Invocation) (string, string) {
+	if invoke == nil {
+		return "", ""
+	}
+	// Invocation does not carry a canonical agent ID today, so use
+	// Invocation.AgentName as the fallback for gen_ai.agent.id.
+	return invoke.AgentName, invoke.AgentName
 }
 
 // TraceBeforeInvokeAgent traces the before invocation of an agent.
 func TraceBeforeInvokeAgent(span trace.Span, invoke *agent.Invocation, agentDescription, instructions string, genConfig *model.GenerationConfig) {
-	if invoke != nil && len(invoke.RunOptions.SpanAttributes) > 0 {
+	if !span.IsRecording() {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String(semconvtrace.KeyGenAISystem, semconvtrace.SystemTRPCGoAgent),
+		attribute.String(semconvtrace.KeyGenAIOperationName, OperationInvokeAgent),
+		attribute.String(semconvtrace.KeyGenAIAgentDescription, agentDescription),
+		attribute.String(semconvtrace.KeyGenAISystemInstructions, instructions),
+	}
+	if invoke != nil {
+		traceBeforeInvokeAgentInvocation(span, invoke)
+		attrs = append(attrs, beforeInvokeAgentAttributes(invoke)...)
+	}
+	span.SetAttributes(attrs...)
+	setInvokeAgentGenerationConfigAttributes(span, genConfig)
+}
+
+func traceBeforeInvokeAgentInvocation(span trace.Span, invoke *agent.Invocation) {
+	if len(invoke.RunOptions.SpanAttributes) > 0 {
 		span.SetAttributes(invoke.RunOptions.SpanAttributes...)
 	}
-	if bts, err := json.Marshal([]model.Message{invoke.Message}); err == nil {
-		span.SetAttributes(
-			attribute.String(KeyGenAIInputMessages, string(bts)),
-		)
-	} else {
-		span.SetAttributes(attribute.String(KeyGenAIInputMessages, "<not json serializable>"))
+	if invoke.GetParentInvocation() == nil &&
+		len(invoke.RunOptions.TraceStartedCallbacks) > 0 {
+		spanContext := span.SpanContext()
+		for _, callback := range invoke.RunOptions.TraceStartedCallbacks {
+			if callback == nil {
+				continue
+			}
+			callback(spanContext)
+		}
 	}
-	span.SetAttributes(
-		attribute.String(KeyGenAISystem, SystemTRPCGoAgent),
-		attribute.String(KeyGenAIOperationName, OperationInvokeAgent),
-		attribute.String(KeyGenAIAgentName, invoke.AgentName),
-		attribute.String(KeyInvocationID, invoke.InvocationID),
-		attribute.String(KeyGenAIAgentDescription, agentDescription),
-		attribute.String(KeyGenAISystemInstructions, instructions),
-	)
+	setInvokeAgentInputMessageAttributes(span, invoke.Message)
+}
+
+func setInvokeAgentInputMessageAttributes(span trace.Span, msg model.Message) {
+	setStringAttribute(span, OperationInvokeAgent, semconvtrace.KeyGenAIInputMessages, "<not json serializable>", func() ([]byte, error) {
+		return marshalTelemetryMessages([]model.Message{msg})
+	})
+	setStringAttribute(span, OperationInvokeAgent, semconvtrace.KeyGenAIInputMessagesOTel, "<not json serializable>", func() ([]byte, error) {
+		return marshalOTelTelemetryMessages([]model.Message{msg})
+	})
+}
+
+func beforeInvokeAgentAttributes(invoke *agent.Invocation) []attribute.KeyValue {
+	var attrs []attribute.KeyValue
+	agentName, agentID := resolveInvocationAgentIdentity(invoke)
+	if agentName != "" {
+		attrs = append(attrs, attribute.String(semconvtrace.KeyGenAIAgentName, agentName))
+	}
+	if agentID != "" {
+		attrs = append(attrs, attribute.String(semconvtrace.KeyGenAIAgentID, agentID))
+	}
+	attrs = append(attrs, attribute.String(semconvtrace.KeyInvocationID, invoke.InvocationID))
+	if invoke.Session != nil {
+		attrs = append(attrs,
+			attribute.String(semconvtrace.KeyRunnerUserID, invoke.Session.UserID),
+			attribute.String(semconvtrace.KeyGenAIConversationID, invoke.Session.ID),
+		)
+	}
+	return attrs
+}
+
+func setInvokeAgentGenerationConfigAttributes(span trace.Span, genConfig *model.GenerationConfig) {
 	if genConfig != nil {
-		span.SetAttributes(attribute.StringSlice(KeyGenAIRequestStopSequences, genConfig.Stop))
+		span.SetAttributes(attribute.Bool(semconvtrace.KeyGenAIRequestIsStream, genConfig.Stream))
+		if len(genConfig.Stop) > 0 {
+			span.SetAttributes(attribute.StringSlice(semconvtrace.KeyGenAIRequestStopSequences, genConfig.Stop))
+		}
 		if fp := genConfig.FrequencyPenalty; fp != nil {
-			span.SetAttributes(attribute.Float64(KeyGenAIRequestFrequencyPenalty, *fp))
+			span.SetAttributes(attribute.Float64(semconvtrace.KeyGenAIRequestFrequencyPenalty, *fp))
 		}
 		if mt := genConfig.MaxTokens; mt != nil {
-			span.SetAttributes(attribute.Int(KeyGenAIRequestMaxTokens, *mt))
+			span.SetAttributes(attribute.Int(semconvtrace.KeyGenAIRequestMaxTokens, *mt))
 		}
 		if pp := genConfig.PresencePenalty; pp != nil {
-			span.SetAttributes(attribute.Float64(KeyGenAIRequestPresencePenalty, *pp))
+			span.SetAttributes(attribute.Float64(semconvtrace.KeyGenAIRequestPresencePenalty, *pp))
 		}
 		if tp := genConfig.Temperature; tp != nil {
-			span.SetAttributes(attribute.Float64(KeyGenAIRequestTemperature, *tp))
+			span.SetAttributes(attribute.Float64(semconvtrace.KeyGenAIRequestTemperature, *tp))
 		}
 		if tp := genConfig.TopP; tp != nil {
-			span.SetAttributes(attribute.Float64(KeyGenAIRequestTopP, *tp))
+			span.SetAttributes(attribute.Float64(semconvtrace.KeyGenAIRequestTopP, *tp))
 		}
 		if te := genConfig.ThinkingEnabled; te != nil {
-			span.SetAttributes(attribute.Bool(KeyGenAIRequestThinkingEnabled, *te))
+			span.SetAttributes(attribute.Bool(semconvtrace.KeyGenAIRequestThinkingEnabled, *te))
 		}
-	}
-
-	if invoke.Session != nil {
-		span.SetAttributes(
-			attribute.String(KeyRunnerUserID, invoke.Session.UserID),
-			attribute.String(KeyGenAIConversationID, invoke.Session.ID),
-		)
 	}
 }
 
@@ -345,7 +475,23 @@ type TokenUsage struct {
 }
 
 // TraceAfterInvokeAgent traces the after invocation of an agent.
-func TraceAfterInvokeAgent(span trace.Span, rspEvent *event.Event, tokenUsage *TokenUsage, timeToFirstToken time.Duration) {
+func TraceAfterInvokeAgent(
+	span trace.Span,
+	rspEvent *event.Event,
+	tokenUsage *TokenUsage,
+	timeToFirstToken time.Duration,
+	errorTypeFallback string,
+) {
+	if !span.IsRecording() {
+		return
+	}
+	if tokenUsage != nil {
+		span.SetAttributes(attribute.Int(semconvtrace.KeyGenAIUsageInputTokens, tokenUsage.PromptTokens))
+		span.SetAttributes(attribute.Int(semconvtrace.KeyGenAIUsageOutputTokens, tokenUsage.CompletionTokens))
+	}
+	if timeToFirstToken > 0 {
+		span.SetAttributes(attribute.Float64(semconvtrace.KeyTRPCAgentGoClientTimeToFirstToken, timeToFirstToken.Seconds()))
+	}
 	if rspEvent == nil {
 		return
 	}
@@ -354,11 +500,12 @@ func TraceAfterInvokeAgent(span trace.Span, rspEvent *event.Event, tokenUsage *T
 		return
 	}
 	if len(rsp.Choices) > 0 {
-		if bts, err := json.Marshal(rsp.Choices); err == nil {
-			span.SetAttributes(
-				attribute.String(KeyGenAIOutputMessages, string(bts)),
-			)
-		}
+		setStringAttribute(span, OperationInvokeAgent, semconvtrace.KeyGenAIOutputMessages, "", func() ([]byte, error) {
+			return marshalTelemetryChoices(rsp.Choices)
+		})
+		setStringAttribute(span, OperationInvokeAgent, semconvtrace.KeyGenAIOutputMessagesOTel, "", func() ([]byte, error) {
+			return marshalOTelTelemetryChoices(rsp.Choices)
+		})
 		var finishReasons []string
 		for _, choice := range rsp.Choices {
 			if choice.FinishReason != nil {
@@ -367,22 +514,14 @@ func TraceAfterInvokeAgent(span trace.Span, rspEvent *event.Event, tokenUsage *T
 				finishReasons = append(finishReasons, "")
 			}
 		}
-		span.SetAttributes(attribute.StringSlice(KeyGenAIResponseFinishReasons, finishReasons))
-
+		span.SetAttributes(attribute.StringSlice(semconvtrace.KeyGenAIResponseFinishReasons, finishReasons))
 	}
-	span.SetAttributes(attribute.String(KeyGenAIResponseModel, rsp.Model))
-	if tokenUsage != nil {
-		span.SetAttributes(attribute.Int(KeyGenAIUsageInputTokens, tokenUsage.PromptTokens))
-		span.SetAttributes(attribute.Int(KeyGenAIUsageOutputTokens, tokenUsage.CompletionTokens))
-	}
-	span.SetAttributes(attribute.String(KeyGenAIResponseID, rsp.ID))
+	span.SetAttributes(attribute.String(semconvtrace.KeyGenAIResponseModel, rsp.Model))
+	span.SetAttributes(attribute.String(semconvtrace.KeyGenAIResponseID, rsp.ID))
 
 	if e := rsp.Error; e != nil {
 		span.SetStatus(codes.Error, e.Message)
-		span.SetAttributes(attribute.String(KeyErrorType, e.Type), attribute.String(KeyErrorMessage, e.Message))
-	}
-	if timeToFirstToken > 0 {
-		span.SetAttributes(attribute.Float64(KeyTRPCAgentGoClientTimeToFirstToken, timeToFirstToken.Seconds()))
+		span.SetAttributes(responseErrorAttributes(e, errorTypeFallback)...)
 	}
 }
 
@@ -409,41 +548,25 @@ func NewSummarizeTaskType(name string) string {
 
 // TraceChat traces the invocation of an LLM call.
 func TraceChat(span trace.Span, attributes *TraceChatAttributes) {
-	attrs := []attribute.KeyValue{
-		attribute.String(KeyGenAISystem, SystemTRPCGoAgent),
-		attribute.String(KeyGenAIOperationName, OperationChat),
+	traceChatWithState(span, attributes, nil)
+}
+
+func traceChatWithState(span trace.Span, attributes *TraceChatAttributes, state *ChatTraceState) {
+	if !span.IsRecording() {
+		return
 	}
 	if attributes == nil {
-		span.SetAttributes(attrs...)
+		span.SetAttributes(baseChatAttributes()...)
 		return
 	}
 
-	if attributes.EventID != "" {
-		attrs = append(attrs, attribute.String(KeyEventID, attributes.EventID))
-	}
-	if attributes.TimeToFirstToken > 0 {
-		attrs = append(attrs, attribute.Float64(KeyTRPCAgentGoClientTimeToFirstToken, attributes.TimeToFirstToken.Seconds()))
-	}
-	if attributes.TaskType != "" {
-		attrs = append(attrs, attribute.String(semconvtrace.KeyGenAITaskType, attributes.TaskType))
-	}
-
-	// Add invocation attributes
-	attrs = append(attrs, buildInvocationAttributes(attributes.Invocation)...)
-
-	// Add request attributes
-	attrs = append(attrs, buildRequestAttributes(attributes.Request)...)
-
-	// Add response attributes
-	attrs = append(attrs, buildResponseAttributes(attributes.Response)...)
-
-	// Set all attributes at once
-	span.SetAttributes(attrs...)
-
-	// Handle response error status
-	if attributes.Response != nil && attributes.Response.Error != nil {
-		span.SetStatus(codes.Error, attributes.Response.Error.Message)
-	}
+	state.commitRequest(span, attributes.Request, attributes.TaskType)
+	state.traceChunk(span, &traceChunkAttributes{
+		Invocation:       attributes.Invocation,
+		Response:         attributes.Response,
+		EventID:          attributes.EventID,
+		TimeToFirstToken: attributes.TimeToFirstToken,
+	})
 }
 
 // buildInvocationAttributes extracts attributes from the invocation.
@@ -453,18 +576,18 @@ func buildInvocationAttributes(invoke *agent.Invocation) []attribute.KeyValue {
 	}
 
 	attrs := []attribute.KeyValue{
-		attribute.String(KeyInvocationID, invoke.InvocationID),
+		attribute.String(semconvtrace.KeyInvocationID, invoke.InvocationID),
 	}
 
 	if invoke.Session != nil {
 		attrs = append(attrs,
-			attribute.String(KeyGenAIConversationID, invoke.Session.ID),
-			attribute.String(KeyRunnerUserID, invoke.Session.UserID),
+			attribute.String(semconvtrace.KeyGenAIConversationID, invoke.Session.ID),
+			attribute.String(semconvtrace.KeyRunnerUserID, invoke.Session.UserID),
 		)
 	}
 
 	if invoke.Model != nil {
-		attrs = append(attrs, attribute.String(KeyGenAIRequestModel, invoke.Model.Info().Name))
+		attrs = append(attrs, attribute.String(semconvtrace.KeyGenAIRequestModel, invoke.Model.Info().Name))
 	}
 
 	return attrs
@@ -477,113 +600,112 @@ func buildRequestAttributes(req *model.Request) []attribute.KeyValue {
 	}
 
 	attrs := []attribute.KeyValue{
-		attribute.StringSlice(KeyGenAIRequestStopSequences, req.GenerationConfig.Stop),
-		attribute.Int(KeyGenAIRequestChoiceCount, 1),
+		attribute.StringSlice(semconvtrace.KeyGenAIRequestStopSequences, req.GenerationConfig.Stop),
+		attribute.Int(semconvtrace.KeyGenAIRequestChoiceCount, 1),
 	}
 
 	// Add generation config attributes
 	genConfig := req.GenerationConfig
 	// Add stream attribute only when it's true
 	if genConfig.Stream {
-		attrs = append(attrs, attribute.Bool(KeyGenAIRequestIsStream, true))
+		attrs = append(attrs, attribute.Bool(semconvtrace.KeyGenAIRequestIsStream, true))
 	}
 	if fp := genConfig.FrequencyPenalty; fp != nil {
-		attrs = append(attrs, attribute.Float64(KeyGenAIRequestFrequencyPenalty, *fp))
+		attrs = append(attrs, attribute.Float64(semconvtrace.KeyGenAIRequestFrequencyPenalty, *fp))
 	}
 	if mt := genConfig.MaxTokens; mt != nil {
-		attrs = append(attrs, attribute.Int(KeyGenAIRequestMaxTokens, *mt))
+		attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIRequestMaxTokens, *mt))
 	}
 	if pp := genConfig.PresencePenalty; pp != nil {
-		attrs = append(attrs, attribute.Float64(KeyGenAIRequestPresencePenalty, *pp))
+		attrs = append(attrs, attribute.Float64(semconvtrace.KeyGenAIRequestPresencePenalty, *pp))
 	}
 	if tp := genConfig.Temperature; tp != nil {
-		attrs = append(attrs, attribute.Float64(KeyGenAIRequestTemperature, *tp))
+		attrs = append(attrs, attribute.Float64(semconvtrace.KeyGenAIRequestTemperature, *tp))
 	}
 	if tp := genConfig.TopP; tp != nil {
-		attrs = append(attrs, attribute.Float64(KeyGenAIRequestTopP, *tp))
+		attrs = append(attrs, attribute.Float64(semconvtrace.KeyGenAIRequestTopP, *tp))
 	}
 	if te := genConfig.ThinkingEnabled; te != nil {
-		attrs = append(attrs, attribute.Bool(KeyGenAIRequestThinkingEnabled, *te))
+		attrs = append(attrs, attribute.Bool(semconvtrace.KeyGenAIRequestThinkingEnabled, *te))
 	}
 
 	// Add request body
-	if bts, err := json.Marshal(req); err == nil {
-		attrs = append(attrs, attribute.String(KeyLLMRequest, string(bts)))
-	} else {
-		attrs = append(attrs, attribute.String(KeyLLMRequest, "<not json serializable>"))
-	}
+	attrs = appendStringAttribute(attrs, OperationChat, semconvtrace.KeyLLMRequest, "<not json serializable>", func() ([]byte, error) {
+		return json.Marshal(req)
+	})
 
 	// Add tool definitions as best-effort structured array (JSON string fallback)
 	if len(req.Tools) > 0 {
 		definitions := make([]*tool.Declaration, 0, len(req.Tools))
-		for _, t := range req.Tools {
-			if t == nil {
-				continue
-			}
-			if decl := t.Declaration(); decl != nil {
-				definitions = append(definitions, decl)
-			}
+		for _, t := range toolorder.SortedTools(req.Tools) {
+			definitions = append(definitions, t.Declaration())
 		}
-
 		if len(definitions) > 0 {
-			if bts, err := json.Marshal(definitions); err == nil {
-				attrs = append(attrs, attribute.String(KeyGenAIRequestToolDefinitions, string(bts)))
-			}
+			attrs = appendStringAttribute(attrs, OperationChat, semconvtrace.KeyGenAIRequestToolDefinitions, "", func() ([]byte, error) {
+				return json.Marshal(definitions)
+			})
 		}
 	}
 
 	// Add messages
-	if bts, err := json.Marshal(req.Messages); err == nil {
-		attrs = append(attrs, attribute.String(KeyGenAIInputMessages, string(bts)))
-	} else {
-		attrs = append(attrs, attribute.String(KeyGenAIInputMessages, "<not json serializable>"))
-	}
+	attrs = appendStringAttribute(attrs, OperationChat, semconvtrace.KeyGenAIInputMessages, "<not json serializable>", func() ([]byte, error) {
+		return marshalTelemetryMessages(req.Messages)
+	})
+	attrs = appendStringAttribute(attrs, OperationChat, semconvtrace.KeyGenAIInputMessagesOTel, "<not json serializable>", func() ([]byte, error) {
+		return marshalOTelTelemetryMessages(req.Messages)
+	})
 
 	return attrs
 }
 
 // buildResponseAttributes builds response-related attributes.
-func buildResponseAttributes(rsp *model.Response) []attribute.KeyValue {
+func buildResponseAttributes(rsp *model.Response, errorTypeFallback string) []attribute.KeyValue {
 	if rsp == nil {
 		return nil
 	}
 
 	attrs := []attribute.KeyValue{
-		attribute.String(KeyGenAIResponseModel, rsp.Model),
-		attribute.String(KeyGenAIResponseID, rsp.ID),
+		attribute.String(semconvtrace.KeyGenAIResponseModel, rsp.Model),
+		attribute.String(semconvtrace.KeyGenAIResponseID, rsp.ID),
 	}
 
 	// Add error type if present
 	if e := rsp.Error; e != nil {
-		attrs = append(attrs, attribute.String(KeyErrorType, e.Type), attribute.String(KeyErrorMessage, e.Message))
+		attrs = append(attrs, responseErrorAttributes(e, errorTypeFallback)...)
 	}
 
 	// Add usage attributes
 	if rsp.Usage != nil {
 		attrs = append(attrs,
-			attribute.Int(KeyGenAIUsageInputTokens, rsp.Usage.PromptTokens),
-			attribute.Int(KeyGenAIUsageOutputTokens, rsp.Usage.CompletionTokens),
+			attribute.Int(semconvtrace.KeyGenAIUsageInputTokens, rsp.Usage.PromptTokens),
+			attribute.Int(semconvtrace.KeyGenAIUsageOutputTokens, rsp.Usage.CompletionTokens),
 		)
+		if rsp.Usage.TotalTokens != 0 {
+			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageTotalTokens, rsp.Usage.TotalTokens))
+		}
 		// Prompt cache tokens (if provided by the model provider)
 		if cached := rsp.Usage.PromptTokensDetails.CachedTokens; cached != 0 {
 			// OpenAI: cached_tokens
-			attrs = append(attrs, attribute.Int(KeyGenAIUsageInputTokensCached, cached))
+			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageInputTokensCached, cached))
 		}
 		if cacheRead := rsp.Usage.PromptTokensDetails.CacheReadTokens; cacheRead != 0 {
 			// Anthropic: cache_read_tokens
-			attrs = append(attrs, attribute.Int(KeyGenAIUsageInputTokensCacheRead, cacheRead))
+			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageInputTokensCacheRead, cacheRead))
 		}
 		if cacheCreation := rsp.Usage.PromptTokensDetails.CacheCreationTokens; cacheCreation != 0 {
 			// Anthropic: cache_creation_tokens
-			attrs = append(attrs, attribute.Int(KeyGenAIUsageInputTokensCacheCreation, cacheCreation))
+			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageInputTokensCacheCreation, cacheCreation))
 		}
 	}
 
 	// Add choices attributes
 	if len(rsp.Choices) > 0 {
-		if bts, err := json.Marshal(rsp.Choices); err == nil {
-			attrs = append(attrs, attribute.String(KeyGenAIOutputMessages, string(bts)))
-		}
+		attrs = appendStringAttribute(attrs, OperationChat, semconvtrace.KeyGenAIOutputMessages, "", func() ([]byte, error) {
+			return marshalTelemetryChoices(rsp.Choices)
+		})
+		attrs = appendStringAttribute(attrs, OperationChat, semconvtrace.KeyGenAIOutputMessagesOTel, "", func() ([]byte, error) {
+			return marshalOTelTelemetryChoices(rsp.Choices)
+		})
 
 		// Extract finish reasons
 		finishReasons := make([]string, 0, len(rsp.Choices))
@@ -594,17 +716,28 @@ func buildResponseAttributes(rsp *model.Response) []attribute.KeyValue {
 				finishReasons = append(finishReasons, "")
 			}
 		}
-		attrs = append(attrs, attribute.StringSlice(KeyGenAIResponseFinishReasons, finishReasons))
+		attrs = append(attrs, attribute.StringSlice(semconvtrace.KeyGenAIResponseFinishReasons, finishReasons))
 	}
 
 	// Add response body
-	if bts, err := json.Marshal(rsp); err == nil {
-		attrs = append(attrs, attribute.String(KeyLLMResponse, string(bts)))
-	} else {
-		attrs = append(attrs, attribute.String(KeyLLMResponse, "<not json serializable>"))
-	}
+	attrs = appendStringAttribute(attrs, OperationChat, semconvtrace.KeyLLMResponse, "<not json serializable>", func() ([]byte, error) {
+		return json.Marshal(rsp)
+	})
 
 	return attrs
+}
+
+func responseErrorAttributes(respErr *model.ResponseError, fallback string) []attribute.KeyValue {
+	if respErr == nil {
+		return nil
+	}
+	return []attribute.KeyValue{
+		attribute.String(
+			semconvtrace.KeyErrorType,
+			FormatResponseErrorLabel(respErr, fallback),
+		),
+		attribute.String(semconvtrace.KeyErrorMessage, respErr.Message),
+	}
 }
 
 // NewGRPCConn creates a new gRPC connection to the OpenTelemetry Collector.

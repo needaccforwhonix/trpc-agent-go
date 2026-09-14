@@ -25,7 +25,7 @@ import (
 // Server provides AG-UI server.
 type Server struct {
 	basePath       string          // basePath is the base path for the service.
-	appName        string          // appName is required when history snapshots are enabled.
+	appName        string          // appName is the static app name configured for the AG-UI runner.
 	path           string          // path is the chat message endpoint path.
 	handler        http.Handler    // handler serves chat and optional history routes.
 	sessionService session.Service // sessionService backs stored conversations for snapshots.
@@ -59,12 +59,24 @@ func newService(runner runner.Runner, opts *options) (service.Service, error) {
 	if opts.serviceFactory == nil {
 		return nil, errors.New("agui: serviceFactory must not be nil")
 	}
-	aguiRunner := aguirunner.New(runner, opts.aguiRunnerOptions...)
+	if opts.runnerFactory == nil {
+		return nil, errors.New("agui: runner factory must not be nil")
+	}
+	if opts.distributedCancelEnabled && opts.sessionService == nil {
+		return nil, errors.New("agui: session service is required when distributed cancel is enabled")
+	}
+	aguiRunner, err := createAGUIRunner(runner, opts)
+	if err != nil {
+		return nil, err
+	}
 	chatPath, err := joinURLPath(opts.basePath, opts.path)
 	if err != nil {
 		return nil, fmt.Errorf("agui: url join chat path: %w", err)
 	}
-	serviceOpts := []service.Option{service.WithPath(chatPath)}
+	serviceOpts := []service.Option{
+		service.WithPath(chatPath),
+		service.WithHeartbeatInterval(opts.heartbeatInterval),
+	}
 	if opts.cancelEnabled {
 		cancelPath, err := joinURLPath(opts.basePath, opts.cancelPath)
 		if err != nil {
@@ -97,6 +109,18 @@ func newService(runner runner.Runner, opts *options) (service.Service, error) {
 		)
 	}
 	return opts.serviceFactory(aguiRunner, serviceOpts...), nil
+}
+
+// createAGUIRunner creates the AG-UI runner used by the service.
+func createAGUIRunner(runner runner.Runner, opts *options) (aguirunner.Runner, error) {
+	aguiRunner, err := opts.runnerFactory(runner, opts.aguiRunnerOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("agui: create runner: %w", err)
+	}
+	if aguiRunner == nil {
+		return nil, errors.New("agui: runner factory returned nil runner")
+	}
+	return aguiRunner, nil
 }
 
 // joinURLPath joins the base path and the path into a URL path.

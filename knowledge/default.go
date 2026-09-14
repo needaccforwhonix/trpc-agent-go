@@ -15,11 +15,15 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
+	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/panjf2000/ants/v2"
@@ -134,6 +138,15 @@ func New(opts ...Option) *BuiltinKnowledge {
 		)
 	}
 	return dk
+}
+
+// Sources returns a shallow copy of the configured sources. It is primarily
+// used by tool-layer helpers that need source-level context such as repository
+// descriptions, without relying on per-chunk metadata.
+func (dk *BuiltinKnowledge) Sources() []source.Source {
+	dk.dataOperationMu.RLock()
+	defer dk.dataOperationMu.RUnlock()
+	return slices.Clone(dk.sources)
 }
 
 // ShowDocumentInfo shows the document info from the vector store.
@@ -323,11 +336,12 @@ func (dk *BuiltinKnowledge) loadSourceInternal(ctx context.Context, sources []so
 		dk.processingDocIDs = sync.Map{}
 	}()
 
+	plan := dk.resolveBatchPlan(ctx, config)
 	if config.srcParallelism > 1 || config.docParallelism > 1 {
-		_, err := dk.loadConcurrent(ctx, config, sources)
+		_, err := dk.loadConcurrent(ctx, config, plan, sources)
 		return err
 	}
-	_, err := dk.loadSequential(ctx, config, sources)
+	_, err := dk.loadSequential(ctx, config, plan, sources)
 	return err
 }
 
@@ -423,6 +437,7 @@ func (dk *BuiltinKnowledge) loadWithRecreate(ctx context.Context, config *loadCo
 
 func (dk *BuiltinKnowledge) load(ctx context.Context, config *loadConfig) error {
 	if dk.enableSourceSync {
+		dk.processedDocIDs = sync.Map{}
 		if err := dk.refreshAllDocInfo(ctx); err != nil {
 			return fmt.Errorf("failed to prepare incremental sync: %w", err)
 		}
@@ -447,78 +462,103 @@ func (dk *BuiltinKnowledge) load(ctx context.Context, config *loadConfig) error 
 func (dk *BuiltinKnowledge) loadSequential(
 	ctx context.Context,
 	config *loadConfig,
+	plan batchPlan,
 	sources []source.Source) ([]string, error) {
 	// Timing variables.
 	startTime := time.Now()
 
 	// Initialise statistics helpers.
 	sizeBuckets := defaultSizeBuckets
-	stats := newSizeStats(sizeBuckets)
 
 	totalSources := len(sources)
 	log.InfofContext(ctx, "Starting knowledge base loading with %d sources", totalSources)
 
+	sourceNames := make([]string, 0, totalSources)
+	for _, s := range sources {
+		sourceNames = append(sourceNames, s.Name())
+	}
+
 	var allAddedIDs []string
 	var processedDocs int
+	reporter := newLoadReporter(config, sourceNames, startTime, sizeBuckets, func() int { return processedDocs })
+	defer reporter.Close()
+
 	for i, src := range sources {
 		sourceName := src.Name()
 		sourceType := src.Type()
 		log.InfofContext(ctx, "Loading source %d/%d: %s (type: %s)",
 			i+1, totalSources, sourceName, sourceType)
 
-		srcStartTime := time.Now()
 		docs, err := src.ReadDocuments(ctx)
 		if err != nil {
 			log.ErrorfContext(ctx, "Failed to read documents from source %s: %v",
 				sourceName, err)
+			reporter.Error(ctx, LoadProgressEvent{SourceName: sourceName}, err)
 			return nil, fmt.Errorf("failed to read documents from source %s: %w", sourceName, err)
 		}
 
 		log.InfofContext(ctx, "Fetched %d document(s) from source %s", len(docs), sourceName)
 
 		// Per-source statistics.
-		srcStats := newSizeStats(sizeBuckets)
+		srcStats := loader.NewStats(sizeBuckets)
 		for _, d := range docs {
 			sz := len(d.Content)
-			srcStats.add(sz, sizeBuckets)
-			stats.add(sz, sizeBuckets)
+			srcStats.Add(sz, sizeBuckets)
+			reporter.RecordStat(sz)
 		}
 
 		if config.showStats {
 			log.InfofContext(ctx, "Statistics for source %s:", sourceName)
-			srcStats.log(sizeBuckets)
+			srcStats.Log(sizeBuckets)
 		}
 
 		log.InfofContext(ctx, "Start embedding & storing documents from source %s...", sourceName)
 
-		// Process documents with progress logging if enabled.
-		for j, doc := range docs {
-			if err := dk.addDocumentWithSync(ctx, doc, src); err != nil {
+		// srcStartTime tracks only the embed+store phase, so that Elapsed and ETA
+		// in progress events and logs reflect actual indexing throughput rather than
+		// including the (often slow) ReadDocuments I/O time.
+		srcStartTime := time.Now()
+
+		// step is 1 unless embedding batching is active, in which case each
+		// iteration embeds and stores a whole batch.
+		step := plan.size
+		for start := 0; start < len(docs); start += step {
+			end := min(start+step, len(docs))
+			batch := docs[start:end]
+
+			stored, err := dk.processBatch(ctx, plan, batch, src)
+			if err != nil {
 				log.ErrorfContext(ctx, "Failed to add document from source %s: %v",
 					sourceName, err)
+				// A batch keeps the writes it completed before the failure, so
+				// they count towards the load total, and the event counts them
+				// rather than reporting the batch start.
+				processedDocs += stored
+				reporter.Error(ctx, LoadProgressEvent{
+					SourceName:      sourceName,
+					SourceProcessed: start + stored,
+					SourceTotal:     len(docs),
+					SourceElapsed:   time.Since(srcStartTime),
+				}, err)
 				return nil, fmt.Errorf("failed to add document from source %s: %w", sourceName, err)
 			}
 
-			allAddedIDs = append(allAddedIDs, doc.ID)
-			processedDocs++
-
-			// Log progress based on configuration.
-			if config.showProgress {
-				srcProcessed := j + 1
-				totalSrc := len(docs)
-
-				// Respect progressStepSize for logging frequency.
-				if srcProcessed%config.progressStepSize == 0 || srcProcessed == totalSrc {
-					etaSrc := calcETA(srcStartTime, srcProcessed, totalSrc)
-					elapsedSrc := time.Since(srcStartTime)
-
-					log.InfofContext(ctx,
-						"Processed %d/%d doc(s) | source %s | elapsed %s | ETA %s",
-						srcProcessed, totalSrc, sourceName,
-						elapsedSrc.Truncate(time.Second),
-						etaSrc.Truncate(time.Second))
-				}
+			for _, doc := range batch {
+				allAddedIDs = append(allAddedIDs, doc.ID)
+				processedDocs++
 			}
+
+			srcProcessed := end
+			totalSrc := len(docs)
+			etaSrc := calcETA(srcStartTime, srcProcessed, totalSrc)
+			elapsedSrc := time.Since(srcStartTime)
+			reporter.Progress(ctx, start, LoadProgressEvent{
+				SourceName:      sourceName,
+				SourceProcessed: srcProcessed,
+				SourceTotal:     totalSrc,
+				SourceElapsed:   elapsedSrc,
+				SourceETA:       etaSrc,
+			})
 		}
 		log.InfofContext(ctx, "Successfully loaded source %s", sourceName)
 	}
@@ -527,10 +567,7 @@ func (dk *BuiltinKnowledge) loadSequential(
 	log.InfofContext(ctx, "Knowledge base loading completed in %s (%d sources)",
 		elapsedTotal, totalSources)
 
-	// Output statistics if requested.
-	if config.showStats && stats.totalDocs > 0 {
-		stats.log(sizeBuckets)
-	}
+	reporter.Done(ctx)
 	return allAddedIDs, nil
 }
 
@@ -538,11 +575,8 @@ func (dk *BuiltinKnowledge) loadSequential(
 func (dk *BuiltinKnowledge) loadConcurrent(
 	ctx context.Context,
 	config *loadConfig,
+	plan batchPlan,
 	sources []source.Source) ([]string, error) {
-	// Create aggregator for collecting results
-	aggr := loader.NewAggregator(defaultSizeBuckets, config.showStats, config.showProgress, config.progressStepSize)
-	defer aggr.Close()
-
 	// Create worker pool for source processing
 	srcPool, err := ants.NewPool(config.srcParallelism)
 	if err != nil {
@@ -561,6 +595,18 @@ func (dk *BuiltinKnowledge) loadConcurrent(
 	var allAddedIDs []string
 	var mu sync.Mutex
 	errCh := make(chan error, len(sources))
+	var globalProcessed atomic.Int64
+	loadStartTime := time.Now()
+	sizeBuckets := defaultSizeBuckets
+
+	sourceNames := make([]string, 0, len(sources))
+	for _, s := range sources {
+		sourceNames = append(sourceNames, s.Name())
+	}
+
+	reporter := newLoadReporter(config, sourceNames, loadStartTime, sizeBuckets,
+		func() int { return int(globalProcessed.Load()) })
+	defer reporter.Close()
 
 	for i, src := range sources {
 		wg.Add(1)
@@ -575,11 +621,18 @@ func (dk *BuiltinKnowledge) loadConcurrent(
 				srcIdx+1, len(sources), sourceName, sourceType)
 			docs, err := source.ReadDocuments(ctx)
 			if err != nil {
+				reporter.Error(ctx, LoadProgressEvent{SourceName: sourceName}, err)
 				errCh <- fmt.Errorf("failed to read documents from source %s: %w", sourceName, err)
 				return
 			}
 			log.InfofContext(ctx, "Fetched %d document(s) from source %s", len(docs), sourceName)
-			if err := dk.processDocuments(ctx, docs, config, aggr, docPool, source); err != nil {
+			processed, err := dk.processDocuments(ctx, docs, docPool, source, plan, &globalProcessed, reporter)
+			if err != nil {
+				reporter.Error(ctx, LoadProgressEvent{
+					SourceName:      sourceName,
+					SourceProcessed: processed,
+					SourceTotal:     len(docs),
+				}, err)
 				errCh <- fmt.Errorf("failed to process documents for source %s: %w", sourceName, err)
 				return
 			}
@@ -608,44 +661,99 @@ func (dk *BuiltinKnowledge) loadConcurrent(
 		}
 	}
 
+	reporter.Done(ctx)
+
 	return allAddedIDs, nil
 }
 
 // processDocuments embeds and stores all documents from a single source using
-// document-level parallelism.
+// document-level parallelism. When embedding batching is active the unit of
+// work is a batch of up to plan.size documents rather than a single document.
+// It returns the number of documents successfully processed and the first
+// error encountered, if any.
 func (dk *BuiltinKnowledge) processDocuments(
 	ctx context.Context,
 	docs []*document.Document,
-	cfg *loadConfig,
-	aggr *loader.Aggregator,
 	pool *ants.Pool,
 	src source.Source,
-) error {
+	plan batchPlan,
+	globalProcessed *atomic.Int64,
+	reporter *loadReporter,
+) (int, error) {
 	var wgDoc sync.WaitGroup
 	errCh := make(chan error, len(docs))
+	var completedCount atomic.Int64
+	startTime := time.Now()
 
-	processDoc := func(doc *document.Document, docIndex int) func() {
+	failPrefix := "add document"
+	if plan.batching() {
+		failPrefix = "add document batch"
+	}
+
+	processTask := func(batch []*document.Document) func() {
 		return func() {
 			defer wgDoc.Done()
-			if err := dk.addDocumentWithSync(ctx, doc, src); err != nil {
-				errCh <- fmt.Errorf("add document: %w", err)
+			stored, err := dk.processBatch(ctx, plan, batch, src)
+			if err != nil {
+				// A batch keeps the writes it completed before the failure, so
+				// they count towards the source and global totals, and towards
+				// the statistics, before the event is reported. Leaving them
+				// out of the statistics would report documents as processed
+				// that the summary does not describe, and would suppress the
+				// summary entirely when the first batch fails part-way.
+				for _, doc := range batch[:stored] {
+					reporter.RecordStat(len(doc.Content))
+				}
+				processed := int(completedCount.Add(int64(stored)))
+				globalProcessed.Add(int64(stored))
+				reporter.Error(ctx, LoadProgressEvent{
+					SourceName:      src.Name(),
+					SourceProcessed: processed,
+					SourceTotal:     len(docs),
+					SourceElapsed:   time.Since(startTime),
+				}, err)
+				errCh <- fmt.Errorf("%s: %w", failPrefix, err)
 				return
 			}
 
-			aggr.StatCh() <- loader.StatEvent{Size: len(doc.Content)}
-			if cfg.showProgress {
-				aggr.ProgCh() <- loader.ProgEvent{
-					SrcName:      src.Name(),
-					SrcProcessed: docIndex + 1,
-					SrcTotal:     len(docs),
-				}
+			completed := int(completedCount.Add(int64(len(batch))))
+			total := len(docs)
+			globalProcessed.Add(int64(len(batch)))
+			for _, doc := range batch {
+				reporter.RecordStat(len(doc.Content))
 			}
+
+			elapsed := time.Since(startTime)
+			var eta time.Duration
+			if completed > 0 {
+				eta = time.Duration(float64(elapsed) / float64(completed) * float64(total-completed))
+			}
+			reporter.Progress(ctx, completed-len(batch), LoadProgressEvent{
+				SourceName:      src.Name(),
+				SourceProcessed: completed,
+				SourceTotal:     total,
+				SourceElapsed:   elapsed,
+				SourceETA:       eta,
+			})
 		}
 	}
 
-	for i, doc := range docs {
+	// step is 1 unless embedding batching is active, in which case each pool
+	// task embeds and stores a whole batch.
+	step := plan.size
+	for start := 0; start < len(docs); start += step {
+		// Stop submitting further batches once the caller cancels. The
+		// per-document path keeps its previous behaviour of submitting every
+		// task regardless of cancellation.
+		if plan.batching() {
+			if err := ctx.Err(); err != nil {
+				errCh <- err
+				break
+			}
+		}
+		end := min(start+step, len(docs))
 		wgDoc.Add(1)
-		task := processDoc(doc, i)
+		task := processTask(docs[start:end])
 		if pool != nil {
 			if err := pool.Submit(task); err != nil {
 				wgDoc.Done()
@@ -659,13 +767,14 @@ func (dk *BuiltinKnowledge) processDocuments(
 	wgDoc.Wait()
 	close(errCh)
 
+	processed := int(completedCount.Load())
 	// Check for any errors
 	for err := range errCh {
 		if err != nil {
-			return err
+			return processed, err
 		}
 	}
-	return nil
+	return processed, nil
 }
 
 // buildLoadConfig creates a load configuration with defaults and applies the given options.
@@ -752,11 +861,203 @@ func (dk *BuiltinKnowledge) addDocument(ctx context.Context, doc *document.Docum
 	return nil
 }
 
+// batchPlan describes how a single Load call groups documents into embedding
+// requests. A size of 1 selects the per-document path and leaves embedder
+// nil.
+//
+// A plan must be built by resolveBatchPlan, which guarantees a size of at
+// least 1. The load loops advance by size documents per iteration and would
+// not terminate for a zero value.
+type batchPlan struct {
+	embedder embedder.BatchEmbedder
+	size     int
+
+	// dimensionWarning guards the declared dimension warning. The mismatch it
+	// reports comes from the embedder and model of one load, so every batch of
+	// that load would otherwise repeat the same warning.
+	dimensionWarning *sync.Once
+}
+
+// batching reports whether the plan groups several documents into a single
+// embedding request. A plan that does not batch carries no embedder and runs
+// the per-document path.
+func (p batchPlan) batching() bool {
+	return p.size > 1
+}
+
+// warnDeclaredDimension logs at most one warning per load when the vectors of
+// a batch do not have the dimension the embedder declares.
+//
+// The mismatch is accepted rather than rejected: an embedder may report a
+// configured default that the selected model does not honour, and the
+// per-document path stores those vectors today.
+func (p batchPlan) warnDeclaredDimension(ctx context.Context, dimensions, declared int) {
+	if declared <= 0 || dimensions == declared || p.dimensionWarning == nil {
+		return
+	}
+	p.dimensionWarning.Do(func() {
+		log.WarnfContext(ctx,
+			"Embedding batch dimension %d differs from the dimension %d declared by the embedder",
+			dimensions, declared)
+	})
+}
+
+// resolveBatchPlan builds the plan a single load follows, applying the
+// requested embedding batch size only when this knowledge base supports it.
+// Batching requires an embedder implementing embedder.BatchEmbedder, and is
+// limited to loads without source sync because the incremental bookkeeping
+// resets IDs and decides skips per document. Any unmet prerequisite falls back
+// to the unchanged per-document path and is logged so an ineffective
+// configuration is visible.
+func (dk *BuiltinKnowledge) resolveBatchPlan(ctx context.Context, config *loadConfig) batchPlan {
+	if config.embeddingBatchSize <= 1 {
+		return batchPlan{size: 1}
+	}
+	if dk.embedder == nil {
+		log.InfofContext(ctx,
+			"Embedding batch size %d ignored: no embedder is configured",
+			config.embeddingBatchSize)
+		return batchPlan{size: 1}
+	}
+	batchEmbedder, ok := dk.embedder.(embedder.BatchEmbedder)
+	if !ok {
+		log.InfofContext(ctx,
+			"Embedding batch size %d ignored: embedder does not implement BatchEmbedder",
+			config.embeddingBatchSize)
+		return batchPlan{size: 1}
+	}
+	if dk.enableSourceSync {
+		log.InfofContext(ctx,
+			"Embedding batch size %d ignored: batching is not supported when source sync is enabled",
+			config.embeddingBatchSize)
+		return batchPlan{size: 1}
+	}
+	return batchPlan{
+		embedder:         batchEmbedder,
+		size:             config.embeddingBatchSize,
+		dimensionWarning: &sync.Once{},
+	}
+}
+
+// processBatch ingests one unit of work and reports how many of its documents
+// reached the vector store. When batching is inactive the batch holds exactly
+// one document and the unchanged per-document path runs, including source sync
+// bookkeeping.
+//
+// An error can come with a positive count, because a batch writes its
+// documents one at a time and keeps the writes that already succeeded. Callers
+// use the count so that progress reported for a failed unit of work matches
+// what is persisted.
+func (dk *BuiltinKnowledge) processBatch(
+	ctx context.Context,
+	plan batchPlan,
+	batch []*document.Document,
+	src source.Source,
+) (int, error) {
+	if !plan.batching() {
+		if err := dk.addDocumentWithSync(ctx, batch[0], src); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	return dk.embedAndStoreBatch(ctx, plan, batch)
+}
+
+// embedAndStoreBatch embeds every document of the batch with a single provider
+// request, validates the complete response, and only then writes the vectors
+// to the store. It reports how many documents reached the store.
+//
+// A rejected request or response stores no document of the batch. A store
+// failure part-way through keeps the documents already written and returns
+// their count with the error, matching the non-transactional semantics of the
+// per-document path.
+func (dk *BuiltinKnowledge) embedAndStoreBatch(
+	ctx context.Context,
+	plan batchPlan,
+	docs []*document.Document,
+) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if dk.vectorStore == nil {
+		return 0, fmt.Errorf("vector store is not configured")
+	}
+	texts := make([]string, len(docs))
+	for i, doc := range docs {
+		if doc == nil {
+			return 0, fmt.Errorf("document at index %d is nil", i)
+		}
+		texts[i] = buildEmbeddingText(doc)
+	}
+	embeddings, err := plan.embedder.GetEmbeddings(ctx, texts)
+	if err != nil {
+		return 0, fmt.Errorf("failed to generate embedding batch: %w", err)
+	}
+	if err := validateEmbeddingBatch(embeddings, len(docs)); err != nil {
+		return 0, err
+	}
+	// Validation established that every vector shares one dimension.
+	plan.warnDeclaredDimension(ctx, len(embeddings[0]), plan.embedder.GetDimensions())
+	stored := 0
+	for i, doc := range docs {
+		if err := ctx.Err(); err != nil {
+			return stored, err
+		}
+		if err := dk.vectorStore.Add(ctx, doc, embeddings[i]); err != nil {
+			return stored, fmt.Errorf("failed to store embedding for document %s: %w", doc.ID, err)
+		}
+		stored++
+	}
+	return stored, nil
+}
+
+// validateEmbeddingBatch verifies a batch response before any vector store
+// write, so that a malformed response cannot bind a vector to the wrong
+// document or persist part of an invalid batch.
+//
+// A vector count differing from the request, an empty vector, a vector whose
+// dimension differs from the rest of the batch, and non-finite components are
+// rejected. A batch whose dimension differs from the one the embedder declares
+// is accepted; see batchPlan.warnDeclaredDimension.
+func validateEmbeddingBatch(embeddings [][]float64, expected int) error {
+	if len(embeddings) != expected {
+		return fmt.Errorf("embedding batch count mismatch: expected %d, got %d", expected, len(embeddings))
+	}
+	dimensions := 0
+	for i, vector := range embeddings {
+		if len(vector) == 0 {
+			return fmt.Errorf("embedding batch contains an empty vector at index %d", i)
+		}
+		if i == 0 {
+			dimensions = len(vector)
+		} else if len(vector) != dimensions {
+			return fmt.Errorf("embedding batch dimension mismatch at index %d: expected %d, got %d",
+				i, dimensions, len(vector))
+		}
+		for j, value := range vector {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return fmt.Errorf("embedding batch contains a non-finite value at index %d position %d", i, j)
+			}
+		}
+	}
+	return nil
+}
+
 // buildEmbeddingText constructs the text used for embedding by prepending
 // metadata context (file name, chunk index, header path) to the document content.
 // This enriches the embedding vector with structural information, improving
 // retrieval accuracy without altering the stored content.
+//
+// If the document has a custom EmbeddingText set (e.g., by proto reader),
+// that will be used directly.
 func buildEmbeddingText(doc *document.Document) string {
+	// Use custom embedding text if provided by the reader.
+	// This allows specialized readers (like proto) to provide structured
+	// metadata JSON for embedding instead of raw content.
+	if doc.EmbeddingText != "" {
+		return doc.EmbeddingText
+	}
+
 	if doc.Metadata == nil {
 		return doc.Content
 	}
@@ -1011,6 +1312,12 @@ func (dk *BuiltinKnowledge) Search(ctx context.Context, req *SearchRequest) (*Se
 		minScore = 0.0
 	}
 
+	searchMode := req.SearchMode
+	if req.Query == "" && hasSearchFilter(req.SearchFilter) {
+		log.DebugfContext(ctx, "knowledge search: empty query with filter, switching search mode to filter")
+		searchMode = vectorstore.SearchModeFilter
+	}
+
 	// Use built-in retriever for RAG pipeline with full context.
 	// The retriever will handle query enhancement if configured.
 	retrieverReq := &retriever.Query{
@@ -1021,7 +1328,7 @@ func (dk *BuiltinKnowledge) Search(ctx context.Context, req *SearchRequest) (*Se
 		Filter:     convertQueryFilter(req.SearchFilter),
 		Limit:      req.MaxResults,
 		MinScore:   minScore,
-		SearchMode: req.SearchMode,
+		SearchMode: searchMode,
 	}
 
 	result, err := dk.retriever.Retrieve(ctx, retrieverReq)
@@ -1050,6 +1357,13 @@ func (dk *BuiltinKnowledge) Search(ctx context.Context, req *SearchRequest) (*Se
 		Text:      content,
 		Documents: documents,
 	}, nil
+}
+
+func hasSearchFilter(filter *SearchFilter) bool {
+	if filter == nil {
+		return false
+	}
+	return len(filter.DocumentIDs) > 0 || len(filter.Metadata) > 0 || filter.FilterCondition != nil
 }
 
 // Close closes the knowledge base and releases resources.
@@ -1084,80 +1398,6 @@ func convertQueryFilter(qf *SearchFilter) *retriever.QueryFilter {
 	}
 }
 
-// sizeStats tracks statistics for document sizes during a load run.
-type sizeStats struct {
-	totalDocs  int
-	totalSize  int
-	minSize    int
-	maxSize    int
-	bucketCnts []int
-}
-
-// newSizeStats returns a sizeStats initialised for the provided buckets.
-func newSizeStats(buckets []int) *sizeStats {
-	return &sizeStats{
-		minSize:    int(^uint(0) >> 1), // Initialise with max-int.
-		bucketCnts: make([]int, len(buckets)+1),
-	}
-}
-
-// add records the size of a document.
-func (ss *sizeStats) add(size int, buckets []int) {
-	ss.totalDocs++
-	ss.totalSize += size
-	if size < ss.minSize {
-		ss.minSize = size
-	}
-	if size > ss.maxSize {
-		ss.maxSize = size
-	}
-
-	placed := false
-	for i, upper := range buckets {
-		if size < upper {
-			ss.bucketCnts[i]++
-			placed = true
-			break
-		}
-	}
-	if !placed {
-		ss.bucketCnts[len(ss.bucketCnts)-1]++
-	}
-}
-
-// avg returns the average document size.
-func (ss *sizeStats) avg() float64 {
-	if ss.totalDocs == 0 {
-		return 0
-	}
-	return float64(ss.totalSize) / float64(ss.totalDocs)
-}
-
-// log outputs the collected statistics.
-func (ss *sizeStats) log(buckets []int) {
-	log.Infof(
-		"Document statistics - total: %d, avg: %.1f B, min: %d B, max: %d B",
-		ss.totalDocs, ss.avg(), ss.minSize, ss.maxSize,
-	)
-
-	lower := 0
-	for i, upper := range buckets {
-		if ss.bucketCnts[i] == 0 {
-			lower = upper
-			continue
-		}
-		log.Infof("  [%d, %d): %d document(s)", lower, upper,
-			ss.bucketCnts[i])
-		lower = upper
-	}
-
-	lastCnt := ss.bucketCnts[len(ss.bucketCnts)-1]
-	if lastCnt > 0 {
-		log.Infof("  [>= %d]: %d document(s)", buckets[len(buckets)-1],
-			lastCnt)
-	}
-}
-
 // calcETA estimates the remaining time based on throughput so far.
 func calcETA(start time.Time, processed, total int) time.Duration {
 	if processed == 0 || total == 0 {
@@ -1174,6 +1414,16 @@ func calcETA(start time.Time, processed, total int) time.Duration {
 
 // convertToInt converts any to int, handling JSON unmarshaling type conversion
 func convertToInt(value any) (int, bool) {
+	if value == nil {
+		return 0, false
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if rv.IsNil() {
+			return 0, false
+		}
+	}
 	switch v := value.(type) {
 	case int:
 		return v, true
@@ -1182,6 +1432,9 @@ func convertToInt(value any) (int, bool) {
 	case float32:
 		return int(v), true
 	case string:
+		if v == "" || v == "<nil>" {
+			return 0, false
+		}
 		s, err := strconv.Atoi(v)
 		if err != nil {
 			log.Infof("convertToInt string to int error: %v", err)

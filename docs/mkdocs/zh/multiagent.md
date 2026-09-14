@@ -20,6 +20,7 @@
 
 - **Agent 工具 (AgentTool)** - 将 Agent 包装成工具，供其他 Agent 调用
 - **Agent 委托 (Agent Transfer)** - 通过 `transfer_to_agent` 工具实现 Agent 间的任务委托
+- **等待用户回复路由** - 让 Agent 在需要补充信息时显式接管下一条用户消息
 - **Team** - 更高层的团队编排封装，支持协调者团队与 Swarm（见 `team` 包）
 
 ## SubAgent 基础
@@ -65,6 +66,156 @@ mainAgent := llmagent.New(
     llmagent.WithSubAgents([]agent.Agent{mathAgent, weatherAgent}),
 )
 ```
+
+## 动态 SubAgent 与 Agent Factory
+
+在 trpc-agent-go 中，SubAgent 并不是一种新的运行时类型。它仍然只是普通的
+`agent.Agent`。所谓 SubAgent，只是描述它和父 Agent 的关系：它通过
+`WithSubAgents` 挂在某个父 Agent 下面，因此这个父 Agent 可以把任务委托给它。
+
+理解这个边界之后，动态创建 Agent 时就不容易选错 API。
+
+### Root Agent 与 SubAgent 的区别
+
+优先选择能解决问题的最小 API：
+
+| 需求 | 推荐 API | 原因 |
+| --- | --- | --- |
+| 本次请求要从某个命名 Agent 开始执行 | `runner.WithAgentFactory` + `agent.WithAgentByName` | Runner 在 run 开始前选择 root Agent。 |
+| 父 Agent 要委托给一批已经构建好的专家 Agent | `llmagent.WithSubAgents` | 父 Agent 可以直接把所有专家的名称和描述暴露给模型。 |
+| 父 Agent 要委托给某个专家，但这个专家构建成本较高，或需要请求级参数 | `agent.NewLazyAgent` + `WithSubAgents` | 父 Agent 先通过 `agent.Info` 暴露专家信息，真正调用时才构建具体 Agent。 |
+| 租户、项目或数据库决定有哪些专家 Agent | 在业务代码中构建 `[]agent.Agent`，再传给 `WithSubAgents` | 配置发现、鉴权、覆盖规则通常应由业务应用负责。 |
+
+`runner.WithAgentFactory` 面向的是 **root Agent 查找**。它回答的问题是：
+“这次 run 已经知道要用哪个 root Agent 名字，请帮我创建它。”
+
+`WithSubAgents` 面向的是 **父 Agent 作用域内的可见性**。它回答的问题是：
+“当前这个父 Agent 正在运行时，它可以委托给哪些专家？”
+
+因此，把一个 Agent factory 注册到 Runner 上，并不意味着所有父 Agent 都能
+自动委托给这个 Agent。这是有意设计的：不同父 Agent 往往需要不同的委托边界。
+
+### 按请求构建 root Agent 和 SubAgents
+
+如果整棵 Agent 树都依赖本次请求，推荐在 Runner factory 中构建父 Agent，
+再把请求级 SubAgents 显式传给 `WithSubAgents`。
+
+```go
+r := runner.NewRunnerWithAgentFactory(
+	"support-app",
+	"support-coordinator",
+	func(ctx context.Context, ro agent.RunOptions) (agent.Agent, error) {
+		tenantID, _ := agent.GetRuntimeStateValue[string](&ro, "tenant_id")
+
+		billingAgent := llmagent.New(
+			"billing-agent",
+			llmagent.WithModel(modelInstance),
+			llmagent.WithDescription("Handles billing and invoice questions"),
+			llmagent.WithInstruction(
+				"Answer billing questions for tenant " + tenantID + ".",
+			),
+		)
+
+		coordinator := llmagent.New(
+			"support-coordinator",
+			llmagent.WithModel(modelInstance),
+			llmagent.WithDescription("Routes support requests to specialists"),
+			llmagent.WithInstruction(
+				"Decide whether to answer directly or transfer to a specialist.",
+			),
+			llmagent.WithSubAgents([]agent.Agent{billingAgent}),
+		)
+		return coordinator, nil
+	},
+)
+
+events, err := r.Run(
+	ctx,
+	userID,
+	sessionID,
+	model.NewUserMessage("Why was my invoice higher this month?"),
+	agent.MergeRuntimeState(map[string]any{
+		"tenant_id": "tenant-001",
+	}),
+)
+_ = events
+_ = err
+```
+
+这个模式把职责拆得很清楚：
+
+- 业务应用决定加载哪个租户或项目配置。
+- Runner 负责创建本次请求使用的 root Agent。
+- 父 Agent 显式声明本次允许委托的 SubAgents。
+
+### 懒加载 SubAgent
+
+有些专家 Agent 只有少数请求会用到。如果它会打开网络连接、初始化大型工具集、
+准备沙箱环境，那么每次都提前构建会造成浪费。
+
+`agent.NewLazyAgent` 解决的是这个很小的框架边界：父 Agent 可以先拿到
+`agent.Info`，因此 `transfer_to_agent` 工具能展示专家名称和描述；只有当这个
+懒加载 Agent 的 `Run` 方法真正被调用时，才会创建具体 Agent。
+
+```go
+lazyBillingAgent := agent.NewLazyAgent(
+	agent.Info{
+		Name:        "billing-agent",
+		Description: "Handles billing and invoice questions",
+	},
+	func(ctx context.Context, ro agent.RunOptions) (agent.Agent, error) {
+		tenantID, _ := agent.GetRuntimeStateValue[string](&ro, "tenant_id")
+
+		return llmagent.New(
+			"billing-agent",
+			llmagent.WithModel(modelInstance),
+			llmagent.WithDescription("Handles billing and invoice questions"),
+			llmagent.WithInstruction(
+				"Answer billing questions for tenant " + tenantID + ".",
+			),
+		), nil
+	},
+)
+
+coordinator := llmagent.New(
+	"support-coordinator",
+	llmagent.WithModel(modelInstance),
+	llmagent.WithDescription("Routes support requests to specialists"),
+	llmagent.WithInstruction(
+		"Use transfer_to_agent when a specialist should handle the request.",
+	),
+	llmagent.WithSubAgents([]agent.Agent{lazyBillingAgent}),
+)
+```
+
+懒加载 Agent 仍然是普通的 `agent.Agent`。父 Agent 仍然通过标准
+`WithSubAgents` 机制看到它，`transfer_to_agent` 也仍然通过标准
+`FindSubAgent` 路径找到它。
+
+使用时注意：
+
+- `agent.Info.Name` 是稳定的委托目标名。factory 返回的具体 Agent 应使用相同
+  名字，便于事件、trace 和 session 分支保持一致。
+- `NewLazyAgent` 最适合叶子专家 Agent。如果这个专家内部还需要自己的
+  SubAgents，请在 factory 内部继续构建和配置。
+- 框架不会接管 factory 内部创建的资源。如果 factory 创建了请求级连接、
+  tool set 或沙箱，请在业务代码或 callback 中自行清理。
+
+### 业务侧负责发现配置
+
+框架不规定动态 SubAgent 的定义必须来自哪里。它们可以来自代码、数据库、
+租户配置服务、插件，或业务应用自己管理的文件。
+
+推荐边界是：
+
+1. 业务应用负责发现、校验和合并配置。
+2. 业务应用把配置转换成 `agent.Agent`，或者转换成 `agent.NewLazyAgent(...)`
+   描述。
+3. 框架通过 `WithSubAgents`、`transfer_to_agent`、AgentTool、ChainAgent、
+   ParallelAgent、CycleAgent 或 GraphAgent 运行这些 Agent。
+
+这样配置来源、鉴权、灰度策略仍然由业务掌控，同时框架继续保持一个统一的
+运行时抽象：`agent.Agent`。
 
 ## 核心协作模式
 
@@ -379,6 +530,8 @@ agentTool := agenttool.NewTool(
     agenttool.WithSkipSummarization(false),
     // 开启转发：把子 Agent 的流式事件内联到父流程
     agenttool.WithStreamInner(true),
+    // 工具结果只返回子 Agent 最后一条完整 assistant 消息
+    agenttool.WithResponseMode(agenttool.ResponseModeFinalOnly),
 )
 
 // 在主 Agent 中使用 Agent 工具
@@ -402,7 +555,7 @@ mainAgent := llmagent.New(
 
 ```
 🚀 Agent 工具示例
-模型：deepseek-chat
+模型：deepseek-v4-flash
 可用工具：current_time, math-specialist
 ==================================================
 
@@ -431,6 +584,7 @@ mainAgent := llmagent.New(
 
 - 子 Agent 的事件会以流式形式转发到父流程（`event.Event`），可直接显示 `choice.Delta.Content`
 - 为避免重复打印，子 Agent 最终的整段文本默认不会作为转发事件再次输出；但会被聚合写入最终的 `tool.response`，用于满足模型“工具消息跟随”的要求
+- 如果你想保留内部进度、但隐藏子 Agent 的 assistant 正文，可以再加上 `WithInnerTextMode(agenttool.InnerTextModeExclude)`
 - 建议在 UI 层：
   - 展示子 Agent 转发的增量内容
   - 如非调试，不再额外打印最终聚合的工具响应内容
@@ -459,6 +613,52 @@ if ev.Response != nil && ev.Object == model.ObjectTypeToolResponse {
 - `WithSkipSummarization(true)`：工具返回后跳过外层模型的总结调用
 - `WithStreamInner(true)`：启用子 Agent 事件转发（父/子 Agent 建议都 `Stream: true`）
 - `WithStreamInner(false)`：按普通可调用工具处理，不转发内部流
+- `WithInnerTextMode(agenttool.InnerTextModeInclude)`：启用内部转发时，继续展示子 Agent 的 assistant 文本
+- `WithInnerTextMode(agenttool.InnerTextModeExclude)`：保留内部进度事件，但不再转发子 Agent 的 assistant 正文
+- `WithResponseMode(agenttool.ResponseModeDefault)`：默认兼容模式，把子 Agent 的 assistant 消息拼接成工具结果
+- `WithResponseMode(agenttool.ResponseModeFinalOnly)`：只把子 Agent 最后一条完整 assistant 消息作为工具结果返回
+
+当子 Agent 是一个上下文隔离的独立工作者，而父 Agent 只应该消费它的最终答案时，
+使用 `ResponseModeFinalOnly`。如果还希望在流式 UI 中隐藏子 Agent 的正文，
+再单独组合 `InnerTextModeExclude`。
+
+#### 钉住模型与结构化输出
+
+默认情况下，子 Agent 会继承调用方从 `RunOptions` 带下来的运行时覆盖项。
+这只在调用方于 `runner.Run` 时传入选项时才会产生影响（例如 AGUI 服务端转发
+终端用户选择的模型或输出格式）。如果 `RunOptions` 中没有设置运行时覆盖项，
+子 Agent 自然使用自己的静态配置。
+
+对固定的 `AgentTool` 子 Agent，可以在 AgentTool 边界清掉指定的继承覆盖项，
+让子 Agent 自己的配置重新生效：
+
+```go
+agenttool.NewTool(subAgent,
+    agenttool.WithPinModel(true),
+    agenttool.WithPinStructuredOutput(true),
+)
+```
+
+这几个选项分别对应不同的继承字段：
+
+- `WithPinModel(true)`：清掉 `RunOptions.ModelName`、`RunOptions.Model` 和
+  `RunOptions.ModelSelector`，让子 Agent 自己的 `llmagent.WithModel(...)`
+  或模型选择器生效。
+- `WithPinStructuredOutput(true)`：清掉 `RunOptions.StructuredOutput` 和
+  `RunOptions.StructuredOutputType`，让子 Agent 自己的
+  `llmagent.WithStructuredOutputJSON(...)` 或
+  `llmagent.WithStructuredOutputJSONSchema(...)` 生效。
+
+#### 关联子 Agent 事件到父级工具调用
+
+通过 `AgentTool` 调用的子 Agent 发出的事件会带有 `ParentMetadata` 字段，其
+`TriggerID` 即父级的 `toolCallId`。AG-UI 调用方可以用它作为 join key，把子
+Agent 的事件挂回到具体那一次 `TOOL_CALL_START`。这在模型于一轮里对同一子
+Agent 发起多个并行 AgentTool 调用时尤为重要——所有派生 invocation 共享同一
+`ParentInvocationID`，只有 `ParentMetadata.TriggerID` 才能区分。具体线上格式
+和字段语义见 AG-UI chat 文档的
+[事件来源元数据](agui/chat.md#事件来源元数据) 章节，以及 Event 文档的
+[ParentMetadata 字段](event.md#requestidparentinvocationidinvocationid三者的关系与使用场景)。
 
 ### Agent 委托 (Agent Transfer)
 
@@ -601,6 +801,189 @@ func refreshSubAgents(ctx context.Context, ag agent.Agent) error {
 - 结果：$7,969.24（利息约$2,969.24）
 ```
 
+#### 跨轮追问用户
+
+`transfer_to_agent` 解决的是 **当前这一轮由谁处理**。它本身并不会告诉
+`Runner`：**下一条用户消息** 应该继续交给谁。
+
+当 SubAgent 发起追问时，这个问题就会暴露出来：
+
+1. coordinator transfer 给某个 SubAgent
+2. SubAgent 向用户追问缺失信息
+3. 用户在下一次请求里补充信息
+4. 默认情况下，`Runner` 还是会从常规入口 Agent 开始
+
+更干净的做法是把这件事做成 **显式**、**一次性** 的路由：
+
+- 在 Runner 上开启 `runner.WithAwaitUserReplyRouting(true)`
+- 对可能追问用户的 Agent，开启
+  `llmagent.WithAwaitUserReplyTool(true)`
+- 在这些 Agent 的 instruction 里明确要求模型：如果要向用户补字段，
+  先调用 `await_user_reply`，再发出追问
+
+```go
+import (
+    "context"
+
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/runner"
+    "trpc.group/trpc-go/trpc-agent-go/tool"
+)
+
+profileAgent := llmagent.New(
+    "profile-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithDescription("负责采集并更新客户资料。"),
+    llmagent.WithInstruction(`
+你负责更新客户资料。
+
+如果缺少必要字段：
+1. 先调用 await_user_reply
+2. 再向用户提出一个明确的问题
+3. 然后等待下一条用户消息
+
+字段齐全后，再调用 update_profile。
+`),
+    llmagent.WithAwaitUserReplyTool(true),
+    llmagent.WithTools([]tool.Tool{updateProfileTool}),
+)
+
+coordinatorAgent := llmagent.New(
+    "coordinator-agent",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithInstruction(`
+用户要更新资料时，直接 transfer 给 profile-agent。
+不要自己收集资料字段。
+`),
+    llmagent.WithSubAgents([]agent.Agent{profileAgent}),
+)
+
+r := runner.NewRunner(
+    "crm-app",
+    coordinatorAgent,
+    runner.WithAwaitUserReplyRouting(true),
+)
+
+// 第 1 轮：
+// user: "帮我更新资料"
+// coordinator-agent -> transfer_to_agent(profile-agent)
+// profile-agent -> await_user_reply + "请问要保存的手机号是多少？"
+
+// 第 2 轮（同一个 session）：
+// user: "+1-555-0101"
+// Runner 这一轮会直接从 profile-agent 开始。
+events, err := r.Run(
+    context.Background(),
+    "user-1",
+    "session-1",
+    model.NewUserMessage("+1-555-0101"),
+)
+if err != nil {
+    // handle error
+}
+for evt := range events {
+    if evt.IsRunnerCompletion() {
+        break
+    }
+}
+```
+
+这套能力的行为边界：
+
+- 这条路由只消费一次；下一条用户消息开始时就会被清掉
+- 显式指定的 `agent.WithAgent(...)` 或 `agent.WithAgentByName(...)`
+  仍然优先
+- 如果目标 Agent 路径已经失效，`Runner` 会回退到默认入口 Agent，
+  并清理掉脏路由
+- 对最常见的 “coordinator + WithSubAgents” 结构，`Runner`
+  会按完整的 Agent 链路径恢复，不需要你把每个 SubAgent 再额外注册一遍
+
+如果你不是用 `LLMAgent`，而是自己实现 `agent.Agent`，请看 `runner`
+文档里的底层 API：`agent.MarkAwaitingUserReply(...)`。
+
+#### 关联 Transfer 目标事件到触发的工具调用
+
+`transfer_to_agent` 把控制权转交给目标 Agent 后，目标 invocation 发出的事件会
+带有 `ParentMetadata` 字段：`TriggerType=transfer`、`TriggerID=<父级的
+toolCallId>`、`TriggerName=transfer_to_agent`。AG-UI 调用方可以用 `TriggerID`
+把目标的事件挂回到具体那一次 `transfer_to_agent` 的 `TOOL_CALL_START`。线上
+格式见 AG-UI chat 文档的
+[事件来源元数据](agui/chat.md#事件来源元数据) 章节。
+
+## 内置 Explorer（只读探索 Agent）
+
+`agent/llmagent/builtin` 提供一个开箱即用的只读“探索 / 检索 / 分析 / 查看”型
+Agent 预设，省去每次手写名字、description、只读 prompt、继承父能力面的样板代码。
+
+`builtin.NewExplorer()` 返回一个普通的 `agent.Agent`，因此两种接入方式都支持：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent/builtin"
+    agenttool "trpc.group/trpc-go/trpc-agent-go/tool/agent"
+)
+
+// 方式一：作为 SubAgent，模型通过 transfer_to_agent 把控制权交给 explorer
+root := llmagent.New("assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithTools(tools),
+    llmagent.WithSubAgents([]agent.Agent{builtin.NewExplorer()}),
+)
+
+// 方式二：包成 AgentTool，模型同步调用 explorer，拿结果后主 Agent 继续
+root := llmagent.New("assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithTools(append(tools, agenttool.NewTool(builtin.NewExplorer()))),
+)
+```
+
+两种方式的能力继承一致：transfer 和 AgentTool 都在父 invocation 的克隆上运行子
+Agent，Explorer 在 `Run` 时通过直接父 invocation 推导默认能力面。
+
+### 默认继承行为
+
+不传任何选项时，Explorer 默认从**直接父 invocation**继承：
+
+- **用户工具**：父 Agent 通过 `WithTools` / `WithToolSets` 注册的工具。框架自动注入的
+  工具（`transfer_to_agent`、`await_user_reply` 等）不会被继承。
+- **knowledge**：父的知识检索能力（`knowledge_search` 等）会按父配置重新生成。
+- **skills / code executor**：按父配置重新生成，绑定到子调用而非硬搬父运行时状态。
+- **model**：继承父 invocation 当前解析出的 model。
+
+### 只读语义是软约束
+
+Explorer 的 read-only 是 **system prompt 软约束，不是权限隔离**。它的定位是一个便捷的
+内置只读角色：模型会被提示去检索、查看和总结，但框架不会自动把工具分类成只读工具或写
+工具。
+
+### 自定义能力面
+
+```go
+builtin.NewExplorer(
+    builtin.WithName("explorer"),
+    builtin.WithDescription("Reads and investigates available context without modifying anything."),
+    builtin.WithInstruction(customReadOnlyPrompt),
+    builtin.WithSkills(readOnlySkillsRepo),            // 显式替换
+    builtin.WithModel(modelInstance),                  // 显式指定，否则继承父 model
+)
+```
+
+可用选项：`WithName`、`WithDescription`、`WithInstruction`、`WithTools`、
+`WithSkills`、`WithModel`、`WithCodeExecutor`，以及高级逃生口
+`WithLLMAgentOptions`（直接透传内部 `llmagent.Option`，谨慎使用）。
+
+行为说明：
+
+- 不传 `WithTools`：运行时继承父用户工具；传了则使用显式工具集，且不再继承父用户工具
+  与 knowledge。
+- 不传 `WithSkills` / `WithCodeExecutor`：运行时按父能力重新生成。
+- 不传 `WithModel`：继承父 invocation 当前 model；若父也没有 model，`Run` 返回清晰错误。
+- 没有父 invocation（例如作为 root 运行）：不继承，只使用显式配置。
+
 ## 环境变量配置
 
 所有多 Agent 示例都需要以下环境变量：
@@ -621,7 +1004,7 @@ func refreshSubAgents(ctx context.Context, ag agent.Agent) error {
 ```bash
 cd examples/multiagent/chain
 export OPENAI_API_KEY="your-api-key"
-go run main.go -model deepseek-chat
+go run main.go -model deepseek-v4-flash
 ```
 
 #### 并行 Agent 示例
@@ -629,7 +1012,7 @@ go run main.go -model deepseek-chat
 ```bash
 cd examples/multiagent/parallel
 export OPENAI_API_KEY="your-api-key"
-go run main.go -model deepseek-chat
+go run main.go -model deepseek-v4-flash
 ```
 
 #### 循环 Agent 示例
@@ -637,7 +1020,7 @@ go run main.go -model deepseek-chat
 ```bash
 cd examples/multiagent/cycle
 export OPENAI_API_KEY="your-api-key"
-go run main.go -model deepseek-chat -max-iterations 5
+go run main.go -model deepseek-v4-flash -max-iterations 5
 ```
 
 ### 辅助功能示例
@@ -647,7 +1030,7 @@ go run main.go -model deepseek-chat -max-iterations 5
 ```bash
 cd examples/agenttool
 export OPENAI_API_KEY="your-api-key"
-go run main.go -model deepseek-chat
+go run main.go -model deepseek-v4-flash
 ```
 
 #### Agent 委托示例
@@ -655,7 +1038,7 @@ go run main.go -model deepseek-chat
 ```bash
 cd examples/transfer
 export OPENAI_API_KEY="your-api-key"
-go run main.go -model deepseek-chat
+go run main.go -model deepseek-v4-flash
 ```
 
 ## 自定义和扩展

@@ -11,11 +11,19 @@
 package json
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"reflect"
+	"strings"
+
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
+
+// CompareFunc defines custom JSON comparison logic.
+type CompareFunc func(actual, expected any) (bool, error)
 
 // JSONCriterion compares two JSON objects using exact matching.
 type JSONCriterion struct {
@@ -29,8 +37,14 @@ type JSONCriterion struct {
 	MatchStrategy JSONMatchStrategy `json:"matchStrategy,omitempty"`
 	// NumberTolerance defines the allowed absolute difference between numeric values. 1e-6 is the default.
 	NumberTolerance *float64 `json:"numberTolerance,omitempty"`
+	// Valid validates raw JSON content when used by callers that receive unparsed content.
+	Valid bool `json:"valid,omitempty"`
+	// Schema validates actual JSON content against the provided JSON Schema.
+	Schema json.RawMessage `json:"schema,omitempty"`
+	// CompareName selects a registered comparison implementation by name.
+	CompareName string `json:"compareName,omitempty"`
 	// Compare overrides default comparison when provided.
-	Compare func(actual, expected any) (bool, error) `json:"-"`
+	Compare CompareFunc `json:"-"`
 }
 
 // JSONMatchStrategy enumerates supported JSON comparison strategies.
@@ -39,7 +53,11 @@ type JSONMatchStrategy string
 const (
 	// JSONMatchStrategyExact matches json objects exactly.
 	JSONMatchStrategyExact JSONMatchStrategy = "exact"
+	// JSONMatchStrategySkip skips JSON value matching.
+	JSONMatchStrategySkip JSONMatchStrategy = "skip"
 )
+
+const inlineSchemaResource = "https://trpc.group/trpc-agent-go/evaluation/metric/criterion/json/schema.json"
 
 // New creates a new JSONCriterion with the provided options.
 func New(opt ...Option) *JSONCriterion {
@@ -50,6 +68,9 @@ func New(opt ...Option) *JSONCriterion {
 		OnlyTree:        opts.onlyTree,
 		MatchStrategy:   opts.matchStrategy,
 		NumberTolerance: opts.numberTolerance,
+		Valid:           opts.valid,
+		Schema:          opts.schema,
+		CompareName:     opts.compareName,
 		Compare:         opts.compare,
 	}
 }
@@ -65,6 +86,27 @@ func (j *JSONCriterion) Match(actual, expected any) (bool, error) {
 	if j.Compare != nil {
 		return j.Compare(actual, expected)
 	}
+	actualForSchema := actual
+	if j.Valid {
+		var err error
+		actualForSchema, err = rawJSONValue(actual)
+		if err != nil {
+			return false, fmt.Errorf("parse actual raw json: %w", err)
+		}
+	}
+	if len(j.Schema) > 0 {
+		if err := validateJSONSchema(actualForSchema, j.Schema); err != nil {
+			return false, err
+		}
+	}
+	if j.MatchStrategy == JSONMatchStrategySkip {
+		return true, nil
+	}
+	var err error
+	actual, expected, err = j.normalizeInputs(actual, expected)
+	if err != nil {
+		return false, err
+	}
 	tolerance := defaultNumberTolerance
 	if j.NumberTolerance != nil {
 		tolerance = *j.NumberTolerance
@@ -78,6 +120,94 @@ func (j *JSONCriterion) Match(actual, expected any) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid match strategy %s", j.MatchStrategy)
 	}
+}
+
+func validateJSONSchema(actual any, schemaRaw json.RawMessage) error {
+	schemaDoc, err := jsonschema.UnmarshalJSON(bytes.NewReader(schemaRaw))
+	if err != nil {
+		return fmt.Errorf("parse json schema: %w", err)
+	}
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	if err := compiler.AddResource(inlineSchemaResource, schemaDoc); err != nil {
+		return fmt.Errorf("add json schema resource: %w", err)
+	}
+	schema, err := compiler.Compile(inlineSchemaResource)
+	if err != nil {
+		return fmt.Errorf("compile json schema: %w", err)
+	}
+	value, err := schemaValue(actual)
+	if err != nil {
+		return fmt.Errorf("parse actual raw json: %w", err)
+	}
+	if err := schema.Validate(value); err != nil {
+		return fmt.Errorf("json schema validation failed: %w", err)
+	}
+	return nil
+}
+
+func schemaValue(value any) (any, error) {
+	switch v := value.(type) {
+	case json.RawMessage:
+		return jsonschema.UnmarshalJSON(bytes.NewReader(v))
+	case []byte:
+		return jsonschema.UnmarshalJSON(bytes.NewReader(v))
+	default:
+		return value, nil
+	}
+}
+
+func (j *JSONCriterion) normalizeInputs(actual, expected any) (any, any, error) {
+	actualValue, err := parseRawMessage(actual)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse actual raw json: %w", err)
+	}
+	expectedValue, err := parseRawMessage(expected)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse expected raw json: %w", err)
+	}
+	return actualValue, expectedValue, nil
+}
+
+func rawJSONValue(value any) (any, error) {
+	switch v := value.(type) {
+	case json.RawMessage:
+		return jsonschema.UnmarshalJSON(bytes.NewReader(v))
+	case string:
+		return jsonschema.UnmarshalJSON(strings.NewReader(v))
+	case []byte:
+		return jsonschema.UnmarshalJSON(bytes.NewReader(v))
+	default:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		return jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	}
+}
+
+func parseRawMessage(value any) (any, error) {
+	raw, ok := value.(json.RawMessage)
+	if !ok {
+		return value, nil
+	}
+	return parseRawJSON(raw)
+}
+
+func parseRawJSON(raw json.RawMessage) (any, error) {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	var v any
+	if err := decoder.Decode(&v); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("multiple json values")
+		}
+		return nil, err
+	}
+	return v, nil
 }
 
 func matchValueOnlyTree(actual, expected any, onlyTree map[string]any, tolerance float64) (bool, error) {

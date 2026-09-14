@@ -13,13 +13,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/multimodal"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/reduce"
+	"trpc.group/trpc-go/trpc-agent-go/server/agui/internal/source"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
 
@@ -31,22 +35,35 @@ type MessagesSnapshotter interface {
 
 // MessagesSnapshot sends a MessagesSnapshot event stream by replaying persisted AG-UI track events.
 func (r *runner) MessagesSnapshot(ctx context.Context,
-	runAgentInput *adapter.RunAgentInput) (<-chan aguievents.Event, error) {
+	runAgentInput *adapter.RunAgentInput) (eventCh <-chan aguievents.Event, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			// The error is written back to the HTTP client; keep the panic
+			// payload (hooks/resolvers may embed request internals) in logs only.
+			log.ErrorfContext(ctx, log.PanicPrefix+" agui messages snapshot: panic: %v\n%s", rec, debug.Stack())
+			eventCh = nil
+			err = errors.New("messages snapshot internal error")
+		}
+	}()
 	if r.runner == nil {
 		return nil, errors.New("runner is nil")
 	}
 	if runAgentInput == nil {
 		return nil, errors.New("run input cannot be nil")
 	}
-	if r.appName == "" {
-		return nil, errors.New("app name is empty")
-	}
 	if r.tracker == nil {
 		return nil, errors.New("tracker is nil")
 	}
-	runAgentInput, err := r.applyRunAgentInputHook(ctx, runAgentInput)
+	runAgentInput, err = r.applyRunAgentInputHook(ctx, runAgentInput)
 	if err != nil {
 		return nil, fmt.Errorf("run input hook: %w", err)
+	}
+	appName, err := r.resolveAppName(ctx, runAgentInput)
+	if err != nil {
+		return nil, fmt.Errorf("resolve app name: %w", err)
+	}
+	if appName == "" {
+		return nil, errors.New("app name is empty")
 	}
 	userID, err := r.userIDResolver(ctx, runAgentInput)
 	if err != nil {
@@ -54,7 +71,7 @@ func (r *runner) MessagesSnapshot(ctx context.Context,
 	}
 	input := &runInput{
 		key: session.Key{
-			AppName:   r.appName,
+			AppName:   appName,
 			UserID:    userID,
 			SessionID: runAgentInput.ThreadID,
 		},
@@ -106,7 +123,7 @@ func (r *runner) messagesSnapshot(ctx context.Context, input *runInput, events c
 		return
 	}
 
-	if r.messagesSnapshotFollowEnabled && trackEvents != nil && !trackEndsWithTerminalRunEvent(trackEvents.Events) {
+	if r.messagesSnapshotFollowEnabled && r.shouldFollowMessagesSnapshot(input.key, trackEvents) {
 		r.messagesSnapshotFollow(ctx, input, events, trackEvents)
 		return
 	}
@@ -124,11 +141,67 @@ func (r *runner) getMessagesSnapshotEvent(ctx context.Context,
 	if err != nil {
 		return nil, nil, fmt.Errorf("get track events: %w", err)
 	}
-	messages, err := reduce.Reduce(r.appName, sessionKey.UserID, trackEvents.Events)
+	eventsForReduce, safeForFollow := trimTrackEventsToHistoryStart(trackEvents.Events)
+	if !safeForFollow && len(trackEvents.Events) > 0 {
+		log.WarnfContext(ctx, "agui messages snapshot: no safe user message boundary, app=%s, user=%s, session=%s, trackEvents=%d",
+			sessionKey.AppName, sessionKey.UserID, sessionKey.SessionID, len(trackEvents.Events))
+	}
+	messages, err := reduce.Reduce(
+		sessionKey.AppName,
+		sessionKey.UserID,
+		eventsForReduce,
+		reduce.WithRunLifecycleEvents(r.messagesSnapshotRunLifecycleEventsEnabled),
+		reduce.WithBestEffort(r.messagesSnapshotBestEffortEnabled),
+	)
 	if err != nil {
 		err = fmt.Errorf("reduce track events: %w", err)
 	}
-	return aguievents.NewMessagesSnapshotEvent(messages), trackEvents, err
+	log.DebugfContext(ctx, "agui messages snapshot: app=%s, user=%s, session=%s, trackEvents=%d, eventsForReduce=%d, safeForFollow=%t, messages=%d, reduceErr=%v",
+		sessionKey.AppName, sessionKey.UserID, sessionKey.SessionID, len(trackEvents.Events), len(eventsForReduce), safeForFollow, len(messages), err)
+	event := aguievents.NewMessagesSnapshotEvent(messages)
+	if r.eventSourceMetadataEnabled {
+		metadata := source.BuildSnapshotMetadata(
+			eventsForReduce,
+			source.WithRunLifecycleEvents(r.messagesSnapshotRunLifecycleEventsEnabled),
+		)
+		if !metadata.IsZero() {
+			event.GetBaseEvent().RawEvent = metadata
+		}
+	}
+	if !safeForFollow {
+		trackEvents = nil
+	}
+	return event, trackEvents, err
+}
+
+func trimTrackEventsToHistoryStart(events []session.TrackEvent) ([]session.TrackEvent, bool) {
+	if len(events) == 0 {
+		return events, true
+	}
+	for i, event := range events {
+		if isUserMessageTrackEvent(event) {
+			return events[i:], true
+		}
+	}
+	return nil, false
+}
+
+func isUserMessageTrackEvent(trackEvent session.TrackEvent) bool {
+	if len(trackEvent.Payload) == 0 {
+		return false
+	}
+	evt, err := aguievents.EventFromJSON(trackEvent.Payload)
+	if err != nil {
+		return false
+	}
+	switch e := evt.(type) {
+	case *aguievents.CustomEvent:
+		return e.Name == multimodal.CustomEventNameUserMessage
+	case *aguievents.TextMessageStartEvent:
+		return e.Role != nil && *e.Role == string(types.RoleUser)
+	default:
+		return false
+	}
 }
 
 func (r *runner) messagesSnapshotFollow(
@@ -173,6 +246,19 @@ func (r *runner) messagesSnapshotFollow(
 	}
 }
 
+func (r *runner) shouldFollowMessagesSnapshot(key session.Key, trackEvents *session.TrackEvents) bool {
+	if trackEvents == nil || trackEndsWithTerminalRunEvent(trackEvents.Events) {
+		return false
+	}
+	if r.flushInterval <= 0 {
+		return false
+	}
+	if len(trackEvents.Events) > 0 {
+		return true
+	}
+	return r.isRunning(key)
+}
+
 func (r *runner) handleMessagesSnapshotFollowTick(
 	ctx context.Context,
 	input *runInput,
@@ -181,6 +267,9 @@ func (r *runner) handleMessagesSnapshotFollowTick(
 ) bool {
 	trackEvents, err := r.tracker.GetEvents(ctx, input.key, session.WithEventTime(*cursorTime))
 	if err != nil {
+		if isEmptyTrackEventsError(err) {
+			return true
+		}
 		r.emitEvent(ctx, events, aguievents.NewRunErrorEvent(fmt.Sprintf("follow track events: %v", err),
 			aguievents.WithRunID(input.runID)), input)
 		return false
@@ -216,6 +305,10 @@ func (r *runner) handleMessagesSnapshotFollowTick(
 		}
 	}
 	return true
+}
+
+func isEmptyTrackEventsError(err error) bool {
+	return errors.Is(err, session.ErrTracksEmpty) || errors.Is(err, session.ErrTrackEventsNotFound)
 }
 
 func trackEndsWithTerminalRunEvent(events []session.TrackEvent) bool {

@@ -11,6 +11,7 @@
 package util
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"strconv"
@@ -20,12 +21,15 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	openaiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	memorychromadb "trpc.group/trpc-go/trpc-agent-go/memory/chromadb"
 	"trpc.group/trpc-go/trpc-agent-go/memory/extractor"
 	memoryinmemory "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 	memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
+	memorymysqlvec "trpc.group/trpc-go/trpc-agent-go/memory/mysqlvec"
 	memorypgvector "trpc.group/trpc-go/trpc-agent-go/memory/pgvector"
 	memorypostgres "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
 	memoryredis "trpc.group/trpc-go/trpc-agent-go/memory/redis"
+	memorysqlite "trpc.group/trpc-go/trpc-agent-go/memory/sqlite"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
@@ -37,11 +41,16 @@ type MemoryType string
 
 // Memory type constants.
 const (
-	MemoryInMemory MemoryType = "inmemory"
-	MemoryRedis    MemoryType = "redis"
-	MemoryPostgres MemoryType = "postgres"
-	MemoryPGVector MemoryType = "pgvector"
-	MemoryMySQL    MemoryType = "mysql"
+	MemoryInMemory  MemoryType = "inmemory"
+	MemorySQLite    MemoryType = "sqlite"
+	MemorySQLiteVec MemoryType = "sqlitevec"
+	MemoryRedis     MemoryType = "redis"
+	MemoryPostgres  MemoryType = "postgres"
+	MemoryPGVector  MemoryType = "pgvector"
+	MemoryMySQL     MemoryType = "mysql"
+	MemoryMySQLVec  MemoryType = "mysqlvec"
+	// MemoryChromaDB selects the ChromaDB-backed memory service.
+	MemoryChromaDB MemoryType = "chromadb"
 )
 
 // MemoryServiceConfig holds configuration for creating a memory service.
@@ -54,6 +63,8 @@ type MemoryServiceConfig struct {
 	AsyncMemoryNum   int
 	MemoryQueueSize  int
 	MemoryJobTimeout time.Duration
+	// DisableAutoMemoryOnExternalContext skips auto extraction after framework-owned external context.
+	DisableAutoMemoryOnExternalContext bool
 }
 
 // RunnerConfig holds configuration for creating a runner.
@@ -72,7 +83,7 @@ func DefaultRunnerConfig() RunnerConfig {
 	return RunnerConfig{
 		AppName:     "memory-chat",
 		AgentName:   "memory-assistant",
-		ModelName:   GetEnvOrDefault("MODEL_NAME", "deepseek-chat"),
+		ModelName:   GetEnvOrDefault("MODEL_NAME", "deepseek-v4-flash"),
 		Instruction: "You are a helpful AI assistant with memory capabilities.",
 		MaxTokens:   2000,
 		Temperature: 0.7,
@@ -87,7 +98,8 @@ func DefaultRunnerConfig() RunnerConfig {
 // - Auto mode: cfg.Extractor != nil, automatically extracts memories from conversations
 //
 // Parameters:
-//   - memoryType: one of inmemory, redis, postgres, pgvector, mysql
+//   - memoryType: one of inmemory, sqlite, sqlitevec, redis, postgres,
+//     pgvector, mysql, mysqlvec, chromadb
 //   - cfg: memory service configuration
 //   - SoftDelete: enable soft delete for SQL backends
 //   - Extractor: memory extractor for auto mode (nil = manual mode)
@@ -97,12 +109,20 @@ func DefaultRunnerConfig() RunnerConfig {
 //
 // Environment variables by memory type:
 //
+//	sqlite:     SQLITE_MEMORY_DSN (default: file:memories.db?_busy_timeout=5000)
+//	sqlitevec:  SQLITEVEC_MEMORY_DSN (default: file:memories_vec.db?_busy_timeout=5000)
 //	redis:      REDIS_ADDR (default: localhost:6379)
 //	postgres:   PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DATABASE
 //	pgvector:   PGVECTOR_HOST, PGVECTOR_PORT, PGVECTOR_USER, PGVECTOR_PASSWORD, PGVECTOR_DATABASE, PGVECTOR_EMBEDDER_MODEL
 //	mysql:      MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
+//	mysqlvec:   MYSQLVEC_HOST, MYSQLVEC_PORT, MYSQLVEC_USER, MYSQLVEC_PASSWORD, MYSQLVEC_DATABASE, MYSQLVEC_EMBEDDER_MODEL
+//	chromadb:   CHROMA_BASE_URL, CHROMA_API_KEY, CHROMA_BEARER_TOKEN, CHROMA_TENANT, CHROMA_DATABASE, CHROMA_COLLECTION, CHROMA_EMBEDDER_MODEL
 func NewMemoryServiceByType(memoryType MemoryType, cfg MemoryServiceConfig) (memory.Service, error) {
 	switch memoryType {
+	case MemorySQLite:
+		return newSQLiteMemoryService(cfg)
+	case MemorySQLiteVec:
+		return newSQLiteVecMemoryService(cfg)
 	case MemoryRedis:
 		return newRedisMemoryService(cfg)
 	case MemoryPostgres:
@@ -111,11 +131,109 @@ func NewMemoryServiceByType(memoryType MemoryType, cfg MemoryServiceConfig) (mem
 		return newPGVectorMemoryService(cfg)
 	case MemoryMySQL:
 		return newMySQLMemoryService(cfg)
+	case MemoryMySQLVec:
+		return newMySQLVecMemoryService(cfg)
+	case MemoryChromaDB:
+		return newChromaDBMemoryService(cfg)
 	case MemoryInMemory:
 		fallthrough
 	default:
 		return newInMemoryMemoryService(cfg), nil
 	}
+}
+
+const (
+	sqliteMemoryDSNEnvKey     = "SQLITE_MEMORY_DSN"
+	defaultSQLiteMemoryDBDSN  = "file:memories.db?_busy_timeout=5000"
+	sqliteDriverName          = "sqlite3"
+	defaultSQLiteMaxOpenConns = 1
+	defaultSQLiteMaxIdleConns = 1
+)
+
+func newSQLiteMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
+	dsn := GetEnvOrDefault(sqliteMemoryDSNEnvKey, defaultSQLiteMemoryDBDSN)
+	db, err := sql.Open(sqliteDriverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(defaultSQLiteMaxOpenConns)
+	db.SetMaxIdleConns(defaultSQLiteMaxIdleConns)
+
+	opts := []memorysqlite.ServiceOpt{
+		memorysqlite.WithSoftDelete(cfg.SoftDelete),
+	}
+
+	if cfg.Extractor != nil {
+		opts = append(opts, memorysqlite.WithExtractor(cfg.Extractor))
+		opts = append(opts, memorysqlite.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		))
+		if cfg.AsyncMemoryNum > 0 {
+			opts = append(
+				opts,
+				memorysqlite.WithAsyncMemoryNum(cfg.AsyncMemoryNum),
+			)
+		}
+		if cfg.MemoryQueueSize > 0 {
+			opts = append(
+				opts,
+				memorysqlite.WithMemoryQueueSize(cfg.MemoryQueueSize),
+			)
+		}
+		if cfg.MemoryJobTimeout > 0 {
+			opts = append(
+				opts,
+				memorysqlite.WithMemoryJobTimeout(cfg.MemoryJobTimeout),
+			)
+		}
+	}
+
+	svc, err := memorysqlite.NewService(db, opts...)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return svc, nil
+}
+
+const (
+	sqliteVecMemoryDSNEnvKey    = "SQLITEVEC_MEMORY_DSN"
+	defaultSQLiteVecMemoryDBDSN = "file:memories_vec.db?_busy_timeout=5000"
+
+	sqliteVecEmbedderModelEnvKey = "SQLITEVEC_EMBEDDER_MODEL"
+
+	openAIEmbeddingAPIKeyEnvKey  = "OPENAI_EMBEDDING_API_KEY"
+	openAIEmbeddingBaseURLEnvKey = "OPENAI_EMBEDDING_BASE_URL"
+	openAIEmbeddingModelEnvKey   = "OPENAI_EMBEDDING_MODEL"
+)
+
+func getEmbeddingModel(defaultModel string) string {
+	if env := os.Getenv(openAIEmbeddingModelEnvKey); env != "" {
+		return env
+	}
+	return defaultModel
+}
+
+func newOpenAIEmbedder(defaultModel string) *openaiembedder.Embedder {
+	modelName := getEmbeddingModel(defaultModel)
+	opts := []openaiembedder.Option{
+		openaiembedder.WithModel(modelName),
+	}
+
+	if apiKey := os.Getenv(openAIEmbeddingAPIKeyEnvKey); apiKey != "" {
+		opts = append(opts, openaiembedder.WithAPIKey(apiKey))
+	}
+
+	baseURL := os.Getenv(openAIEmbeddingBaseURLEnvKey)
+	if baseURL == "" {
+		baseURL = os.Getenv("OPENAI_BASE_URL")
+	}
+	if baseURL != "" {
+		opts = append(opts, openaiembedder.WithBaseURL(baseURL))
+	}
+
+	return openaiembedder.New(opts...)
 }
 
 // newInMemoryMemoryService creates an in-memory memory service.
@@ -126,6 +244,9 @@ func newInMemoryMemoryService(cfg MemoryServiceConfig) memory.Service {
 	// Configure extractor for auto memory mode if provided.
 	if cfg.Extractor != nil {
 		opts = append(opts, memoryinmemory.WithExtractor(cfg.Extractor))
+		opts = append(opts, memoryinmemory.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		))
 		if cfg.AsyncMemoryNum > 0 {
 			opts = append(opts, memoryinmemory.WithAsyncMemoryNum(cfg.AsyncMemoryNum))
 		}
@@ -155,6 +276,9 @@ func newRedisMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
 	// Configure extractor for auto memory mode if provided.
 	if cfg.Extractor != nil {
 		opts = append(opts, memoryredis.WithExtractor(cfg.Extractor))
+		opts = append(opts, memoryredis.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		))
 		if cfg.AsyncMemoryNum > 0 {
 			opts = append(opts, memoryredis.WithAsyncMemoryNum(cfg.AsyncMemoryNum))
 		}
@@ -202,6 +326,9 @@ func newPostgresMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
 	// Configure extractor for auto memory mode if provided.
 	if cfg.Extractor != nil {
 		opts = append(opts, memorypostgres.WithExtractor(cfg.Extractor))
+		opts = append(opts, memorypostgres.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		))
 		if cfg.AsyncMemoryNum > 0 {
 			opts = append(opts, memorypostgres.WithAsyncMemoryNum(cfg.AsyncMemoryNum))
 		}
@@ -240,7 +367,7 @@ func newPGVectorMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
 	embedderModel := GetEnvOrDefault("PGVECTOR_EMBEDDER_MODEL", "text-embedding-3-small")
 
 	// Create embedder - for simplicity, we'll use OpenAI embedder
-	embedder := openaiembedder.New(openaiembedder.WithModel(embedderModel))
+	embedder := newOpenAIEmbedder(embedderModel)
 
 	opts := []memorypgvector.ServiceOpt{
 		memorypgvector.WithHost(host),
@@ -255,6 +382,9 @@ func newPGVectorMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
 	// Configure extractor for auto memory mode if provided.
 	if cfg.Extractor != nil {
 		opts = append(opts, memorypgvector.WithExtractor(cfg.Extractor))
+		opts = append(opts, memorypgvector.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		))
 		if cfg.AsyncMemoryNum > 0 {
 			opts = append(opts, memorypgvector.WithAsyncMemoryNum(cfg.AsyncMemoryNum))
 		}
@@ -267,6 +397,63 @@ func newPGVectorMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
 	}
 
 	return memorypgvector.NewService(opts...)
+}
+
+// newChromaDBMemoryService creates a ChromaDB memory service.
+// It supports both self-hosted ChromaDB and Chroma Cloud authentication.
+func newChromaDBMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
+	embedderModel := GetEnvOrDefault(
+		"CHROMA_EMBEDDER_MODEL",
+		"text-embedding-3-small",
+	)
+	opts := []memorychromadb.ServiceOpt{
+		memorychromadb.WithBaseURL(GetEnvOrDefault(
+			"CHROMA_BASE_URL",
+			"http://localhost:8000",
+		)),
+		memorychromadb.WithCollectionName(GetEnvOrDefault(
+			"CHROMA_COLLECTION",
+			"memories",
+		)),
+		memorychromadb.WithEmbedder(newOpenAIEmbedder(embedderModel)),
+		memorychromadb.WithSoftDelete(cfg.SoftDelete),
+	}
+	if value := os.Getenv("CHROMA_API_KEY"); value != "" {
+		opts = append(opts, memorychromadb.WithAPIKey(value))
+	}
+	if value := os.Getenv("CHROMA_BEARER_TOKEN"); value != "" {
+		opts = append(opts, memorychromadb.WithBearerToken(value))
+	}
+	if value := os.Getenv("CHROMA_TENANT"); value != "" {
+		opts = append(opts, memorychromadb.WithTenant(value))
+	}
+	if value := os.Getenv("CHROMA_DATABASE"); value != "" {
+		opts = append(opts, memorychromadb.WithDatabase(value))
+	}
+	opts = append(opts, chromaAutoMemoryOptions(cfg)...)
+	return memorychromadb.NewService(opts...)
+}
+
+func chromaAutoMemoryOptions(cfg MemoryServiceConfig) []memorychromadb.ServiceOpt {
+	if cfg.Extractor == nil {
+		return nil
+	}
+	opts := []memorychromadb.ServiceOpt{
+		memorychromadb.WithExtractor(cfg.Extractor),
+		memorychromadb.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		),
+	}
+	if cfg.AsyncMemoryNum > 0 {
+		opts = append(opts, memorychromadb.WithAsyncMemoryNum(cfg.AsyncMemoryNum))
+	}
+	if cfg.MemoryQueueSize > 0 {
+		opts = append(opts, memorychromadb.WithMemoryQueueSize(cfg.MemoryQueueSize))
+	}
+	if cfg.MemoryJobTimeout > 0 {
+		opts = append(opts, memorychromadb.WithMemoryJobTimeout(cfg.MemoryJobTimeout))
+	}
+	return opts
 }
 
 // newMySQLMemoryService creates a MySQL memory service.
@@ -295,6 +482,9 @@ func newMySQLMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
 	// Configure extractor for auto memory mode if provided.
 	if cfg.Extractor != nil {
 		opts = append(opts, memorymysql.WithExtractor(cfg.Extractor))
+		opts = append(opts, memorymysql.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		))
 		if cfg.AsyncMemoryNum > 0 {
 			opts = append(opts, memorymysql.WithAsyncMemoryNum(cfg.AsyncMemoryNum))
 		}
@@ -307,6 +497,54 @@ func newMySQLMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
 	}
 
 	return memorymysql.NewService(opts...)
+}
+
+// newMySQLVecMemoryService creates a MySQL vector memory service.
+// Supports both manual mode (cfg.Extractor == nil) and auto mode (cfg.Extractor != nil).
+// Environment variables:
+//   - MYSQLVEC_HOST: MySQL host (default: localhost)
+//   - MYSQLVEC_PORT: MySQL port (default: 3306)
+//   - MYSQLVEC_USER: MySQL user (default: root)
+//   - MYSQLVEC_PASSWORD: MySQL password (default: empty)
+//   - MYSQLVEC_DATABASE: MySQL database (default: trpc_agent_go)
+//   - MYSQLVEC_EMBEDDER_MODEL: Embedder model name (default: text-embedding-3-small)
+func newMySQLVecMemoryService(cfg MemoryServiceConfig) (memory.Service, error) {
+	host := GetEnvOrDefault("MYSQLVEC_HOST", "localhost")
+	port := GetEnvOrDefault("MYSQLVEC_PORT", "3306")
+	user := GetEnvOrDefault("MYSQLVEC_USER", "root")
+	password := GetEnvOrDefault("MYSQLVEC_PASSWORD", "")
+	database := GetEnvOrDefault("MYSQLVEC_DATABASE", "trpc_agent_go")
+	embedderModel := GetEnvOrDefault("MYSQLVEC_EMBEDDER_MODEL", "text-embedding-3-small")
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
+		user, password, host, port, database)
+
+	embedder := newOpenAIEmbedder(embedderModel)
+
+	opts := []memorymysqlvec.ServiceOpt{
+		memorymysqlvec.WithMySQLClientDSN(dsn),
+		memorymysqlvec.WithEmbedder(embedder),
+		memorymysqlvec.WithSoftDelete(cfg.SoftDelete),
+	}
+
+	// Configure extractor for auto memory mode if provided.
+	if cfg.Extractor != nil {
+		opts = append(opts, memorymysqlvec.WithExtractor(cfg.Extractor))
+		opts = append(opts, memorymysqlvec.WithDisableAutoMemoryOnExternalContext(
+			cfg.DisableAutoMemoryOnExternalContext,
+		))
+		if cfg.AsyncMemoryNum > 0 {
+			opts = append(opts, memorymysqlvec.WithAsyncMemoryNum(cfg.AsyncMemoryNum))
+		}
+		if cfg.MemoryQueueSize > 0 {
+			opts = append(opts, memorymysqlvec.WithMemoryQueueSize(cfg.MemoryQueueSize))
+		}
+		if cfg.MemoryJobTimeout > 0 {
+			opts = append(opts, memorymysqlvec.WithMemoryJobTimeout(cfg.MemoryJobTimeout))
+		}
+	}
+
+	return memorymysqlvec.NewService(opts...)
 }
 
 // NewRunner creates a runner with the given memory service and configuration.
@@ -357,6 +595,22 @@ func FloatPtr(v float64) *float64 {
 // PrintMemoryInfo prints memory service information based on type.
 func PrintMemoryInfo(memoryType MemoryType, softDelete bool) {
 	switch memoryType {
+	case MemorySQLite:
+		dsn := GetEnvOrDefault(sqliteMemoryDSNEnvKey, defaultSQLiteMemoryDBDSN)
+		fmt.Printf("SQLite: %s\n", dsn)
+		fmt.Printf("Soft delete: %t\n", softDelete)
+	case MemorySQLiteVec:
+		dsn := GetEnvOrDefault(
+			sqliteVecMemoryDSNEnvKey,
+			defaultSQLiteVecMemoryDBDSN,
+		)
+		embedderModel := GetEnvOrDefault(
+			sqliteVecEmbedderModelEnvKey,
+			openaiembedder.DefaultModel,
+		)
+		fmt.Printf("SQLiteVec: %s\n", dsn)
+		fmt.Printf("Embedder model: %s\n", getEmbeddingModel(embedderModel))
+		fmt.Printf("Soft delete: %t\n", softDelete)
 	case MemoryRedis:
 		addr := GetEnvOrDefault("REDIS_ADDR", "localhost:6379")
 		fmt.Printf("Redis: %s\n", addr)
@@ -370,15 +624,39 @@ func PrintMemoryInfo(memoryType MemoryType, softDelete bool) {
 		host := GetEnvOrDefault("PGVECTOR_HOST", "localhost")
 		port := GetEnvOrDefault("PGVECTOR_PORT", "5432")
 		database := GetEnvOrDefault("PGVECTOR_DATABASE", "trpc-agent-go-pgmemory")
-		embedderModel := GetEnvOrDefault("PGVECTOR_EMBEDDER_MODEL", "text-embedding-3-small")
+		embedderModel := GetEnvOrDefault(
+			"PGVECTOR_EMBEDDER_MODEL",
+			"text-embedding-3-small",
+		)
 		fmt.Printf("pgvector: %s:%s/%s\n", host, port, database)
-		fmt.Printf("Embedder model: %s\n", embedderModel)
+		fmt.Printf("Embedder model: %s\n", getEmbeddingModel(embedderModel))
+		fmt.Printf("Soft delete: %t\n", softDelete)
+	case MemoryChromaDB:
+		baseURL := GetEnvOrDefault("CHROMA_BASE_URL", "http://localhost:8000")
+		collection := GetEnvOrDefault("CHROMA_COLLECTION", "memories")
+		embedderModel := GetEnvOrDefault(
+			"CHROMA_EMBEDDER_MODEL",
+			"text-embedding-3-small",
+		)
+		fmt.Printf("ChromaDB: %s/%s\n", baseURL, collection)
+		fmt.Printf("Embedder model: %s\n", getEmbeddingModel(embedderModel))
 		fmt.Printf("Soft delete: %t\n", softDelete)
 	case MemoryMySQL:
 		host := GetEnvOrDefault("MYSQL_HOST", "localhost")
 		port := GetEnvOrDefault("MYSQL_PORT", "3306")
 		database := GetEnvOrDefault("MYSQL_DATABASE", "trpc_agent_go")
 		fmt.Printf("MySQL: %s:%s/%s\n", host, port, database)
+		fmt.Printf("Soft delete: %t\n", softDelete)
+	case MemoryMySQLVec:
+		host := GetEnvOrDefault("MYSQLVEC_HOST", "localhost")
+		port := GetEnvOrDefault("MYSQLVEC_PORT", "3306")
+		database := GetEnvOrDefault("MYSQLVEC_DATABASE", "trpc_agent_go")
+		embedderModel := GetEnvOrDefault(
+			"MYSQLVEC_EMBEDDER_MODEL",
+			"text-embedding-3-small",
+		)
+		fmt.Printf("MySQL Vector: %s:%s/%s\n", host, port, database)
+		fmt.Printf("Embedder model: %s\n", getEmbeddingModel(embedderModel))
 		fmt.Printf("Soft delete: %t\n", softDelete)
 	default:
 		fmt.Printf("In-memory\n")

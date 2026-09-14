@@ -12,6 +12,7 @@ package file
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,11 +26,11 @@ import (
 // searchFileRequest represents the input for the search file operation.
 type searchFileRequest struct {
 	// Path is a relative directory under base_directory.
-	Path string `json:"path"`
+	Path string `json:"path" jsonschema:"description=Relative directory path under base_directory or workspace:// directory ref; empty means the base directory"`
 	// Pattern is a glob to match file names.
-	Pattern string `json:"pattern"`
+	Pattern string `json:"pattern" jsonschema:"description=Glob pattern to match files or folders such as *.go or **/*.md"`
 	// CaseSensitive controls glob case matching.
-	CaseSensitive bool `json:"case_sensitive"`
+	CaseSensitive bool `json:"case_sensitive" jsonschema:"description=Whether glob matching should be case-sensitive"`
 }
 
 // searchFileResponse represents the output from the search file operation.
@@ -49,13 +50,18 @@ func (f *fileToolSet) searchFile(
 ) (*searchFileResponse, error) {
 	rsp := &searchFileResponse{
 		BaseDirectory: f.baseDir,
-		Path:          req.Path,
-		Pattern:       req.Pattern,
 	}
+	if req == nil {
+		err := errors.New("request cannot be nil")
+		rsp.Message = "Error: " + err.Error()
+		return rsp, err
+	}
+	rsp.Path = req.Path
+	rsp.Pattern = req.Pattern
 	// Validate pattern
 	if req.Pattern == "" {
 		rsp.Message = "Error: pattern cannot be empty"
-		return rsp, fmt.Errorf("pattern cannot be empty")
+		return rsp, errors.New("pattern cannot be empty")
 	}
 
 	ref, err := fileref.Parse(req.Path)
@@ -65,7 +71,7 @@ func (f *fileToolSet) searchFile(
 	}
 	if ref.Scheme == fileref.SchemeArtifact {
 		rsp.Message = "Error: searching artifact:// is not supported"
-		return rsp, fmt.Errorf("searching artifact:// is not supported")
+		return rsp, errors.New("searching artifact:// is not supported")
 	}
 	if ref.Scheme == fileref.SchemeWorkspace {
 		rsp.Path = fileref.WorkspaceRef(ref.Path)
